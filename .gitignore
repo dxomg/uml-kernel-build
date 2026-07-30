@@ -10,3 +10,7 @@ build.log
 linux-uml
 slirp
 VERSION
+
+__pycache__/
+*.py[cod]
+.pytest_cache/

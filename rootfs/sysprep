@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+echo "[*] APT cleanup"
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+rm -rf /var/cache/apt/*
+
+echo "[*] Remove SSH host keys"
+rm -f /etc/ssh/ssh_host_*
+
+echo "[*] Clear logs"
+find /var/log -type f -exec truncate -s 0 {} \;
+
+echo "[*] Remove machine-id"
+rm -f /etc/machine-id
+: > /etc/machine-id
+
+echo "[*] Sync before zero-fill"
+sync
+
+echo "[*] Zero-fill free space"
+dd if=/dev/zero of=/ZERO bs=1M || true
+sync
+rm -f /ZERO
+sync
+
+echo "[*] Sysprep complete"
+

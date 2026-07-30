@@ -106,6 +106,42 @@ stub-executable allocator (`init_stub_exe_fd` in `arch/um/os-Linux/skas/process.
 at a plain on-disk directory (verified: guest memory shows as
 `/memfd:uml-physmem (deleted)` and the tempdir stays empty).
 
+
+### `uml-balloon-auto.patch`
+
+Guest-driven memory balloon so idle UML RAM is returned to the host.
+
+Upstream UML already supports manual ballooning via mconsole
+(`config mem=-N` / `config mem=+N`) using `MADV_REMOVE` on the physmem
+backing store. This patch:
+
+1. Extracts that plug/unplug core into `arch/um/drivers/uml_balloon.c`
+2. Keeps the mconsole `mem=` UX as a thin wrapper
+3. Adds an auto-balloon kthread with the policy:
+
+   - `allocated = boot_cap - ballooned` (boot_cap = boot `mem=`, hard cap)
+   - `usage = allocated - si_mem_available()`
+   - `slack = allocated - usage`
+   - **reclaim** when `slack >= 250MiB` → leave **100MiB** reserve slack
+   - **restore** when `slack <= 32MiB` → grow back toward 100MiB reserve
+   - never plug above boot_cap; never unplug below 64MiB allocated
+
+Sysfs (tunable): `/sys/kernel/uml_balloon/`
+
+| file | default | role |
+|---|---|---|
+| `enabled` | 1 | master switch |
+| `high_slack_bytes` | 250MiB | reclaim threshold |
+| `reserve_slack_bytes` | 100MiB | target headroom after reclaim/restore |
+| `low_slack_bytes` | 32MiB | restore threshold |
+| `min_allocated_bytes` | 64MiB | floor |
+| `step_bytes` | 4MiB | batch size |
+| `interval_ms` | 5000 | policy tick |
+| `boot_cap_bytes` / `allocated_bytes` / `ballooned_bytes` / `usage_bytes` / `slack_bytes` | ro | stats |
+
+Policy math is unit-tested in userspace (`balloon/tests/`, pytest) and
+must stay in sync with `decide()` in `uml_balloon.c`.
+
 ### UML SMP support (`patches/apply-smp.sh`, `patches/smp-backport/`)
 
 Upstream UML was single-CPU for its entire history until **v6.19** (Oct 2025),

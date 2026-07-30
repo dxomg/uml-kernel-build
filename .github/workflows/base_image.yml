@@ -1,0 +1,231 @@
+name: "UML Base Image (distro-agnostic, VECTOR/VDE)"
+
+# Rebuilds UML rootfs images from linuxcontainers.org "cloud" rootfs
+# tarballs.  The cloud variant preinstalls cloud-init; a NoCloud seed
+# baked into the image configures vec0 (10.0.2.15/24, gw 10.0.2.2,
+# DNS 10.0.2.3) on first boot.
+#
+# Cloud-init is the network renderer: it writes the distro-native config
+# (netplan on Ubuntu, systemd-networkd on Debian, NetworkManager on EL).
+#
+# Artifacts: base-<distro>-<release>.img.gz + VERSION
+# Runs weekly Monday + manual trigger.
+
+on:
+  schedule:
+    - cron: '0 13 * * 1'          # every Monday, 1h after kernel builds
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu
+            release: noble
+          - distro: ubuntu
+            release: resolute
+          - distro: debian
+            release: bookworm
+          - distro: debian
+            release: trixie
+          - distro: rockylinux
+            release: "9"
+          - distro: rockylinux
+            release: "10"
+          - distro: almalinux
+            release: "9"
+          - distro: almalinux
+            release: "10"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y wget xz-utils e2fsprogs
+
+      - name: Download cloud-variant rootfs
+        run: |
+          URL_PATH=$(curl -s http://images.linuxcontainers.org/meta/1.0/index-system \
+            | grep -v edge \
+            | awk '-F;' -v d="${{ matrix.distro }}" -v r="${{ matrix.release }}" \
+              '(($1==d) && ($2==r) && ($3=="amd64") && ($4=="cloud")) {print $NF}')
+          if [ -z "$URL_PATH" ]; then
+            echo "::error::No cloud variant found for ${{ matrix.distro }} ${{ matrix.release }}"
+            exit 1
+          fi
+          wget -O rootfs.tar.xz \
+            "http://images.linuxcontainers.org${URL_PATH}rootfs.tar.xz"
+          echo "Rootfs: ${URL_PATH}rootfs.tar.xz"
+          sha256sum rootfs.tar.xz
+          SERIAL=$(echo "$URL_PATH" | grep -oE '[0-9]{8}_[0-9]{2}:[0-9]{2}')
+          echo "SERIAL=$SERIAL" >> "$GITHUB_ENV"
+
+      - name: Create ext4 image
+        run: |
+          dd if=/dev/zero of=base.img bs=1M count=1024 status=progress
+          mkfs.ext4 -F -L rootfs base.img
+
+      - name: Populate rootfs
+        run: |
+          sudo mkdir /mnt/rootfs
+          sudo mount -o loop base.img /mnt/rootfs
+          sudo tar -xf rootfs.tar.xz -C /mnt/rootfs
+
+      - name: Detect distro family
+        id: family
+        run: |
+          # Debian/Ubuntu: apt + /lib/systemd;  EL: dnf + /usr/lib/systemd
+          if [ -f /mnt/rootfs/usr/bin/dnf ] || [ -f /mnt/rootfs/usr/bin/yum ]; then
+            echo "pm=dnf"      >> "$GITHUB_OUTPUT"
+            echo "sshd=sshd"   >> "$GITHUB_OUTPUT"
+            echo "unitpath=usr/lib/systemd/system" >> "$GITHUB_OUTPUT"
+            echo "pkgs=iproute iputils openssh-server openssh-clients" >> "$GITHUB_OUTPUT"
+          else
+            echo "pm=apt"      >> "$GITHUB_OUTPUT"
+            echo "sshd=ssh"    >> "$GITHUB_OUTPUT"
+            echo "unitpath=lib/systemd/system" >> "$GITHUB_OUTPUT"
+            echo "pkgs=openssh-server iproute2 iputils-ping" >> "$GITHUB_OUTPUT"
+          fi
+          echo "[+] Distro: ${{ matrix.distro }} → ${{ steps.family.outputs.pm }}"
+
+      - name: Install packages
+        run: |
+          sudo mount -t proc proc /mnt/rootfs/proc
+          sudo mount --bind /dev /mnt/rootfs/dev
+          sudo rm -f /mnt/rootfs/etc/resolv.conf
+          echo 'nameserver 1.1.1.1' | sudo tee /mnt/rootfs/etc/resolv.conf
+          sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }}-get update -qq || \
+            sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} update -qq || true
+          sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} install -y -q \
+            ${{ steps.family.outputs.pkgs }}
+          sudo umount /mnt/rootfs/dev
+          sudo umount /mnt/rootfs/proc
+
+      - name: Configure system
+        run: |
+          # root password
+          sudo chroot /mnt/rootfs bash -c 'echo "root:root" | chpasswd'
+
+          # hostname
+          echo 'uml' | sudo tee /mnt/rootfs/etc/hostname
+          sudo tee /mnt/rootfs/etc/hosts >/dev/null <<'HOSTS'
+          127.0.0.1   localhost localhost.localdomain
+          127.0.1.1   uml
+          HOSTS
+
+          # getty on tty0 (console login)
+          sudo ln -sf /${{ steps.family.outputs.unitpath }}/getty@.service \
+            /mnt/rootfs/etc/systemd/system/getty.target.wants/getty@tty0.service
+
+          # fstab (UML block device)
+          sudo tee /mnt/rootfs/etc/fstab >/dev/null <<'FSTAB'
+          /dev/ubda   /       ext4    defaults    0 1
+          proc        /proc   proc    defaults    0 0
+          sysfs       /sys    sysfs   defaults    0 0
+          tmpfs       /run    tmpfs   nosuid,nodev,size=50%,mode=755  0 0
+          FSTAB
+
+          # sysprep (image generalisation)
+          sudo cp rootfs/sysprep /mnt/rootfs/usr/bin/sysprep
+          sudo chmod +x /mnt/rootfs/usr/bin/sysprep
+
+          # SSH host-key regeneration on first boot
+          sudo cp rootfs/ssh-keygen.service /mnt/rootfs/etc/systemd/system/
+          sudo chroot /mnt/rootfs systemctl enable ssh-keygen
+
+          # sshd service name differs (ssh vs sshd)
+          sudo chroot /mnt/rootfs systemctl enable ${{ steps.family.outputs.sshd }}
+
+      - name: Configure networking (cloud-init NoCloud)
+        run: |
+          # Remove any pre-existing network configs that fight cloud-init
+          sudo rm -f /mnt/rootfs/etc/netplan/*.yaml
+          sudo rm -f /mnt/rootfs/etc/systemd/network/*.network
+          sudo rm -f /mnt/rootfs/etc/sysconfig/network-scripts/ifcfg-*
+          sudo rm -f /mnt/rootfs/etc/NetworkManager/system-connections/cloud-init-eth0.nmconnection
+
+          # Remove cloud-init.disabled (LXC sets it on EL)
+          sudo rm -f /mnt/rootfs/etc/cloud/cloud-init.disabled
+
+          # Bake NoCloud seed into the image
+          sudo mkdir -p /mnt/rootfs/var/lib/cloud/seed/nocloud
+          sudo cp rootfs/nocloud/meta-data \
+                  rootfs/nocloud/network-config \
+                  rootfs/nocloud/user-data \
+                  /mnt/rootfs/var/lib/cloud/seed/nocloud/
+
+          # Enable cloud-init services manually (generator needs a volume)
+          UNITPATH=${{ steps.family.outputs.unitpath }}
+          sudo mkdir -p /mnt/rootfs/etc/systemd/system/sysinit.target.wants
+          sudo mkdir -p /mnt/rootfs/etc/systemd/system/multi-user.target.wants
+          sudo ln -sf "/${UNITPATH}/cloud-init-local.service" \
+            /mnt/rootfs/etc/systemd/system/sysinit.target.wants/cloud-init-local.service
+          for svc in cloud-init cloud-config cloud-final; do
+            sudo ln -sf "/${UNITPATH}/${svc}.service" \
+              /mnt/rootfs/etc/systemd/system/multi-user.target.wants/${svc}.service
+          done
+
+          # Mask wait-online (hangs on Debian, unneeded — cloud-init handles timing)
+          sudo ln -sf /dev/null \
+            /mnt/rootfs/etc/systemd/system/systemd-networkd-wait-online.service
+
+          # Enable network services
+          sudo chroot /mnt/rootfs systemctl enable systemd-networkd 2>/dev/null || true
+          sudo chroot /mnt/rootfs systemctl enable systemd-resolved 2>/dev/null || true
+
+          # resolv.conf → resolved stub (if resolved is enabled)
+          if [ -f /mnt/rootfs/etc/systemd/system/multi-user.target.wants/systemd-resolved.service ]; then
+            sudo rm -f /mnt/rootfs/etc/resolv.conf
+            sudo ln -sf /run/systemd/resolve/stub-resolv.conf \
+              /mnt/rootfs/etc/resolv.conf
+          fi
+
+      - name: Sysprep & finalise
+        run: |
+          # Empty machine-id → regenerated on first boot
+          sudo rm -f /mnt/rootfs/etc/machine-id
+          sudo touch /mnt/rootfs/etc/machine-id
+
+          # APT/dnf cleanup
+          sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} clean all 2>/dev/null || \
+            sudo chroot /mnt/rootfs apt-get clean 2>/dev/null || true
+          sudo rm -rf /mnt/rootfs/var/lib/apt/lists/*
+
+          # Remove SSH host keys (regenerated by ssh-keygen.service)
+          sudo rm -f /mnt/rootfs/etc/ssh/ssh_host_*
+
+          # Clear logs
+          sudo find /mnt/rootfs/var/log -type f -exec sudo truncate -s 0 {} \;
+
+          # Clear cloud-init runtime state (seed stays, instance data goes)
+          sudo rm -rf /mnt/rootfs/var/lib/cloud/data/* \
+                      /mnt/rootfs/var/lib/cloud/instance/*
+
+          # Zero-fill free space
+          sudo dd if=/dev/zero of=/mnt/rootfs/ZERO bs=1M status=none || true
+          sudo rm -f /mnt/rootfs/ZERO
+          sudo sync
+          sudo umount /mnt/rootfs
+
+      - name: Sparsify & compress
+        run: |
+          cp --sparse=always base.img base-sparse.img
+          mv -f base-sparse.img base.img
+          OUT=base-${{ matrix.distro }}-${{ matrix.release }}.img.gz
+          gzip -6 -c base.img > "$OUT"
+          echo "$(date -u +%Y-%m-%d) distro=${{ matrix.distro }} release=${{ matrix.release }} rootfs=${{ env.SERIAL }}" \
+            > VERSION
+          ls -lh "$OUT" VERSION
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: uml-base-${{ matrix.distro }}-${{ matrix.release }}
+          path: |
+            base-${{ matrix.distro }}-${{ matrix.release }}.img.gz
+            VERSION
+          retention-days: 30

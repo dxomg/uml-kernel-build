@@ -1,0 +1,9 @@
+#cloud-config
+# UML base image — NoCloud user-data
+# cloud-init applies these on first boot, then disables itself (semper)
+disable_root: false
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  list: |
+    root:root
