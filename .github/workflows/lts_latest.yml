@@ -1,10 +1,13 @@
-name: "UML Kernel — LTS latest (VECTOR/VDE)"
-
-# Builds the newest LTS kernel (currently 6.18.x) with UML_NET_VECTOR.
-# Use with: vec0:transport=vde,vnl=slirp://
-# Requires vde2 + libvdeplug-slirp on the host.
+name: "UML Kernel & Tools Build"
 
 on:
+  push:
+    paths:
+      - 'slirp.c'
+      - 'vde_plug/**'
+      - 'Makefile'
+      - 'slirp.yaml'
+      - '.github/workflows/**'
   schedule:
     - cron: '0 12 * * 1'          # every Monday
   workflow_dispatch:
@@ -13,33 +16,76 @@ permissions:
   contents: write                 # REQUIRED to create tags and releases
 
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4 # Fixed version (v6 does not exist)
+      - uses: actions/checkout@v4
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y build-essential libncurses-dev flex bison \
-            libssl-dev libelf-dev bc dwarves wget curl jq tar xz-utils \
-            libglib2.0-dev libpcre3-dev pkg-config
+          sudo apt-get install -y \
+            build-essential libncurses-dev flex bison libssl-dev \
+            libelf-dev bc dwarves wget curl jq tar xz-utils \
+            libglib2.0-dev libpcre3-dev pkg-config cmake git \
+            libslirp-dev libvdeplug-dev libyaml-dev
 
-      - name: Pick newest LTS (excluding 6.12 — that’s the oldstable workflow)
+      # --- BUILD TOOLS ---
+      - name: Build libvdeslirp (static .a)
+        run: |
+          git clone --depth 1 https://github.com/virtualsquare/libvdeslirp.git
+          cat > libvdeslirp/CMakeLists.txt << 'CMAKEOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(vdeslirp LANGUAGES C)
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_C_FLAGS "-O2 -Wall -Wextra -pedantic")
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          include(GNUInstallDirs)
+          configure_file(config.h.in config.h)
+          add_library(vdeslirp STATIC libvdeslirp.c)
+          target_include_directories(vdeslirp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+          target_link_libraries(vdeslirp PRIVATE slirp pthread glib-2.0)
+          set_target_properties(vdeslirp PROPERTIES OUTPUT_NAME "vdeslirp")
+          install(TARGETS vdeslirp DESTINATION ${CMAKE_INSTALL_LIBDIR})
+          install(FILES libvdeslirp.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+          CMAKEOF
+          
+          mkdir -p libvdeslirp/build && cd libvdeslirp/build
+          cmake ..
+          make -j"$(nproc)"
+
+      - name: Build static slirp (legacy SLIP transport)
+        run: |
+          make static \
+            VDESLIRP_SRC=libvdeslirp \
+            VDESLIRP_BUILD=libvdeslirp/build \
+            SYSLIB=/usr/lib/x86_64-linux-gnu
+          strip slirp
+
+      - name: Build static vde_plug (VECTOR transport)
+        run: |
+          cd vde_plug
+          make static \
+            VDESLIRP_SRC=../libvdeslirp \
+            VDESLIRP_BUILD=../libvdeslirp/build
+          strip vde_plug
+
+      # --- BUILD KERNEL ---
+      - name: Pick newest LTS kernel
         run: |
           KVER=$(curl -s https://www.kernel.org/releases.json | \
             jq -r '.releases[] | select(.moniker=="longterm") | .version' | \
             sort -V | tail -1)
           MAJOR=$(echo "$KVER" | cut -d. -f1)
           MINOR=$(echo "$KVER" | cut -d. -f2)
+          
           echo "KVER=$KVER" >> "$GITHUB_ENV"
           echo "KMAJOR=$MAJOR" >> "$GITHUB_ENV"
           echo "KMINOR=$MINOR" >> "$GITHUB_ENV"
           echo "[+] Selected $KVER"
 
-      - name: Download & extract
+      - name: Download & extract kernel
         run: |
-          # cdn.kernel.org tarballs are flaky (404s); clone the tag directly.
           git clone --depth 1 --branch "v${{ env.KVER }}" \
             "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" \
             "linux-${{ env.KVER }}"
@@ -70,15 +116,13 @@ jobs:
           if [ -f arch/x86/include/asm/unwind_user.h ] && \
               ! grep -q unwind_user arch/um/include/asm/Kbuild 2>/dev/null; then
             echo 'generic-y += unwind_user.h' >> arch/um/include/asm/Kbuild
-            echo "[+] Patched unwind_user.h"
           fi
 
-      - name: Configure & build
+      - name: Configure & build kernel
         run: |
           cd linux-${{ env.KVER }}
           make ARCH=um defconfig
 
-          # --- common options ---
           scripts/config --file .config \
             -e BLK_DEV -e BLK_DEV_LOOP -e BLK_DEV_UBD \
             -e EXT4_FS -e EXT2_FS -e EXT3_FS -e FS_MBCACHE \
@@ -97,55 +141,58 @@ jobs:
             -e IKCONFIG -e IKCONFIG_PROC -e CONFIG_IPV6 \
             -e SMP --set-val NR_CPUS 64
 
-          # --- network transport ---
           MAJOR=${{ env.KMAJOR }}; MINOR=${{ env.KMINOR }}
           if [ "$MAJOR" -gt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -ge 16 ]; }; then
-            echo "[+] >= 6.16 → VECTOR transport"
             scripts/config --file .config -e UML_NET_VECTOR
           else
-            echo "[+] < 6.16 → SLIRP transport (fallback)"
             scripts/config --file .config \
               -e SLHC -e SLIP -e SLIP_COMPRESSED -e SLIP_SMART -e SLIP_MODE_SLIP6 \
               -e UML_NET -e UML_NET_SLIRP -d UML_NET_DAEMON
           fi
 
-          # Merge container config (Docker/Podman/LXC, cgroup v2)
           ./scripts/kconfig/merge_config.sh -m -O . .config ../patches/containers.config >/dev/null
 
           make ARCH=um olddefconfig
           make ARCH=um -j"$(nproc)"
 
-      - name: Strip & prepare files
+      - name: Strip & prepare kernel files
         run: |
           cp linux-${{ env.KVER }}/linux ./linux-uml
           strip ./linux-uml
+          
           TRANSPORT="VECTOR"
           MAJOR=${{ env.KMAJOR }}; MINOR=${{ env.KMINOR }}
           if [ "$MAJOR" -lt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 16 ]; }; then
             TRANSPORT="SLIRP"
           fi
           
-          # Export to env for the release step body/title
           echo "TRANSPORT=$TRANSPORT" >> "$GITHUB_ENV"
           echo "${{ env.KVER }} ($TRANSPORT)" > VERSION
 
-      - name: Upload Workflow Artifact
-        uses: actions/upload-artifact@v4 # Fixed version
+      # --- ARTIFACTS & RELEASE ---
+      - name: Upload Workspace Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: linux-uml-lts-latest
+          name: uml-kernel-and-tools
           path: |
             linux-uml
             VERSION
+            slirp
+            slirp.yaml
+            vde_plug/vde_plug
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ env.KVER }}-${{ github.run_number }}"
-          name: "UML LTS ${{ env.KVER }} (${{ env.TRANSPORT }})"
+          name: "UML LTS ${{ env.KVER }} (${{ env.TRANSPORT }}) + Networking Tools"
           body: |
-            Automated weekly build of the latest LTS UML kernel.
+            Automated build containing the latest LTS UML kernel alongside static networking tools.
             - **Kernel Version:** ${{ env.KVER }}
             - **Network Transport:** ${{ env.TRANSPORT }}
           files: |
             linux-uml
             VERSION
+            slirp
+            slirp.yaml
+            vde_plug/vde_plug
