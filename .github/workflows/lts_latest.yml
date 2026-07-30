@@ -49,7 +49,7 @@ jobs:
           install(TARGETS vdeslirp DESTINATION ${CMAKE_INSTALL_LIBDIR})
           install(FILES libvdeslirp.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
           CMAKEOF
-          
+
           mkdir -p libvdeslirp/build && cd libvdeslirp/build
           cmake ..
           make -j"$(nproc)"
@@ -78,7 +78,7 @@ jobs:
             sort -V | tail -1)
           MAJOR=$(echo "$KVER" | cut -d. -f1)
           MINOR=$(echo "$KVER" | cut -d. -f2)
-          
+
           echo "KVER=$KVER" >> "$GITHUB_ENV"
           echo "KMAJOR=$MAJOR" >> "$GITHUB_ENV"
           echo "KMINOR=$MINOR" >> "$GITHUB_ENV"
@@ -114,7 +114,7 @@ jobs:
         run: |
           cd linux-${{ env.KVER }}
           if [ -f arch/x86/include/asm/unwind_user.h ] && \
-              ! grep -q unwind_user arch/um/include/asm/Kbuild 2>/dev/null; then
+             ! grep -q unwind_user arch/um/include/asm/Kbuild 2>/dev/null; then
             echo 'generic-y += unwind_user.h' >> arch/um/include/asm/Kbuild
           fi
 
@@ -125,6 +125,9 @@ jobs:
 
           scripts/config --file .config \
             -e BLK_DEV -e BLK_DEV_LOOP -e BLK_DEV_UBD \
+            -e SWAP -e ZSMALLOC -e ZRAM \
+            -e CRYPTO_LZO -e CRYPTO_LZ4 -e CRYPTO_ZSTD \
+            -e LZO_COMPRESS -e LZ4_COMPRESS -e ZSTD_COMPRESS \
             -e EXT4_FS -e EXT2_FS -e EXT3_FS -e FS_MBCACHE \
             -e NET -e INET -e PACKET -e NETDEVICES -e NET_CORE -e TUN \
             -e TTY -e UNIX98_PTYS -e DEVTMPFS -e DEVTMPFS_MOUNT \
@@ -159,13 +162,13 @@ jobs:
         run: |
           cp linux-${{ env.KVER }}/linux ./linux-uml
           strip ./linux-uml
-          
+
           TRANSPORT="VECTOR"
           MAJOR=${{ env.KMAJOR }}; MINOR=${{ env.KMINOR }}
           if [ "$MAJOR" -lt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 16 ]; }; then
             TRANSPORT="SLIRP"
           fi
-          
+
           echo "TRANSPORT=$TRANSPORT" >> "$GITHUB_ENV"
           echo "${{ env.KVER }} ($TRANSPORT)" > VERSION
 
