@@ -1,0 +1,149 @@
+diff --git a/arch/um/kernel/mem.c b/arch/um/kernel/mem.c
+index 32e3b1972..8a3d60657 100644
+--- a/arch/um/kernel/mem.c
++++ b/arch/um/kernel/mem.c
+@@ -22,6 +22,9 @@
+ #include <um_malloc.h>
+ #include <linux/sched/task.h>
+ #include <linux/kasan.h>
++#include <linux/page_reporting.h>
++#include <linux/scatterlist.h>
++#include <linux/mmzone.h>
+ 
+ #ifdef CONFIG_KASAN
+ void __init kasan_init(void)
+@@ -57,6 +60,57 @@ pgd_t swapper_pg_dir[PTRS_PER_PGD];
+ /* Initialized at boot time, and readonly after that */
+ int kmalloc_ok = 0;
+ 
++/*
++ * memdrop: return free guest physmem to the host via MADV_REMOVE.
++ *
++ * Uses the kernel PAGE_REPORTING framework (same path virtio-balloon free-
++ * page reporting uses). The mm free path notifies when enough free pages
++ * of a given order have accumulated; the reporter:
++ *   1. isolates free pages from the buddy (they cannot be allocated),
++ *   2. calls our report() which MADV_REMOVEs their host backing,
++ *   3. returns them to the freelist with PageReported set.
++ *
++ * No use-after-reuse, no fixed queue overflow, no random free-page punch.
++ *
++ * Default batch: report free pages of order >= 3 (32KiB chunks).
++ * memdrop=on: order >= 0 (every free page, still batched by the framework).
++ */
++static int memdrop_mode = 1; /* 0=off, 1=batch, 2=on */
++static unsigned int memdrop_order = 3; /* batch default */
++
++static struct page_reporting_dev_info memdrop_prdev;
++
++static int memdrop_report(struct page_reporting_dev_info *prdev,
++			  struct scatterlist *sgl, unsigned int nents)
++{
++	struct scatterlist *sg;
++	unsigned int i;
++
++	for_each_sg(sgl, sg, nents, i) {
++		struct page *page = sg_page(sg);
++		unsigned int order = get_order(sg->length);
++		int err;
++
++		if (!page)
++			continue;
++
++		err = os_drop_memory(page_address(page), PAGE_SIZE << order);
++		if (unlikely(err)) {
++			printk(KERN_WARNING
++			       "memdrop: MADV_REMOVE failed: %d - disabling\n",
++			       err);
++			/*
++			 * Still return 0 so pages are put back cleanly;
++			 * unregister to stop further reports.
++			 */
++			page_reporting_unregister(&memdrop_prdev);
++			memdrop_mode = 0;
++			return 0;
++		}
++	}
++	return 0;
++}
++
+ /* Used during early boot */
+ static unsigned long brk_end;
+ 
+@@ -84,6 +138,76 @@ void __init mem_init(void)
+ 	kmalloc_ok = 1;
+ }
+ 
++static int __init memdrop_late_init(void)
++{
++	int err;
++
++	if (!memdrop_mode) {
++		os_info("memdrop: disabled\n");
++		return 0;
++	}
++
++	if (!IS_ENABLED(CONFIG_PAGE_REPORTING)) {
++		os_warn("memdrop: CONFIG_PAGE_REPORTING missing, disabled\n");
++		memdrop_mode = 0;
++		return 0;
++	}
++
++	memdrop_prdev.report = memdrop_report;
++	memdrop_prdev.order = memdrop_order;
++
++	err = page_reporting_register(&memdrop_prdev);
++	if (err) {
++		os_warn("memdrop: page_reporting_register failed: %d\n", err);
++		memdrop_mode = 0;
++		return 0;
++	}
++
++	os_info("memdrop: %s (page_reporting order >= %u)\n",
++		memdrop_mode == 2 ? "on" : "batch", memdrop_order);
++	return 0;
++}
++late_initcall(memdrop_late_init);
++
++
++static int __init uml_memdrop_setup(char *line, int *add)
++{
++	*add = 0;
++
++	if (!strcmp(line, "off")) {
++		memdrop_mode = 0;
++	} else if (!line[0] || !strcmp(line, "on")) {
++		memdrop_mode = 2;
++		memdrop_order = 0;
++	} else if (!strcmp(line, "batch")) {
++		memdrop_mode = 1;
++		memdrop_order = 3;
++	} else {
++		char *end;
++		unsigned long val = simple_strtoul(line, &end, 0);
++
++		if (end == line || *end != '\0' || val > MAX_PAGE_ORDER) {
++			os_warn("memdrop: invalid '%s', using batch\n", line);
++			memdrop_mode = 1;
++			memdrop_order = 3;
++		} else {
++			memdrop_mode = 1;
++			memdrop_order = (unsigned int)val;
++		}
++	}
++	return 0;
++}
++__uml_setup("memdrop=", uml_memdrop_setup,
++"memdrop=off\n"
++"    Do not return free guest pages to the host.\n"
++"memdrop=batch\n"
++"    Default. Use page_reporting on free pages of order >= 3 (~32KiB).\n"
++"memdrop=on\n"
++"    page_reporting on free pages of order >= 0 (framework still batches).\n"
++"memdrop=<order>\n"
++"    page_reporting with this minimum free order.\n\n"
++);
++
+ #if IS_ENABLED(CONFIG_ARCH_REUSE_HOST_VSYSCALL_AREA)
+ /*
+  * Create a page table and place a pointer to it in a middle page

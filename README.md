@@ -107,40 +107,33 @@ at a plain on-disk directory (verified: guest memory shows as
 `/memfd:uml-physmem (deleted)` and the tempdir stays empty).
 
 
-### `uml-balloon-auto.patch`
+### `uml-memdrop-on-free.patch`
 
-Guest-driven memory balloon so idle UML RAM is returned to the host.
+`memfd` stops host writeback, but host RSS still tracks the guest high-water
+mark because physmem is one long `MAP_SHARED` mapping.
 
-Upstream UML already supports manual ballooning via mconsole
-(`config mem=-N` / `config mem=+N`) using `MADV_REMOVE` on the physmem
-backing store. This patch:
+This patch registers UML with the kernel **PAGE_REPORTING** framework (same
+machinery virtio free-page reporting uses). When enough free buddy pages of
+a given order accumulate, mm isolates them (they cannot be allocated), calls
+our reporter which `MADV_REMOVE`s the host backing, then returns them to the
+freelist. Guest free-count is unchanged; host RSS shrinks; next touch
+zero-faults.
 
-1. Extracts that plug/unplug core into `arch/um/drivers/uml_balloon.c`
-2. Keeps the mconsole `mem=` UX as a thin wrapper
-3. Adds an auto-balloon kthread with the policy:
+This avoids the traps of naive approaches:
 
-   - `allocated = boot_cap - ballooned` (boot_cap = boot `mem=`, hard cap)
-   - `usage = allocated - si_mem_available()`
-   - `slack = allocated - usage`
-   - **reclaim** when `slack >= 250MiB` → leave **100MiB** reserve slack
-   - **restore** when `slack <= 32MiB` → grow back toward 100MiB reserve
-   - never plug above boot_cap; never unplug below 64MiB allocated
+* delayed punch of a just-freed address → use-after-reuse
+* punching a random `alloc_page` → wrong pages (cold freelist)
+* fixed PFN queue → overflows on large munmap
 
-Sysfs (tunable): `/sys/kernel/uml_balloon/`
+Default is **batch**, not per-4K free-path syscalls:
 
-| file | default | role |
-|---|---|---|
-| `enabled` | 1 | master switch |
-| `high_slack_bytes` | 250MiB | reclaim threshold |
-| `reserve_slack_bytes` | 100MiB | target headroom after reclaim/restore |
-| `low_slack_bytes` | 32MiB | restore threshold |
-| `min_allocated_bytes` | 64MiB | floor |
-| `step_bytes` | 4MiB | batch size |
-| `interval_ms` | 5000 | policy tick |
-| `boot_cap_bytes` / `allocated_bytes` / `ballooned_bytes` / `usage_bytes` / `slack_bytes` | ro | stats |
+* `memdrop=batch` (default) — report free pages of order ≥ **3** (~32KiB)
+* `memdrop=on` — order ≥ **0** (framework still batches into scatterlists)
+* `memdrop=<order>` — custom minimum free order
+* `memdrop=off` — disabled
 
-Policy math is unit-tested in userspace (`balloon/tests/`, pytest) and
-must stay in sync with `decide()` in `uml_balloon.c`.
+Requires `CONFIG_PAGE_REPORTING=y` (enabled in `containers.config`).
+
 
 ### UML SMP support (`patches/apply-smp.sh`, `patches/smp-backport/`)
 

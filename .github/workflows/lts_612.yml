@@ -37,6 +37,10 @@ jobs:
             "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" \
             "linux-${{ env.KVER }}"
 
+      - name: Apply UML SMP support
+        run: |
+          cd linux-${{ env.KVER }}
+          bash ../patches/apply-smp.sh ../patches
       - name: Apply bundled UML patches
         run: |
           cd linux-${{ env.KVER }}
@@ -52,10 +56,6 @@ jobs:
             fi
           done
 
-      - name: Apply UML SMP support
-        run: |
-          cd linux-${{ env.KVER }}
-          bash ../patches/apply-smp.sh ../patches
 
       - name: Patch UML (unwind_user.h)
         run: |
@@ -91,6 +91,9 @@ jobs:
             -e SMP --set-val NR_CPUS 64
           # Merge container config (Docker/Podman/LXC, cgroup v2)
           ./scripts/kconfig/merge_config.sh -m -O . .config ../patches/containers.config >/dev/null
+
+          # memdrop via page_reporting
+          scripts/config --file .config -e PAGE_REPORTING
 
           make ARCH=um olddefconfig
           make ARCH=um -j"$(nproc)"

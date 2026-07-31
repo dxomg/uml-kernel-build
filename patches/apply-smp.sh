@@ -11,6 +11,10 @@
 #   - Kernel <= 6.17 / 6.12 LTS: the series base is too far away to port
 #     safely. SMP stays off (single-CPU, as upstream).
 #
+# IMPORTANT: never reset the whole working tree on failure. Other bundled
+# patches (memfd, memdrop, ...) may already be applied; a blanket
+# `git checkout -- .` would silently drop them.
+#
 # Usage: apply-smp.sh <patches-dir>  (run from inside the kernel source tree)
 set -euo pipefail
 
@@ -45,22 +49,36 @@ if [ "$KMAJOR" -eq 6 ] && [ "$KMINOR" -eq 18 ]; then
         exit 0
     fi
     echo "[smp] 6.18.x: applying SMP backport series"
-    # Prefer 3-way merge (uses base blobs from git history); fall back to fuzz.
+    # Prefer 3-way merge (uses base blobs from git history).
     if git apply --3way --index "$CUMUL" 2>/tmp/smp-apply.err; then
         echo "[smp] applied cleanly via 3-way merge"
-    else
-        echo "[smp] 3-way had issues, trying with patch(1) --fuzz=3"
-        # reset any partial application
-        git checkout -- . 2>/dev/null || true
-        if patch -p1 --fuzz=3 --forward < "$CUMUL" >/tmp/smp-apply2.log 2>&1; then
-            echo "[smp] applied with fuzz"
-        else
-            echo "[smp] FAILED to apply backport:" >&2
-            tail -20 /tmp/smp-apply2.log >&2
-            exit 1
-        fi
+        exit 0
     fi
-    exit 0
+
+    echo "[smp] 3-way had issues, trying git apply without 3-way"
+    if git apply --reject --whitespace=nowarn "$CUMUL" 2>/tmp/smp-apply1.err; then
+        echo "[smp] applied via git apply"
+        exit 0
+    fi
+
+    echo "[smp] plain git apply failed, trying patch(1) --fuzz=3 on current tree"
+    # Do NOT reset the tree — preserve already-applied bundled patches.
+    if patch -p1 --fuzz=3 --forward --no-backup-if-mismatch < "$CUMUL" \
+            >/tmp/smp-apply2.log 2>&1; then
+        echo "[smp] applied with fuzz"
+        # Clean up reject files if any empty leftovers
+        find . -name '*.rej' -size 0 -delete 2>/dev/null || true
+        if find . -name '*.rej' | grep -q .; then
+            echo "[smp] WARN: reject files remain:" >&2
+            find . -name '*.rej' >&2
+        fi
+        exit 0
+    fi
+
+    echo "[smp] FAILED to apply backport:" >&2
+    tail -40 /tmp/smp-apply2.log >&2 || true
+    tail -40 /tmp/smp-apply.err >&2 || true
+    exit 1
 fi
 
 # Older (6.12 LTS, etc.) -> not supported, stay UP
