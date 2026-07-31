@@ -145,8 +145,10 @@ jobs:
             -e IKCONFIG -e IKCONFIG_PROC -e CONFIG_IPV6 \
             -e SMP --set-val NR_CPUS 64
 
-          # Proxmox / LXC / Docker container modules and namespaces
+          # Proxmox / LXC / Docker container modules, cgroups & namespaces
+          # (Includes CPUSETS & PROC_PID_CPUSET for core allocation)
           scripts/config --file .config \
+            -e CPUSETS -e PROC_PID_CPUSET \
             -e USER_NS -e CHECKPOINT_RESTORE \
             -e FAIR_GROUP_SCHED -e CFS_BANDWIDTH -e CGROUP_FREEZER \
             -e CGROUP_DEVICE -e CGROUP_CPUACCT -e MEMCG -e MEMCG_SWAP \
