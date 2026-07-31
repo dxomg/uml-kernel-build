@@ -94,6 +94,7 @@ jobs:
         run: |
           cd linux-${{ env.KVER }}
           bash ../patches/apply-smp.sh ../patches
+
       - name: Apply bundled UML patches
         run: |
           cd linux-${{ env.KVER }}
@@ -122,6 +123,7 @@ jobs:
           cd linux-${{ env.KVER }}
           make ARCH=um defconfig
 
+          # Standard base configuration
           scripts/config --file .config \
             -e BLK_DEV -e BLK_DEV_LOOP -e BLK_DEV_UBD \
             -e SWAP -e ZSMALLOC -e ZRAM \
@@ -143,6 +145,16 @@ jobs:
             -e IKCONFIG -e IKCONFIG_PROC -e CONFIG_IPV6 \
             -e SMP --set-val NR_CPUS 64
 
+          # Proxmox / LXC / Docker container modules and namespaces
+          scripts/config --file .config \
+            -e USER_NS -e CHECKPOINT_RESTORE \
+            -e FAIR_GROUP_SCHED -e CFS_BANDWIDTH -e CGROUP_FREEZER \
+            -e CGROUP_DEVICE -e CGROUP_CPUACCT -e MEMCG -e MEMCG_SWAP \
+            -e CGROUP_BPF -e EXT4_FS_POSIX_ACL -e EXT4_FS_SECURITY \
+            -e VETH -e BRIDGE -e BRIDGE_NETFILTER -e MACVLAN -e IPVLAN -e TAP \
+            -e IP_NF_IPTABLES -e IP_NF_FILTER -e IP_NF_NAT -e IP6_NF_IPTABLES \
+            -e SECCOMP -e SECCOMP_FILTER
+
           MAJOR=${{ env.KMAJOR }}; MINOR=${{ env.KMINOR }}
           if [ "$MAJOR" -gt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -ge 16 ]; }; then
             scripts/config --file .config -e UML_NET_VECTOR
@@ -152,7 +164,9 @@ jobs:
               -e UML_NET -e UML_NET_SLIRP -d UML_NET_DAEMON
           fi
 
-          ./scripts/kconfig/merge_config.sh -m -O . .config ../patches/containers.config >/dev/null
+          if [ -f ../patches/containers.config ]; then
+            ./scripts/kconfig/merge_config.sh -m -O . .config ../patches/containers.config >/dev/null
+          fi
 
           # memdrop via page_reporting
           scripts/config --file .config -e PAGE_REPORTING
