@@ -23,20 +23,16 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write  # Required to publish releases
+      contents: write  # Required to create/publish releases
       actions: read    # Required to download artifacts across workflows
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Determine Release Tag & Workspace Preparation
+      - name: Determine Release Tag
         id: vars
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p ./release-assets
-          
           # Set Tag Name (Defaults to vYYYY.MM.DD-buildNumber if omitted)
           if [ -n "${{ inputs.tag_name }}" ]; then
             TAG_NAME="${{ inputs.tag_name }}"
@@ -49,28 +45,47 @@ jobs:
       - name: Fetch Latest Artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "[+] Downloading 'linux-uml-lts-latest' artifact..."
-          # Get the run ID of the latest successful kernel build
-          KERNEL_RUN_ID=$(gh run list --workflow "UML Kernel — LTS latest (VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
-          gh run download "$KERNEL_RUN_ID" -n "linux-uml-lts-latest" --dir ./tmp-kernel
+          mkdir -p ./tmp-kernel ./tmp-tools
 
-          echo "[+] Downloading 'slirp-static' and 'vde_plug-static' artifacts..."
-          # Get the run ID of the latest successful static binary build
-          TOOLS_RUN_ID=$(gh run list --workflow "Build Static Binaries (slirp + vde_plug)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
-          gh run download "$TOOLS_RUN_ID" -n "slirp-static" --dir ./tmp-slirp
-          gh run download "$TOOLS_RUN_ID" -n "vde_plug-static" --dir ./tmp-vde
+          echo "[+] Finding latest successful kernel build..."
+          KERNEL_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Kernel — LTS latest (VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
+
+          if [ -z "$KERNEL_RUN_ID" ]; then
+            echo "::error::No successful run found for 'UML Kernel — LTS latest (VECTOR/VDE)'"
+            exit 1
+          fi
+
+          echo "[+] Downloading artifacts from Kernel Run ID: $KERNEL_RUN_ID"
+          gh run download "$KERNEL_RUN_ID" --repo "$REPO" --dir ./tmp-kernel
+
+          echo "[+] Finding latest successful static binaries build..."
+          TOOLS_RUN_ID=$(gh run list --repo "$REPO" --workflow "Build Static Binaries (slirp + vde_plug)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
+
+          if [ -z "$TOOLS_RUN_ID" ]; then
+            echo "::error::No successful run found for 'Build Static Binaries (slirp + vde_plug)'"
+            exit 1
+          fi
+
+          echo "[+] Downloading artifacts from Tools Run ID: $TOOLS_RUN_ID"
+          gh run download "$TOOLS_RUN_ID" --repo "$REPO" --dir ./tmp-tools
 
       - name: Organize Release Binaries
         run: |
-          # Copy target assets into release staging directory
-          cp ./tmp-kernel/linux-uml ./release-assets/
-          cp ./tmp-kernel/VERSION ./release-assets/
-          cp ./tmp-slirp/slirp ./release-assets/
-          cp ./tmp-slirp/slirp.yaml ./release-assets/ 2>/dev/null || true
-          cp ./tmp-vde/vde_plug ./release-assets/
+          mkdir -p ./release-assets
 
-          echo "=== Files staged for Release ==="
+          echo "=== Downloaded Files Structure ==="
+          find ./tmp-kernel ./tmp-tools -type f
+
+          # Locate and copy target files regardless of subfolder nesting
+          find ./tmp-kernel -type f -name "linux-uml" -exec cp {} ./release-assets/ \;
+          find ./tmp-kernel -type f -name "VERSION" -exec cp {} ./release-assets/ \;
+          find ./tmp-tools -type f -name "slirp" -exec cp {} ./release-assets/ \;
+          find ./tmp-tools -type f -name "slirp.yaml" -exec cp {} ./release-assets/ \;
+          find ./tmp-tools -type f -name "vde_plug" -exec cp {} ./release-assets/ \;
+
+          echo "=== Staged Release Assets ==="
           ls -lh ./release-assets/
 
       - name: Create GitHub Release
@@ -80,12 +95,15 @@ jobs:
           TAG="${{ steps.vars.outputs.tag_name }}"
           
           # Extract kernel version info if available
-          K_VERSION=$(cat ./release-assets/VERSION 2>/dev/null || echo "Latest LTS")
+          K_VERSION="Latest LTS"
+          if [ -f ./release-assets/VERSION ]; then
+            K_VERSION=$(cat ./release-assets/VERSION)
+          fi
 
           gh release create "$TAG" ./release-assets/* \
             --title "UML Kernel & Networking Suite ($TAG)" \
             --notes "### Included Binaries
-          * **`linux-uml`**: Kernel build for **${K_VERSION}**
-          * **`slirp`**: Static slirp binary with enlarged DHCP pool
-          * **`vde_plug`**: Static vde_plug binary with VECTOR transport support" \
+          * **\`linux-uml\`**: Kernel build for **${K_VERSION}**
+          * **\`slirp\`**: Static slirp binary with enlarged DHCP pool
+          * **\`vde_plug\`**: Static vde_plug binary with VECTOR transport support" \
             --generate-notes
