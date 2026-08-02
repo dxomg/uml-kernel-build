@@ -1,15 +1,6 @@
-name: Publish UML & Networking Tools Release
+name: Trigger, Build, and Publish Release
 
 on:
-  # Automatically release when the kernel workflow finishes successfully
-  workflow_run:
-    workflows: ["UML Kernel — LTS latest (VECTOR/VDE)"]
-    types:
-      - completed
-    branches:
-      - main
-
-  # Allow manual triggering from the Actions tab
   workflow_dispatch:
     inputs:
       tag_name:
@@ -18,13 +9,13 @@ on:
         type: string
 
 jobs:
-  publish-release:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+  trigger-build-and-release:
     runs-on: ubuntu-latest
 
     permissions:
       contents: write  # Required to create/publish releases
-      actions: read    # Required to download artifacts across workflows
+      actions: write   # Required to trigger workflows (`gh workflow run`)
+      checks: read     # Required to monitor workflow status
 
     steps:
       - name: Checkout Repository
@@ -33,7 +24,6 @@ jobs:
       - name: Determine Release Tag
         id: vars
         run: |
-          # Set Tag Name (Defaults to vYYYY.MM.DD-buildNumber if omitted)
           if [ -n "${{ inputs.tag_name }}" ]; then
             TAG_NAME="${{ inputs.tag_name }}"
           else
@@ -42,43 +32,89 @@ jobs:
           
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Fetch Latest Artifacts
+      - name: Trigger Build Workflows
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "[+] Triggering 'UML Kernel — LTS latest (VECTOR/VDE)'..."
+          gh workflow run "UML Kernel — LTS latest (VECTOR/VDE)" --repo "$REPO" --ref "${{ github.ref_name }}"
+
+          echo "[+] Triggering 'Build Static Binaries (slirp + vde_plug)'..."
+          gh workflow run "Build Static Binaries (slirp + vde_plug)" --repo "$REPO" --ref "${{ github.ref_name }}"
+
+          # Give GitHub API a few seconds to register the new runs
+          sleep 10
+
+      - name: Wait for Build Workflows to Complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Function to wait for a workflow run triggered recently to complete
+          wait_for_workflow() {
+            WORKFLOW_NAME="$1"
+            echo "=================================================="
+            echo "[+] Monitoring workflow: '$WORKFLOW_NAME'"
+            echo "=================================================="
+
+            # Get the latest run ID for the workflow on current branch
+            RUN_ID=$(gh run list --repo "$REPO" --workflow "$WORKFLOW_NAME" --branch "${{ github.ref_name }}" --limit 1 --json databaseId -q '.[0].databaseId')
+
+            if [ -z "$RUN_ID" ]; then
+              echo "::error::Could not find run ID for workflow '$WORKFLOW_NAME'"
+              exit 1
+            fi
+
+            echo "[+] Tracking Run ID: $RUN_ID"
+
+            # Poll status every 20 seconds
+            while true; do
+              STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status,conclusion -q '.status')
+              
+              if [ "$STATUS" = "completed" ]; then
+                CONCLUSION=$(gh run view "$RUN_ID" --repo "$REPO" --json conclusion -q '.conclusion')
+                echo "[+] Workflow '$WORKFLOW_NAME' completed with conclusion: $CONCLUSION"
+                
+                if [ "$CONCLUSION" != "success" ]; then
+                  echo "::error::Workflow '$WORKFLOW_NAME' (Run ID: $RUN_ID) failed with conclusion: $CONCLUSION"
+                  exit 1
+                fi
+                break
+              fi
+
+              echo "[*] Workflow '$WORKFLOW_NAME' is still $STATUS... waiting 20s"
+              sleep 20
+            done
+          }
+
+          # Wait for both build pipelines to finish building
+          wait_for_workflow "UML Kernel — LTS latest (VECTOR/VDE)"
+          wait_for_workflow "Build Static Binaries (slirp + vde_plug)"
+
+      - name: Fetch Artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           mkdir -p ./tmp-kernel ./tmp-tools
 
-          echo "[+] Finding latest successful kernel build..."
           KERNEL_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Kernel — LTS latest (VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
-
-          if [ -z "$KERNEL_RUN_ID" ]; then
-            echo "::error::No successful run found for 'UML Kernel — LTS latest (VECTOR/VDE)'"
-            exit 1
-          fi
-
           echo "[+] Downloading artifacts from Kernel Run ID: $KERNEL_RUN_ID"
           gh run download "$KERNEL_RUN_ID" --repo "$REPO" --dir ./tmp-kernel
 
-          echo "[+] Finding latest successful static binaries build..."
           TOOLS_RUN_ID=$(gh run list --repo "$REPO" --workflow "Build Static Binaries (slirp + vde_plug)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
-
-          if [ -z "$TOOLS_RUN_ID" ]; then
-            echo "::error::No successful run found for 'Build Static Binaries (slirp + vde_plug)'"
-            exit 1
-          fi
-
           echo "[+] Downloading artifacts from Tools Run ID: $TOOLS_RUN_ID"
           gh run download "$TOOLS_RUN_ID" --repo "$REPO" --dir ./tmp-tools
 
-      - name: Organize Release Binaries
+      - name: Organize Release Assets
         run: |
           mkdir -p ./release-assets
 
           echo "=== Downloaded Files Structure ==="
           find ./tmp-kernel ./tmp-tools -type f
 
-          # Locate and copy target files regardless of subfolder nesting
+          # Locate and copy target files regardless of artifact folder nesting
           find ./tmp-kernel -type f -name "linux-uml" -exec cp {} ./release-assets/ \;
           find ./tmp-kernel -type f -name "VERSION" -exec cp {} ./release-assets/ \;
           find ./tmp-tools -type f -name "slirp" -exec cp {} ./release-assets/ \;
@@ -94,7 +130,6 @@ jobs:
         run: |
           TAG="${{ steps.vars.outputs.tag_name }}"
           
-          # Extract kernel version info if available
           K_VERSION="Latest LTS"
           if [ -f ./release-assets/VERSION ]; then
             K_VERSION=$(cat ./release-assets/VERSION)
