@@ -1,0 +1,91 @@
+name: Publish UML & Networking Tools Release
+
+on:
+  # Automatically release when the kernel workflow finishes successfully
+  workflow_run:
+    workflows: ["UML Kernel — LTS latest (VECTOR/VDE)"]
+    types:
+      - completed
+    branches:
+      - main
+
+  # Allow manual triggering from the Actions tab
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (e.g., v1.0.0 or leave blank for date-based tag)'
+        required: false
+        type: string
+
+jobs:
+  publish-release:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write  # Required to publish releases
+      actions: read    # Required to download artifacts across workflows
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Determine Release Tag & Workspace Preparation
+        id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ./release-assets
+          
+          # Set Tag Name (Defaults to vYYYY.MM.DD-buildNumber if omitted)
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            TAG_NAME="${{ inputs.tag_name }}"
+          else
+            TAG_NAME="v$(date +'%Y.%m.%d')-${{ github.run_number }}"
+          fi
+          
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Fetch Latest Artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "[+] Downloading 'linux-uml-lts-latest' artifact..."
+          # Get the run ID of the latest successful kernel build
+          KERNEL_RUN_ID=$(gh run list --workflow "UML Kernel — LTS latest (VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          gh run download "$KERNEL_RUN_ID" -n "linux-uml-lts-latest" --dir ./tmp-kernel
+
+          echo "[+] Downloading 'slirp-static' and 'vde_plug-static' artifacts..."
+          # Get the run ID of the latest successful static binary build
+          TOOLS_RUN_ID=$(gh run list --workflow "Build Static Binaries (slirp + vde_plug)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          gh run download "$TOOLS_RUN_ID" -n "slirp-static" --dir ./tmp-slirp
+          gh run download "$TOOLS_RUN_ID" -n "vde_plug-static" --dir ./tmp-vde
+
+      - name: Organize Release Binaries
+        run: |
+          # Copy target assets into release staging directory
+          cp ./tmp-kernel/linux-uml ./release-assets/
+          cp ./tmp-kernel/VERSION ./release-assets/
+          cp ./tmp-slirp/slirp ./release-assets/
+          cp ./tmp-slirp/slirp.yaml ./release-assets/ 2>/dev/null || true
+          cp ./tmp-vde/vde_plug ./release-assets/
+
+          echo "=== Files staged for Release ==="
+          ls -lh ./release-assets/
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag_name }}"
+          
+          # Extract kernel version info if available
+          K_VERSION=$(cat ./release-assets/VERSION 2>/dev/null || echo "Latest LTS")
+
+          gh release create "$TAG" ./release-assets/* \
+            --title "UML Kernel & Networking Suite ($TAG)" \
+            --notes "### Included Binaries
+          * **`linux-uml`**: Kernel build for **${K_VERSION}**
+          * **`slirp`**: Static slirp binary with enlarged DHCP pool
+          * **`vde_plug`**: Static vde_plug binary with VECTOR transport support" \
+            --generate-notes
