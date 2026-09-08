@@ -18,6 +18,19 @@ diff --git a/arch/um/Kconfig b/arch/um/Kconfig
  config HOSTFS
  	tristate "Host filesystem"
  	help
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -190,7 +190,8 @@
+ extern void check_host_supports_tls(int *supports_tls, int *tls_min);
+ extern void get_host_cpu_features(
+ 	void (*flags_helper_func)(char *line),
+-	void (*cache_helper_func)(char *line));
++	void (*cache_helper_func)(char *line),
++	void (*model_helper_func)(char *line));
+ 
+ /* mem.c */
+ extern int create_mem_file(unsigned long long len);
 diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
 --- a/arch/um/kernel/um_arch.c
 +++ b/arch/um/kernel/um_arch.c
