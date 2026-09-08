@@ -1,0 +1,92 @@
+diff --git a/arch/um/Kconfig b/arch/um/Kconfig
+--- a/arch/um/Kconfig
++++ b/arch/um/Kconfig
+@@ -129,6 +129,16 @@
+ 	  might otherwise unexpected use libraries from /lib or /lib64
+ 	  instead of the desired ones.
+ 
++config UML_CPU_MODEL
++	string "CPU model name shown in /proc/cpuinfo"
++	default ""
++	help
++	  By default UML reports the host CPU model name in /proc/cpuinfo
++	  (read from the host's /proc/cpuinfo at boot, falling back to
++	  "UML" if it cannot be read). Set this to a fixed string to always
++	  show that instead, for example to mask the real host CPU or to
++	  satisfy tools that parse this field.
++
+ config HOSTFS
+ 	tristate "Host filesystem"
+ 	help
+diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
+--- a/arch/um/kernel/um_arch.c
++++ b/arch/um/kernel/um_arch.c
+@@ -74,2 +74,17 @@
+ 
++static char host_cpu_model[128];
++static char cpu_model[128] = CONFIG_UML_CPU_MODEL;
++
++static void parse_host_cpu_model(char *line)
++{
++	char *p = strstr(line, ":");
++	if (p) {
++		p++;
++		while (*p != 0 && isspace(*p))
++			p++;
++		strscpy(host_cpu_model, p, sizeof(host_cpu_model));
++		strim(host_cpu_model);
++	}
++}
++
+ static int show_cpuinfo(struct seq_file *m, void *v)
+diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
+--- a/arch/um/kernel/um_arch.c
++++ b/arch/um/kernel/um_arch.c
+@@ -95,3 +95,5 @@
+ 	seq_printf(m, "vendor_id\t: User Mode Linux\n");
+-	seq_printf(m, "model name\t: UML\n");
++	seq_printf(m, "model name\t: %s\n",
++		   cpu_model[0] ? cpu_model :
++		   host_cpu_model[0] ? host_cpu_model : "UML");
+ 	seq_printf(m, "mode\t\t: skas\n");
+diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
+--- a/arch/um/kernel/um_arch.c
++++ b/arch/um/kernel/um_arch.c
+@@ -359,7 +359,8 @@
+ 	/* OS sanity checks that need to happen before the kernel runs */
+ 	os_early_checks();
+ 
+-	get_host_cpu_features(parse_host_cpu_flags, parse_cache_line);
++	get_host_cpu_features(parse_host_cpu_flags, parse_cache_line,
++			      parse_host_cpu_model);
+ 
+ 	brk_start = (unsigned long) sbrk(0);
+ 
+diff --git a/arch/um/os-Linux/start_up.c b/arch/um/os-Linux/start_up.c
+--- a/arch/um/os-Linux/start_up.c
++++ b/arch/um/os-Linux/start_up.c
+@@ -249,7 +249,8 @@
+ 
+ void  __init get_host_cpu_features(
+ 		void (*flags_helper_func)(char *line),
+-		void (*cache_helper_func)(char *line))
++		void (*cache_helper_func)(char *line),
++		void (*model_helper_func)(char *line))
+ {
+ 	FILE *cpuinfo;
+ 	char *line = NULL;
+@@ -269,9 +270,13 @@
+ 				cache_helper_func(line);
+ 				done_parsing++;
+ 			}
++			if (strstr(line, "model name")) {
++				model_helper_func(line);
++				done_parsing++;
++			}
+ 			free(line);
+ 			line = NULL;
+-			if (done_parsing > 1)
++			if (done_parsing > 2)
+ 				break;
+ 		}
+ 		fclose(cpuinfo);
