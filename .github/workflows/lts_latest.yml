@@ -8,6 +8,11 @@ on:
   schedule:
     - cron: '0 12 * * 1'          # every Monday
   workflow_dispatch:
+    inputs:
+      cpu_model:
+        description: 'CPU model name to report in /proc/cpuinfo (blank = show the host CPU)'
+        required: false
+        type: string
 
 jobs:
   build:
@@ -81,6 +86,12 @@ jobs:
         run: |
           cd linux-${{ env.KVER }}
           make ARCH=um defconfig
+
+          # --- cpu model override (blank = show host CPU at boot) ---
+          if [ -n "${{ inputs.cpu_model }}" ]; then
+            echo "[+] Setting CONFIG_UML_CPU_MODEL to '${{ inputs.cpu_model }}'"
+            scripts/config --file .config --set-str CONFIG_UML_CPU_MODEL "${{ inputs.cpu_model }}"
+          fi
 
           # --- common options ---
           scripts/config --file .config \
