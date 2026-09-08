@@ -34,7 +34,7 @@ diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
 diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
 --- a/arch/um/kernel/um_arch.c
 +++ b/arch/um/kernel/um_arch.c
-@@ -74,2 +74,23 @@
+@@ -74,2 +74,66 @@
  
 +static char host_cpu_model[128];
 +static char host_cpu_mhz[32];
@@ -57,17 +57,61 @@ diff --git a/arch/um/kernel/um_arch.c b/arch/um/kernel/um_arch.c
 +	}
 +}
 +
++static void refresh_host_cpu_mhz(void)
++{
++	char buf[4096];
++	char *line, *p, *nl;
++	int fd, len = 0, n, tail;
++
++	fd = os_open_file("/proc/cpuinfo", of_read(OPENFLAGS()), 0);
++	if (fd < 0)
++		return;
++
++	while ((n = os_read_file(fd, buf + len, sizeof(buf) - 1 - len)) > 0 &&
++	       len < sizeof(buf) - 1) {
++		len += n;
++		buf[len] = '\0';
++		line = buf;
++		while ((nl = strchr(line, '\n')) != NULL) {
++			*nl = '\0';
++			if (strstr(line, "cpu MHz")) {
++				p = strchr(line, ':');
++				if (p) {
++					p++;
++					while (*p != 0 && isspace(*p))
++						p++;
++					if (*p) {
++						strscpy(host_cpu_mhz, p,
++							sizeof(host_cpu_mhz));
++						strim(host_cpu_mhz);
++						os_close_file(fd);
++						return;
++					}
++				}
++			}
++			line = nl + 1;
++		}
++		tail = strlen(line);
++		if (tail == 0 || tail == len)
++			break;
++		memmove(buf, line, tail + 1);
++		len = tail;
++	}
++	os_close_file(fd);
++}
++
  static int show_cpuinfo(struct seq_file *m, void *v)
-@@ -80,3 +101,7 @@
+@@ -80,3 +144,8 @@
  	seq_printf(m, "vendor_id\t: User Mode Linux\n");
 -	seq_printf(m, "model name\t: UML\n");
 +	seq_printf(m, "model name\t: %s\n",
 +		   cpu_model[0] ? cpu_model :
 +		   host_cpu_model[0] ? host_cpu_model : "UML");
++	refresh_host_cpu_mhz();
 +	seq_printf(m, "cpu MHz\t\t: %s\n",
 +		   host_cpu_mhz[0] ? host_cpu_mhz : "0.000");
  	seq_printf(m, "mode\t\t: skas\n");
-@@ -344,3 +369,4 @@
+@@ -344,3 +413,4 @@
  
 -	get_host_cpu_features(parse_host_cpu_flags, parse_cache_line);
 +	get_host_cpu_features(parse_host_cpu_flags, parse_cache_line,
