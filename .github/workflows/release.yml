@@ -7,6 +7,10 @@ on:
         description: 'Release Tag (e.g., v1.0.0 or leave blank for date-based tag)'
         required: false
         type: string
+      cpu_model:
+        description: 'CPU model name to report in /proc/cpuinfo (blank = show the host CPU)'
+        required: false
+        type: string
 
 jobs:
   trigger-build-and-release:
@@ -38,7 +42,12 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "[+] Triggering 'UML Kernel — LTS latest (VECTOR/VDE)'..."
-          gh workflow run "UML Kernel — LTS latest (VECTOR/VDE)" --repo "$REPO" --ref "${{ github.ref_name }}"
+          EXTRA_ARGS=()
+          if [ -n "${{ inputs.cpu_model }}" ]; then
+            echo "[+] Forwarding cpu_model='${{ inputs.cpu_model }}' to build workflow"
+            EXTRA_ARGS+=(-f "cpu_model=${{ inputs.cpu_model }}")
+          fi
+          gh workflow run "UML Kernel — LTS latest (VECTOR/VDE)" --repo "$REPO" --ref "${{ github.ref_name }}" "${EXTRA_ARGS[@]}"
 
           echo "[+] Triggering 'Build Static Binaries (slirp + vde_plug)'..."
           gh workflow run "Build Static Binaries (slirp + vde_plug)" --repo "$REPO" --ref "${{ github.ref_name }}"
