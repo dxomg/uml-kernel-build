@@ -52,6 +52,9 @@ jobs:
           echo "[+] Triggering 'Build Static Binaries (slirp + vde_plug)'..."
           gh workflow run "Build Static Binaries (slirp + vde_plug)" --repo "$REPO" --ref "${{ github.ref_name }}"
 
+          echo "[+] Triggering 'UML Base Image (distro-agnostic, VECTOR/VDE)'..."
+          gh workflow run "UML Base Image (distro-agnostic, VECTOR/VDE)" --repo "$REPO" --ref "${{ github.ref_name }}"
+
           # Give GitHub API a few seconds to register the new runs
           sleep 10
 
@@ -97,16 +100,17 @@ jobs:
             done
           }
 
-          # Wait for both build pipelines to finish building
+          # Wait for all build pipelines to finish building
           wait_for_workflow "UML Kernel — LTS latest (VECTOR/VDE)"
           wait_for_workflow "Build Static Binaries (slirp + vde_plug)"
+          wait_for_workflow "UML Base Image (distro-agnostic, VECTOR/VDE)"
 
       - name: Fetch Artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          mkdir -p ./tmp-kernel ./tmp-tools
+          mkdir -p ./tmp-kernel ./tmp-tools ./tmp-images
 
           KERNEL_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Kernel — LTS latest (VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
           echo "[+] Downloading artifacts from Kernel Run ID: $KERNEL_RUN_ID"
@@ -116,12 +120,16 @@ jobs:
           echo "[+] Downloading artifacts from Tools Run ID: $TOOLS_RUN_ID"
           gh run download "$TOOLS_RUN_ID" --repo "$REPO" --dir ./tmp-tools
 
+          IMAGE_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Base Image (distro-agnostic, VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          echo "[+] Downloading artifacts from Image Run ID: $IMAGE_RUN_ID"
+          gh run download "$IMAGE_RUN_ID" --repo "$REPO" --dir ./tmp-images
+
       - name: Organize Release Assets
         run: |
           mkdir -p ./release-assets
 
           echo "=== Downloaded Files Structure ==="
-          find ./tmp-kernel ./tmp-tools -type f
+          find ./tmp-kernel ./tmp-tools ./tmp-images -type f
 
           # Locate and copy target files regardless of artifact folder nesting
           find ./tmp-kernel -type f -name "linux-uml" -exec cp {} ./release-assets/ \;
@@ -129,6 +137,7 @@ jobs:
           find ./tmp-tools -type f -name "slirp" -exec cp {} ./release-assets/ \;
           find ./tmp-tools -type f -name "slirp.yaml" -exec cp {} ./release-assets/ \;
           find ./tmp-tools -type f -name "vde_plug" -exec cp {} ./release-assets/ \;
+          find ./tmp-images -type f -name "*.img.gz" -exec cp {} ./release-assets/ \;
 
           echo "=== Staged Release Assets ==="
           ls -lh ./release-assets/
@@ -149,5 +158,8 @@ jobs:
             --notes "### Included Binaries
           * **\`linux-uml\`**: Kernel build for **${K_VERSION}**
           * **\`slirp\`**: Static slirp binary with enlarged DHCP pool
-          * **\`vde_plug\`**: Static vde_plug binary with VECTOR transport support" \
+          * **\`vde_plug\`**: Static vde_plug binary with VECTOR transport support
+
+          ### Included Images
+          * **\`base-*.img.gz\`**: Fresh UML rootfs cloud images (Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10) with cloud-init NoCloud networking baked in" \
             --generate-notes
