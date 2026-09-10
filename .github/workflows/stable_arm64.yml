@@ -125,7 +125,6 @@ jobs:
           cd linux-${{ env.KVER }}
           # LDFLAGS must reach the stub link too: see workflow header notes.
           MAKE="make ARCH=um SUBARCH=arm64 LLVM=1"
-          STUB_LDFLAGS='STUB_EXE_LDFLAGS=-Wl,-n -Wl,--no-rosegment -static -fuse-ld=lld'
 
           $MAKE defconfig
 
@@ -220,7 +219,8 @@ jobs:
           grep -q '^CONFIG_64BIT=y' .config || {
             echo "::error::not an arm64 (64BIT) config — SUBARCH=arm64 did not stick"; exit 1; }
 
-          $MAKE $STUB_LDFLAGS -j"$(nproc)"
+          $MAKE STUB_EXE_LDFLAGS='-Wl,-n -Wl,--no-rosegment -static -fuse-ld=lld' \
+            -j"$(nproc)"
 
       - name: Strip & upload
         run: |
