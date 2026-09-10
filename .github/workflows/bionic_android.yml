@@ -65,15 +65,21 @@ jobs:
 
       - name: Download & extract linux-7.2.4
         run: |
-          curl -fL --retry 3 -o linux.tar.xz \
+          # Outside the checkout repo on purpose: `git apply` run from a
+          # subdirectory of a repository resolves patch paths against the repo
+          # root and silently ignores everything outside the cwd — every patch
+          # would no-op with exit 0. The kernel tree must live where repo
+          # discovery finds no repository.
+          curl -fL --retry 3 -o "$RUNNER_TEMP/linux.tar.xz" \
             https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.4.tar.xz
-          tar xf linux.tar.xz
+          tar xf "$RUNNER_TEMP/linux.tar.xz" -C "$RUNNER_TEMP"
+          echo "KDIR=$RUNNER_TEMP/linux-7.2.4" >> "$GITHUB_ENV"
 
       - name: Apply bundled UML patches
         run: |
-          cd linux-7.2.4
+          cd "$KDIR"
           shopt -s nullglob
-          for p in ../patches/*.patch; do
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
             # Applied separately below — it must apply cleanly or the build fails.
             case "$(basename "$p")" in arm64-port-*) continue;; esac
             echo "[+] Applying $(basename "$p")"
@@ -82,16 +88,20 @@ jobs:
 
       - name: Apply arm64 port series (consolidated, must apply cleanly)
         run: |
-          cd linux-7.2.4
-          git apply --check ../patches/arm64-port-7.2.4.patch || {
+          cd "$KDIR"
+          git apply --check "$GITHUB_WORKSPACE/patches/arm64-port-7.2.4.patch" || {
             echo "::error::arm64 port does not apply on linux-7.2.4 + bundled patches"
             exit 1
           }
-          git apply ../patches/arm64-port-7.2.4.patch
+          git apply "$GITHUB_WORKSPACE/patches/arm64-port-7.2.4.patch"
+          # Belt and suspenders against a vacuous git apply (repo-relative path
+          # resolution): the harness is the port's own build entry point.
+          [ -f tools/um-arm64/harness/build-bionic.sh ] \
+            || { echo "::error::harness missing after apply — patch was a no-op"; exit 1; }
 
       - name: unwind_user.h for UML
         run: |
-          cd linux-7.2.4
+          cd "$KDIR"
           if [ -f arch/x86/include/asm/unwind_user.h ] && \
              ! grep -q unwind_user arch/um/include/asm/Kbuild 2>/dev/null; then
             echo 'generic-y += unwind_user.h' >> arch/um/include/asm/Kbuild
@@ -99,25 +109,25 @@ jobs:
 
       - name: Build (harness/build-bionic.sh)
         run: |
-          cd linux-7.2.4
+          cd "$KDIR"
           NDK="$NDK" JOBS="$(nproc)" bash tools/um-arm64/harness/build-bionic.sh
 
       - name: Verify + strip
         run: |
           set -euxo pipefail
-          file -b artifacts/linux-bionic | grep -q 'ARM aarch64.*statically linked' \
+          file -b "$RUNNER_TEMP/artifacts/linux-bionic" | grep -q 'ARM aarch64.*statically linked' \
             || { echo "not a static aarch64 binary" >&2; exit 1; }
-          $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip artifacts/linux-bionic
-          ls -lh artifacts/
+          $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "$RUNNER_TEMP/artifacts/linux-bionic"
+          ls -lh "$RUNNER_TEMP/artifacts/"
 
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v6
         with:
           name: linux-bionic-arm64
           path: |
-            artifacts/linux-bionic
-            artifacts/stub_exe_bionic
-            artifacts/build-bionic-*.log
+            ${{ runner.temp }}/artifacts/linux-bionic
+            ${{ runner.temp }}/artifacts/stub_exe_bionic
+            ${{ runner.temp }}/artifacts/build-bionic-*.log
 
   helpers:
     runs-on: ubuntu-22.04
