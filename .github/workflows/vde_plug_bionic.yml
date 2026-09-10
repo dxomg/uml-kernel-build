@@ -151,7 +151,9 @@ jobs:
           cmake_minimum_required(VERSION 3.16)
           project(vdeslirp LANGUAGES C)
           set(CMAKE_C_STANDARD 11)
-          set(CMAKE_C_FLAGS "-O2 -Wall")
+          # bionic does not transitively include <string.h> the way glibc does:
+          # force it, libvdeslirp.c calls memset/memcmp without including it.
+          set(CMAKE_C_FLAGS "-O2 -Wall -include string.h")
           set(CMAKE_POSITION_INDEPENDENT_CODE ON)
           include(GNUInstallDirs)
           configure_file(config.h.in config.h)
