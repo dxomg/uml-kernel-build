@@ -1,11 +1,21 @@
-name: "Build bionic helpers (vde_plug + slirp, Android NDK)"
+name: "Build bionic (Android NDK) — kernel + network helpers"
 
-# Cross-compiles the two userspace network helpers against bionic so they can
-# run inside an Android app. A glibc binary — even fully static — dies in an
-# app before main(): zygote starts the process with a seccomp filter already
-# installed, and glibc's startup issues rseq(2) and set_robust_list(2), which
-# that filter kills (status 159, no output). bionic is the libc the filter was
-# written for.
+# Two bionic artifacts for running UML inside an Android app:
+#
+#   kernel   linux-bionic — the UML kernel (7.2.4 + bundled patches + arm64
+#            port series) linked static against bionic, built by the port's
+#            own harness/build-bionic.sh. Config is defconfig + STATIC_LINK +
+#            UML_NET_VECTOR; pass EXTRA_CONFIG for docker/usb-wifi fragments
+#            when building by hand.
+#   helpers  vde_plug + slirp network helpers linked static against bionic
+#            (libffi/pcre2/libyaml/glib/proxy-libintl/libslirp/libvdeslirp,
+#            slirp with the DHCP pool raised to 240).
+#
+# Why bionic at all: an app process is started by zygote with a seccomp filter
+# already installed, and glibc's startup issues rseq(2) and set_robust_list(2),
+# which that filter kills — a glibc binary, even fully static, dies before
+# main() with status 159 and no output. bionic is the libc the filter was
+# written for. glibc static remains fine under `adb shell`.
 #
 # Why the x86_64 runner despite the aarch64 target: the Android NDK only ships
 # an x86_64-linux hosted toolchain (there is no linux-arm64 prebuilt), and the
@@ -16,7 +26,8 @@ name: "Build bionic helpers (vde_plug + slirp, Android NDK)"
 # Everything is linked static with 16 KiB LOAD alignment: Android has no
 # dynamic loader an app can use, and Android 15+ devices ship 16K-page kernels
 # whose ELF loader rejects binaries aligned below the page size (the kernel
-# image dodges this by linking at 64K; these get max-page-size explicitly).
+# image dodges this by linking at 64K; everything here gets max-page-size
+# explicitly).
 
 on:
   workflow_dispatch:
@@ -24,16 +35,93 @@ on:
     paths:
       - 'vde_plug/**'
       - 'slirp.c'
-      - '.github/workflows/vde_plug_bionic.yml'
+      - 'patches/**'
+      - '.github/workflows/bionic_android.yml'
 
 env:
   # Oldest bionic declaring everything the helpers use: statx(30), getrandom(28).
   API: '30'
 
 jobs:
-  bionic:
+  kernel:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y
+          # HOSTCC is the only thing using the host clang (build-bionic.sh pins
+          # it to /usr/bin/clang); the target compiler is the NDK's clang.
+          sudo apt-get install -y build-essential clang flex bison bc \
+            libssl-dev libelf-dev file unzip cpio
+
+      - name: Download Android NDK r27c
+        run: |
+          curl -fL --retry 3 -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q ndk.zip -d "$RUNNER_TEMP/ndk"
+          echo "NDK=$RUNNER_TEMP/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Download & extract linux-7.2.4
+        run: |
+          curl -fL --retry 3 -o linux.tar.xz \
+            https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.4.tar.xz
+          tar xf linux.tar.xz
+
+      - name: Apply bundled UML patches
+        run: |
+          cd linux-7.2.4
+          shopt -s nullglob
+          for p in ../patches/*.patch; do
+            # Applied separately below — it must apply cleanly or the build fails.
+            case "$(basename "$p")" in arm64-port-*) continue;; esac
+            echo "[+] Applying $(basename "$p")"
+            git apply "$p" || patch -p1 --fuzz=3 < "$p" || exit 1
+          done
+
+      - name: Apply arm64 port series (consolidated, must apply cleanly)
+        run: |
+          cd linux-7.2.4
+          git apply --check ../patches/arm64-port-7.2.4.patch || {
+            echo "::error::arm64 port does not apply on linux-7.2.4 + bundled patches"
+            exit 1
+          }
+          git apply ../patches/arm64-port-7.2.4.patch
+
+      - name: unwind_user.h for UML
+        run: |
+          cd linux-7.2.4
+          if [ -f arch/x86/include/asm/unwind_user.h ] && \
+             ! grep -q unwind_user arch/um/include/asm/Kbuild 2>/dev/null; then
+            echo 'generic-y += unwind_user.h' >> arch/um/include/asm/Kbuild
+          fi
+
+      - name: Build (harness/build-bionic.sh)
+        run: |
+          cd linux-7.2.4
+          NDK="$NDK" JOBS="$(nproc)" bash tools/um-arm64/harness/build-bionic.sh
+
+      - name: Verify + strip
+        run: |
+          set -euxo pipefail
+          file -b artifacts/linux-bionic | grep -q 'ARM aarch64.*statically linked' \
+            || { echo "not a static aarch64 binary" >&2; exit 1; }
+          $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip artifacts/linux-bionic
+          ls -lh artifacts/
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-bionic-arm64
+          path: |
+            artifacts/linux-bionic
+            artifacts/stub_exe_bionic
+            artifacts/build-bionic-*.log
+
+  helpers:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
 

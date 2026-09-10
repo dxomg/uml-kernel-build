@@ -413,6 +413,25 @@ carry a `-arm64` suffix; the amd64 names are unchanged. Artifacts hold raw
 (uncompressed) images — `release.yml` gzips them when staging release
 assets, so published assets keep the `base-*.img.gz` format.
 
+### CI: bionic artifacts (`bionic_android.yml`)
+
+One workflow, two jobs, producing the Android-app bionic set (cross-built on
+an x86_64 runner — the NDK only ships an x86_64-linux hosted toolchain):
+
+* **kernel** — `linux-bionic` + `stub_exe_bionic`, built by the port's own
+  `harness/build-bionic.sh` on 7.2.4 + bundled patches + the arm64 series
+  (defconfig + `STATIC_LINK` + `UML_NET_VECTOR`).
+* **helpers** — `vde_plug` + `slirp` linked static against bionic, every
+  dependency cross-built in the same run (libffi, pcre2, libyaml, glib,
+  proxy-libintl, libslirp with the 240-lease DHCP pool, libvdeslirp).
+
+All binaries link with 16 KiB LOAD alignment and no `PT_INTERP`, so they load
+and exec inside an app: zygote starts app processes with a seccomp filter that
+kills glibc's startup (`rseq(2)`, `set_robust_list(2)`) before `main()`, and
+bionic is the libc that filter was written for. glibc static stays fine under
+`adb shell`. The helpers job verifies each binary (aarch64, static, no
+interpreter, LOAD aligned ≥ 16K) before uploading.
+
 ## Container support (Docker / Podman / LXC)
 
 `patches/containers.config` is merged into every kernel build, then the
