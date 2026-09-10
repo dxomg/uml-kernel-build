@@ -8,7 +8,10 @@ name: "UML Base Image (distro-agnostic, VECTOR/VDE)"
 # Cloud-init is the network renderer: it writes the distro-native config
 # (netplan on Ubuntu, systemd-networkd on Debian, NetworkManager on EL).
 #
-# Artifacts: base-<distro>-<release>.img.gz + VERSION
+# Artifacts: base-<distro>-<release>.img.gz (amd64, names unchanged) and
+# base-<distro>-<release>-arm64.img.gz + VERSION.  Every distro/release pair
+# builds for both architectures; arm64 runs natively on an arm runner (same
+# pattern as stable_arm64.yml), so no qemu/chroot emulation is involved.
 # Runs weekly Monday + manual trigger.
 
 on:
@@ -18,27 +21,93 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # --- amd64: original matrix (artifact names unchanged) ---
           - distro: ubuntu
             release: noble
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
           - distro: ubuntu
             release: resolute
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
           - distro: debian
             release: bookworm
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
           - distro: debian
             release: trixie
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
           - distro: rockylinux
             release: "9"
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
           - distro: rockylinux
             release: "10"
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
           - distro: almalinux
             release: "9"
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
           - distro: almalinux
             release: "10"
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
+          # --- arm64: same pairs, built natively on arm runners ---
+          - distro: ubuntu
+            release: noble
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            suffix: "-arm64"
+          - distro: ubuntu
+            release: resolute
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            suffix: "-arm64"
+          - distro: debian
+            release: bookworm
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            suffix: "-arm64"
+          - distro: debian
+            release: trixie
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            suffix: "-arm64"
+          - distro: rockylinux
+            release: "9"
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            suffix: "-arm64"
+          - distro: rockylinux
+            release: "10"
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            suffix: "-arm64"
+          - distro: almalinux
+            release: "9"
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            suffix: "-arm64"
+          - distro: almalinux
+            release: "10"
+            arch: arm64
+            runner: ubuntu-22.04-arm
+            suffix: "-arm64"
 
     steps:
       - uses: actions/checkout@v6
@@ -53,9 +122,10 @@ jobs:
           URL_PATH=$(curl -s http://images.linuxcontainers.org/meta/1.0/index-system \
             | grep -v edge \
             | awk '-F;' -v d="${{ matrix.distro }}" -v r="${{ matrix.release }}" \
-              '(($1==d) && ($2==r) && ($3=="amd64") && ($4=="cloud")) {print $NF}')
+                  -v a="${{ matrix.arch }}" \
+              '(($1==d) && ($2==r) && ($3==a) && ($4=="cloud")) {print $NF}')
           if [ -z "$URL_PATH" ]; then
-            echo "::error::No cloud variant found for ${{ matrix.distro }} ${{ matrix.release }}"
+            echo "::error::No cloud variant found for ${{ matrix.distro }} ${{ matrix.release }} ${{ matrix.arch }}"
             exit 1
           fi
           wget -O rootfs.tar.xz \
@@ -216,16 +286,16 @@ jobs:
         run: |
           cp --sparse=always base.img base-sparse.img
           mv -f base-sparse.img base.img
-          OUT=base-${{ matrix.distro }}-${{ matrix.release }}.img.gz
+          OUT=base-${{ matrix.distro }}-${{ matrix.release }}${{ matrix.suffix }}.img.gz
           gzip -6 -c base.img > "$OUT"
-          echo "$(date -u +%Y-%m-%d) distro=${{ matrix.distro }} release=${{ matrix.release }} rootfs=${{ env.SERIAL }}" \
+          echo "$(date -u +%Y-%m-%d) arch=${{ matrix.arch }} distro=${{ matrix.distro }} release=${{ matrix.release }} rootfs=${{ env.SERIAL }}" \
             > VERSION
           ls -lh "$OUT" VERSION
 
       - uses: actions/upload-artifact@v6
         with:
-          name: uml-base-${{ matrix.distro }}-${{ matrix.release }}
+          name: uml-base-${{ matrix.distro }}-${{ matrix.release }}${{ matrix.suffix }}
           path: |
-            base-${{ matrix.distro }}-${{ matrix.release }}.img.gz
+            base-${{ matrix.distro }}-${{ matrix.release }}${{ matrix.suffix }}.img.gz
             VERSION
           retention-days: 30

@@ -407,6 +407,11 @@ does not apply. The x86-relevant parts (generic `um/` fixes, the cpuinfo
 callback split) were compile-tested on the merged tree with
 `make ARCH=um LLVM=1`.
 
+The base images follow along: `base_image.yml` builds every distro/release
+pair for arm64 as well, natively on an arm runner (no qemu). Arm64 artifacts
+carry a `-arm64` suffix (`base-ubuntu-noble-arm64.img.gz`); the amd64 names
+are unchanged.
+
 ## Container support (Docker / Podman / LXC)
 
 `patches/containers.config` is merged into every kernel build, then the

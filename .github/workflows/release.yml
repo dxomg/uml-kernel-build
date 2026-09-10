@@ -161,5 +161,5 @@ jobs:
           * **\`vde_plug\`**: Static vde_plug binary with VECTOR transport support
 
           ### Included Images
-          * **\`base-*.img.gz\`**: Fresh UML rootfs cloud images (Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10) with cloud-init NoCloud networking baked in" \
+          * **\`base-*.img.gz\`**: Fresh UML rootfs cloud images (Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10; amd64 + arm64) with cloud-init NoCloud networking baked in" \
             --generate-notes
