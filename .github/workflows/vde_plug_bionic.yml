@@ -129,6 +129,17 @@ jobs:
           meson compile -C build-glib
           meson install -C build-glib
 
+      - name: Build proxy-libintl (static gettext shim)
+        run: |
+          set -euxo pipefail
+          # glib's objects reference g_libintl_* regardless of -Dnls; this tiny
+          # shim (glib's own recommendation for static builds) provides them.
+          git clone --depth 1 https://github.com/frida/proxy-libintl.git
+          meson setup build-intl proxy-libintl --cross-file=cross.ini \
+            --prefix="$PREFIX" -Ddefault_library=static
+          meson compile -C build-intl
+          meson install -C build-intl
+
       - name: Build libslirp (static, bionic, DHCP pool 240)
         run: |
           set -euxo pipefail
@@ -180,7 +191,8 @@ jobs:
                   -I$PREFIX/include -I$PREFIX/include/slirp -Ilibvdeslirp -Ilibvdeslirp/build"
           LIBS="libvdeslirp/build/libvdeslirp.a \
                 $PREFIX/lib/libslirp.a $PREFIX/lib/libyaml.a \
-                $PREFIX/lib/libglib-2.0.a $PREFIX/lib/libpcre2-8.a $PREFIX/lib/libffi.a \
+                $PREFIX/lib/libglib-2.0.a $PREFIX/lib/libintl.a \
+                $PREFIX/lib/libpcre2-8.a $PREFIX/lib/libffi.a \
                 -lm"
           $CC $CFLAGS -o vde_plug_bionic vde_plug/vde_plug.c $LIBS
           $CC $CFLAGS -o slirp_bionic slirp.c $LIBS
