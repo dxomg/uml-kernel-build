@@ -289,9 +289,8 @@ jobs:
         run: |
           # Uploaded uncompressed: GitHub zips artifact downloads anyway;
           # release.yml gzips when staging release assets.
-          cp --sparse=always base.img base-sparse.img
-          mv -f base-sparse.img base.img
           OUT=base-${{ matrix.distro }}-${{ matrix.release }}${{ matrix.suffix }}.img
+          cp --sparse=always base.img "$OUT"
           echo "$(date -u +%Y-%m-%d) arch=${{ matrix.arch }} distro=${{ matrix.distro }} release=${{ matrix.release }} rootfs=${{ env.SERIAL }}" \
             > VERSION
           ls -lh "$OUT" VERSION
