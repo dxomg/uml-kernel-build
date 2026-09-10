@@ -163,7 +163,7 @@ jobs:
             $ENV{SLIRP_PREFIX}/include $ENV{SLIRP_PREFIX}/include/slirp)
           set_target_properties(vdeslirp PROPERTIES OUTPUT_NAME "vdeslirp")
           install(TARGETS vdeslirp DESTINATION ${CMAKE_INSTALL_LIBDIR})
-          install(FILES libvdeslirp.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+          install(FILES libvdeslirp.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/slirp)
           CMAKEOF
           SLIRP_PREFIX="$PREFIX" cmake -S libvdeslirp -B libvdeslirp/build \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
