@@ -137,7 +137,13 @@ jobs:
           find ./tmp-tools -type f -name "slirp" -exec cp {} ./release-assets/ \;
           find ./tmp-tools -type f -name "slirp.yaml" -exec cp {} ./release-assets/ \;
           find ./tmp-tools -type f -name "vde_plug" -exec cp {} ./release-assets/ \;
-          find ./tmp-images -type f -name "*.img.gz" -exec cp {} ./release-assets/ \;
+          # Base image artifacts are raw .img (compression moved out of the
+          # build matrix) — gzip here so release assets keep the .img.gz
+          # format.
+          find ./tmp-images -type f -name "*.img" | while read -r f; do
+            echo "[+] Compressing $(basename "$f")"
+            gzip -6 -c "$f" > "./release-assets/$(basename "$f").gz"
+          done
 
           echo "=== Staged Release Assets ==="
           ls -lh ./release-assets/
