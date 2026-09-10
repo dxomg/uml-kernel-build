@@ -366,6 +366,47 @@ set was compile-tested. `apply-backports.sh` must run **after**
 `apply-smp.sh` — the reaper fix builds on the SMP backport's threading
 changes in `os-Linux/skas/process.c`.
 
+### Full arm64 port for 7.2.4 (`patches/arm64-port-7.2.4.patch`, `stable_arm64.yml`)
+
+The arm64 subarch skeleton has since landed in the uml tree as a complete
+**54-commit series** rebased on **v7.2.4**. `arm64-port-7.2.4.patch` is that
+series, consolidated: every commit was applied in order on top of v7.2.4 +
+this repo's bundled patches (including `vector-static-link.patch`, whose
+`MAY_HAVE_RUNTIME_DEPS` removal the series' bionic commit redoes with a full
+explanation in `arch/um/drivers/Kconfig`), and the handful of hunks that
+conflicted were merged by hand. It applies as a single clean `git apply`.
+
+What it brings to `ARCH=um SUBARCH=arm64`:
+
+* the `arch/arm64/um/` subarch (defconfig, ptrace/signal, FP/SIMD state
+  save/restore across signals, `arm64_defconfig` with 16 KB pages)
+* loadable module support, and build against bionic (Android NDK)
+* the 7.2 stub rework fixes: no `-ENOSYS` leak into the first guest syscall,
+  syscall interception where `-1` cannot be written, elided stub-handoff
+  wake with brief spin, cycle-counter probe
+* `/proc/cpuinfo` reworked behind `arch_show_cpuinfo()` /
+  `arch_parse_host_cpu_flags()` callbacks so each subarch prints the same
+  lines real `/proc/cpuinfo` has (x86: `fpu`/`flags`; arm64: `Features`);
+  `get_host_cpu_features()` now takes a single line callback
+
+`.github/workflows/stable_arm64.yml` builds it on `ubuntu-22.04-arm`
+(**native** — no cross toolchain or sysroot needed) with `LLVM=1`. The jammy
+archive only ships clang 14, too old for the stub link below, so the workflow
+installs LLVM 18 from apt.llvm.org first. Two
+toolchain notes carry over to any manual build:
+
+* `LLVM=1` is required on 7.2.x: the stub link uses `-Wl,--no-rosegment`,
+  which GNU ld (≤ 2.43) rejects. The stub link goes through the clang
+  driver, which does not pick up lld from `LLVM=1`, so the make invocation
+  passes `STUB_EXE_LDFLAGS="-Wl,-n -Wl,--no-rosegment -static -fuse-ld=lld"`.
+* The UML SMP backport is **not** applied here — 7.2.4 has native SMP, and
+  the series was gate-tested against the plain tree.
+
+The x86 workflows are unaffected: they target 6.18 LTS, where this patch
+does not apply. The x86-relevant parts (generic `um/` fixes, the cpuinfo
+callback split) were compile-tested on the merged tree with
+`make ARCH=um LLVM=1`.
+
 ## Container support (Docker / Podman / LXC)
 
 `patches/containers.config` is merged into every kernel build, then the
