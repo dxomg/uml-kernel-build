@@ -73,6 +73,11 @@ jobs:
             fi
           done
 
+      - name: Apply backported UML fixes (linux-um-arm64)
+        run: |
+          cd linux-${{ env.KVER }}
+          bash ../patches/apply-backports.sh ../patches
+
       - name: Patch UML (unwind_user.h)
         run: |
           cd linux-${{ env.KVER }}

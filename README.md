@@ -331,6 +331,41 @@ process — kernel-mode execution and kthreads are parallel, but userspace
 threads of a single process still serialize within that process's stub.
 This is an upstream limitation of the initial SMP support.
 
+### Backported generic UML fixes (`patches/um-backport/`)
+
+The [linux-um-arm64](https://github.com/zalexdev/linux-um-arm64) series
+(41 commits on a 7.2-rc4 uml-tree base) contains a set of generic `um/`
+and x86 fixes that are not arm64-specific. Three of them apply cleanly to
+6.18.x **on top of the SMP backport** and are shipped here.
+`patches/apply-backports.sh` applies them after the bundled patches,
+best-effort (`git apply --3way`; a patch whose context drifted is skipped
+with a `::warning`, never fatal):
+
+| Patch | What it does |
+|---|---|
+| `um-backport-01` | `PTRS_PER_PTE` derived from `PAGE_SHIFT` instead of a literal 512 |
+| `um-backport-02` | no panic at shutdown when `uml_dir` was never created |
+| `um-backport-03` | hand dead stubs to the SIGCHLD reaper instead of blocking in `waitpid()` — faster `execve` path, no zombie leak |
+
+Everything else in the series is deliberately **not** backported:
+
+* `um/arm64:` and `tools/um-arm64:` commits need the arm64 UML subarch
+  skeleton, which exists only in the uml tree `next` branch — not in any
+  LTS, and not even in mainline as of v7.2-rc4.
+* The fault-around, ncpus-default and seccomp-probe fixes target the 7.2
+  stub redesign; their context is too far from 6.18 to port mechanically.
+* One more fix that applies cleanly (`ARCH_INIT_SP_RESERVE` for the stub
+  syscall handler stack) is dropped anyway: the symbol it uses does not
+  exist on 6.18 — it arrived with the 7.2 stub redesign. A clean
+  `git apply` is not sufficient on its own; the accepted set is
+  compile-tested before shipping.
+
+Selection was verified empirically: the whole series was applied to
+v6.18.38 + SMP backport with `git apply --check --3way`, and the accepted
+set was compile-tested. `apply-backports.sh` must run **after**
+`apply-smp.sh` — the reaper fix builds on the SMP backport's threading
+changes in `os-Linux/skas/process.c`.
+
 ## Container support (Docker / Podman / LXC)
 
 `patches/containers.config` is merged into every kernel build, then the
