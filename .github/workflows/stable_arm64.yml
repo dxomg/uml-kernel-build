@@ -224,12 +224,9 @@ jobs:
 
       - name: Strip & upload
         run: |
-          cd linux-${{ env.KVER }}
-          file ./linux
-          cp ./linux ../linux-uml-arm64
-          aarch64-linux-gnu-strip ./linux-uml-arm64 2>/dev/null || strip ./linux-uml-arm64
-          echo "${{ env.KVER }} (arm64, VECTOR)" > ../VERSION
-          cd ..
+          cp linux-${{ env.KVER }}/linux ./linux-uml-arm64
+          strip ./linux-uml-arm64
+          echo "${{ env.KVER }} (arm64, VECTOR)" > VERSION
           file ./linux-uml-arm64
 
       - uses: actions/upload-artifact@v6
