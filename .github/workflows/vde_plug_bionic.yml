@@ -1,0 +1,212 @@
+name: "Build bionic helpers (vde_plug + slirp, Android NDK)"
+
+# Cross-compiles the two userspace network helpers against bionic so they can
+# run inside an Android app. A glibc binary — even fully static — dies in an
+# app before main(): zygote starts the process with a seccomp filter already
+# installed, and glibc's startup issues rseq(2) and set_robust_list(2), which
+# that filter kills (status 159, no output). bionic is the libc the filter was
+# written for.
+#
+# Why the x86_64 runner despite the aarch64 target: the Android NDK only ships
+# an x86_64-linux hosted toolchain (there is no linux-arm64 prebuilt), and the
+# arm64 runner has no qemu/binfmt set up to run one. Cross-compiling from
+# x86_64 is what the NDK is designed for anyway — the same reason
+# stable_arm64.yml notes that cross from x86_64 "needs nothing but clang".
+#
+# Everything is linked static with 16 KiB LOAD alignment: Android has no
+# dynamic loader an app can use, and Android 15+ devices ship 16K-page kernels
+# whose ELF loader rejects binaries aligned below the page size (the kernel
+# image dodges this by linking at 64K; these get max-page-size explicitly).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'vde_plug/**'
+      - 'slirp.c'
+      - '.github/workflows/vde_plug_bionic.yml'
+
+env:
+  # Oldest bionic declaring everything the helpers use: statx(30), getrandom(28).
+  API: '30'
+
+jobs:
+  bionic:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config file unzip
+          pip3 install --user meson ninja
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Download Android NDK r27c
+        run: |
+          curl -fL --retry 3 -o ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q ndk.zip -d "$RUNNER_TEMP/ndk"
+          echo "NDK=$RUNNER_TEMP/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Prefix + cross file
+        run: |
+          set -euxo pipefail
+          TOOL=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          cat > cross.ini <<EOF
+          [binaries]
+          c = '$TOOL/aarch64-linux-android$API-clang'
+          cpp = '$TOOL/aarch64-linux-android$API-clang++'
+          ar = '$TOOL/llvm-ar'
+          strip = '$TOOL/llvm-strip'
+          pkg-config = '/usr/bin/pkg-config'
+
+          [built-in options]
+          c_link_args = ['-Wl,-z,max-page-size=16384']
+
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+          echo "PREFIX=$PWD/bionic-prefix" >> "$GITHUB_ENV"
+          # pkg-config must only ever see the cross prefix, never the host's libs.
+          echo "PKG_CONFIG_LIBDIR=$PWD/bionic-prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Build libffi (static, bionic)
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 -o libffi.tar.gz \
+            https://github.com/libffi/libffi/releases/download/v3.4.6/libffi-3.4.6.tar.gz
+          tar xf libffi.tar.gz && cd libffi-3.4.6
+          ./configure --host=aarch64-linux-android --prefix="$PREFIX" \
+            --disable-shared --enable-static \
+            CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$API-clang" \
+            CFLAGS="-O2"
+          make -j"$(nproc)" && make install
+
+      - name: Build pcre2 (static, bionic)
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 -o pcre2.tar.bz2 \
+            https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.44/pcre2-10.44.tar.bz2
+          tar xf pcre2.tar.bz2
+          cmake -S pcre2-10.44 -B pcre2-build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" \
+            -DBUILD_SHARED_LIBS=OFF -DPCRE2_SUPPORT_JIT=ON \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib
+          ninja -C pcre2-build install
+
+      - name: Build libyaml (static, bionic)
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 -o yaml.tar.gz \
+            https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz
+          tar xf yaml.tar.gz && cd yaml-0.2.5
+          ./configure --host=aarch64-linux-android --prefix="$PREFIX" \
+            --disable-shared --enable-static \
+            CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$API-clang" \
+            CFLAGS="-O2"
+          make -j"$(nproc)" && make install
+
+      - name: Build glib (static, bionic)
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 -o glib.tar.xz \
+            https://download.gnome.org/sources/glib/2.82/glib-2.82.5.tar.xz
+          tar xf glib.tar.xz
+          meson setup build-glib glib-2.82.5 --cross-file=cross.ini \
+            --prefix="$PREFIX" -Ddefault_library=static \
+            -Dtests=false -Dinstalled_tests=false \
+            -Dglib_debug=disabled -Dglib_assert=false -Dglib_checks=false \
+            -Dintrospection=disabled -Dnls=disabled \
+            -Ddtrace=false -Dsystemtap=false -Dman=false -Ddocumentation=false \
+            -Dselinux=disabled -Dlibmount=disabled -Dlibelf=disabled -Dsysprof=disabled \
+            -Dxattr=false
+          meson compile -C build-glib
+          meson install -C build-glib
+
+      - name: Build libslirp (static, bionic, DHCP pool 240)
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://gitlab.freedesktop.org/slirp/libslirp.git
+          cd libslirp
+          # Upstream caps the DHCP server at NB_BOOTP_CLIENTS=16; raise to cover
+          # a /24 above dhcp_start (same as the slirp.yml CI job).
+          sed -i 's/^#define NB_BOOTP_CLIENTS .*/#define NB_BOOTP_CLIENTS 240/' src/bootp.h
+          grep -n 'NB_BOOTP_CLIENTS' src/bootp.h
+          meson setup build --cross-file=../cross.ini \
+            --prefix="$PREFIX" -Ddefault_library=static
+          meson compile -C build
+          meson install -C build
+
+      - name: Build libvdeslirp (static, bionic)
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/virtualsquare/libvdeslirp.git
+          cat > libvdeslirp/CMakeLists.txt << 'CMAKEOF'
+          cmake_minimum_required(VERSION 3.16)
+          project(vdeslirp LANGUAGES C)
+          set(CMAKE_C_STANDARD 11)
+          set(CMAKE_C_FLAGS "-O2 -Wall")
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          include(GNUInstallDirs)
+          configure_file(config.h.in config.h)
+          add_library(vdeslirp STATIC libvdeslirp.c)
+          target_include_directories(vdeslirp PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}
+            $ENV{SLIRP_PREFIX}/include $ENV{SLIRP_PREFIX}/include/slirp)
+          set_target_properties(vdeslirp PROPERTIES OUTPUT_NAME "vdeslirp")
+          install(TARGETS vdeslirp DESTINATION ${CMAKE_INSTALL_LIBDIR})
+          install(FILES libvdeslirp.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+          CMAKEOF
+          SLIRP_PREFIX="$PREFIX" cmake -S libvdeslirp -B libvdeslirp/build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM="android-$API" \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build libvdeslirp/build --parallel "$(nproc)"
+          cmake --install libvdeslirp/build
+
+      - name: Compile vde_plug + slirp (static, bionic)
+        run: |
+          set -euxo pipefail
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$API-clang"
+          CFLAGS="-O2 -Wall -Wextra -static -Wl,-z,max-page-size=16384 \
+                  -I$PREFIX/include -I$PREFIX/include/slirp -Ilibvdeslirp -Ilibvdeslirp/build"
+          LIBS="libvdeslirp/build/libvdeslirp.a \
+                $PREFIX/lib/libslirp.a $PREFIX/lib/libyaml.a \
+                $PREFIX/lib/libglib-2.0.a $PREFIX/lib/libpcre2-8.a $PREFIX/lib/libffi.a \
+                -lm"
+          $CC $CFLAGS -o vde_plug_bionic vde_plug/vde_plug.c $LIBS
+          $CC $CFLAGS -o slirp_bionic slirp.c $LIBS
+
+      - name: Verify (no PT_INTERP, android static, LOAD aligned >= 16K)
+        run: |
+          set -euxo pipefail
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          for f in vde_plug_bionic slirp_bionic; do
+            file -b "$f" | grep -q 'ARM aarch64.*statically linked' || {
+              echo "$f: not a static aarch64 binary" >&2; exit 1; }
+            if "$READELF" -l "$f" | grep -q INTERP; then
+              echo "$f: has PT_INTERP, not usable in an app" >&2; exit 1
+            fi
+            for align in $("$READELF" -l "$f" | awk '$1 == "LOAD" { print $NF }'); do
+              [ "$((align))" -ge 16384 ] || {
+                echo "$f: LOAD aligned $align < 16K, will not load on a 16K-page kernel" >&2
+                exit 1
+              }
+            done
+          done
+          # Best-effort smoke test under qemu-user (static binary, x86 host).
+          ./vde_plug_bionic --descr bionic-ci slirp:// 2>&1 | head -2 || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: helpers-bionic-arm64
+          path: |
+            vde_plug_bionic
+            slirp_bionic
