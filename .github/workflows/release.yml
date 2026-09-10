@@ -137,6 +137,7 @@ jobs:
           find ./tmp-tools -type f -name "slirp" -exec cp {} ./release-assets/ \;
           find ./tmp-tools -type f -name "slirp.yaml" -exec cp {} ./release-assets/ \;
           find ./tmp-tools -type f -name "vde_plug" -exec cp {} ./release-assets/ \;
+          find ./tmp-tools -type f -name "vde_plug-arm64" -exec cp {} ./release-assets/ \;
           # Base image artifacts are raw .img (compression moved out of the
           # build matrix) — gzip here so release assets keep the .img.gz
           # format.
@@ -164,7 +165,7 @@ jobs:
             --notes "### Included Binaries
           * **\`linux-uml\`**: Kernel build for **${K_VERSION}**
           * **\`slirp\`**: Static slirp binary with enlarged DHCP pool
-          * **\`vde_plug\`**: Static vde_plug binary with VECTOR transport support
+          * **\`vde_plug\`** / **\`vde_plug-arm64\`**: Static vde_plug binaries with VECTOR transport support (amd64 / arm64)
 
           ### Included Images
           * **\`base-*.img.gz\`**: Fresh UML rootfs cloud images (Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10; amd64 + arm64) with cloud-init NoCloud networking baked in" \
