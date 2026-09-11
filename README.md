@@ -331,6 +331,107 @@ process — kernel-mode execution and kthreads are parallel, but userspace
 threads of a single process still serialize within that process's stub.
 This is an upstream limitation of the initial SMP support.
 
+### Backported generic UML fixes (`patches/um-backport/`)
+
+The [linux-um-arm64](https://github.com/zalexdev/linux-um-arm64) series
+(41 commits on a 7.2-rc4 uml-tree base) contains a set of generic `um/`
+and x86 fixes that are not arm64-specific. Three of them apply cleanly to
+6.18.x **on top of the SMP backport** and are shipped here.
+`patches/apply-backports.sh` applies them after the bundled patches,
+best-effort (`git apply --3way`; a patch whose context drifted is skipped
+with a `::warning`, never fatal):
+
+| Patch | What it does |
+|---|---|
+| `um-backport-01` | `PTRS_PER_PTE` derived from `PAGE_SHIFT` instead of a literal 512 |
+| `um-backport-02` | no panic at shutdown when `uml_dir` was never created |
+| `um-backport-03` | hand dead stubs to the SIGCHLD reaper instead of blocking in `waitpid()` — faster `execve` path, no zombie leak |
+
+Everything else in the series is deliberately **not** backported:
+
+* `um/arm64:` and `tools/um-arm64:` commits need the arm64 UML subarch
+  skeleton, which exists only in the uml tree `next` branch — not in any
+  LTS, and not even in mainline as of v7.2-rc4.
+* The fault-around, ncpus-default and seccomp-probe fixes target the 7.2
+  stub redesign; their context is too far from 6.18 to port mechanically.
+* One more fix that applies cleanly (`ARCH_INIT_SP_RESERVE` for the stub
+  syscall handler stack) is dropped anyway: the symbol it uses does not
+  exist on 6.18 — it arrived with the 7.2 stub redesign. A clean
+  `git apply` is not sufficient on its own; the accepted set is
+  compile-tested before shipping.
+
+Selection was verified empirically: the whole series was applied to
+v6.18.38 + SMP backport with `git apply --check --3way`, and the accepted
+set was compile-tested. `apply-backports.sh` must run **after**
+`apply-smp.sh` — the reaper fix builds on the SMP backport's threading
+changes in `os-Linux/skas/process.c`.
+
+### Full arm64 port for 7.2.4 (`patches/arm64-port-7.2.4.patch`, `stable_arm64.yml`)
+
+The arm64 subarch skeleton has since landed in the uml tree as a complete
+**54-commit series** rebased on **v7.2.4**. `arm64-port-7.2.4.patch` is that
+series, consolidated: every commit was applied in order on top of v7.2.4 +
+this repo's bundled patches (including `vector-static-link.patch`, whose
+`MAY_HAVE_RUNTIME_DEPS` removal the series' bionic commit redoes with a full
+explanation in `arch/um/drivers/Kconfig`), and the handful of hunks that
+conflicted were merged by hand. It applies as a single clean `git apply`.
+
+What it brings to `ARCH=um SUBARCH=arm64`:
+
+* the `arch/arm64/um/` subarch (defconfig, ptrace/signal, FP/SIMD state
+  save/restore across signals, `arm64_defconfig` with 16 KB pages)
+* loadable module support, and build against bionic (Android NDK)
+* the 7.2 stub rework fixes: no `-ENOSYS` leak into the first guest syscall,
+  syscall interception where `-1` cannot be written, elided stub-handoff
+  wake with brief spin, cycle-counter probe
+* `/proc/cpuinfo` reworked behind `arch_show_cpuinfo()` /
+  `arch_parse_host_cpu_flags()` callbacks so each subarch prints the same
+  lines real `/proc/cpuinfo` has (x86: `fpu`/`flags`; arm64: `Features`);
+  `get_host_cpu_features()` now takes a single line callback
+
+`.github/workflows/stable_arm64.yml` builds it on `ubuntu-22.04-arm`
+(**native** — no cross toolchain or sysroot needed) with `LLVM=1`. The jammy
+archive only ships clang 14, too old for the stub link below, so the workflow
+installs LLVM 18 from apt.llvm.org first. Two
+toolchain notes carry over to any manual build:
+
+* `LLVM=1` is required on 7.2.x: the stub link uses `-Wl,--no-rosegment`,
+  which GNU ld (≤ 2.43) rejects. The stub link goes through the clang
+  driver, which does not pick up lld from `LLVM=1`, so the make invocation
+  passes `STUB_EXE_LDFLAGS="-Wl,-n -Wl,--no-rosegment -static -fuse-ld=lld"`.
+* The UML SMP backport is **not** applied here — 7.2.4 has native SMP, and
+  the series was gate-tested against the plain tree.
+
+The x86 workflows are unaffected: they target 6.18 LTS, where this patch
+does not apply. The x86-relevant parts (generic `um/` fixes, the cpuinfo
+callback split) were compile-tested on the merged tree with
+`make ARCH=um LLVM=1`.
+
+The base images follow along: `base_image.yml` builds every distro/release
+pair for arm64 as well, natively on an arm runner (no qemu). Arm64 artifacts
+carry a `-arm64` suffix; the amd64 names are unchanged. Artifacts hold raw
+(uncompressed) images — `release.yml` gzips them when staging release
+assets, so published assets keep the `base-*.img.gz` format.
+
+### CI: bionic artifacts (`bionic_android.yml`)
+
+One workflow, two jobs, producing the Android-app bionic set (cross-built on
+an x86_64 runner — the NDK only ships an x86_64-linux hosted toolchain):
+
+* **kernel** — `linux-bionic` + `stub_exe_bionic`, built by the port's own
+  `harness/build-bionic.sh` on 7.2.4 + bundled patches + the arm64 series
+  (defconfig + `STATIC_LINK` + `UML_NET_VECTOR`).
+* **helpers** — `vde_plug` + `slirp` linked static against bionic, every
+  dependency cross-built in the same run (libffi, pcre2, libyaml, glib,
+  proxy-libintl, libslirp with the 240-lease DHCP pool, libvdeslirp).
+
+All binaries link with 16 KiB LOAD alignment and no `PT_INTERP`, so they load
+and exec inside an app: zygote starts app processes with a seccomp filter that
+kills glibc's startup (`rseq(2)`, `set_robust_list(2)`) before `main()`, and
+bionic is the libc that filter was written for. glibc static stays fine under
+`adb shell`. The helpers job verifies each binary (aarch64, static, no
+interpreter, LOAD aligned ≥ 16K) before uploading.
+
 ## Container support (Docker / Podman / LXC)
 
 `patches/containers.config` is merged into every kernel build, then the

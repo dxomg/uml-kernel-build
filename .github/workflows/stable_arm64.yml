@@ -1,8 +1,18 @@
-name: "UML Kernel — LTS latest (VECTOR/VDE)"
+name: "UML Kernel — stable arm64 (linux-um port)"
 
-# Builds the newest LTS kernel (currently 6.18.x) with UML_NET_VECTOR.
-# Use with: vec0:transport=vde,vnl=slirp://
-# Requires vde2 + libvdeplug-slirp on the host.
+# Builds the newest stable kernel (currently 7.2.x) for UML with SUBARCH=arm64,
+# using the linux-um arm64 patch series (uml/um-arm64, 54 commits, rebased onto
+# v7.2.4 and merged with this repo's bundled patches). Runs on an arm64 runner
+# so no cross sysroot is needed: the UML binary is a normal aarch64 Linux
+# executable that links the runner's own glibc.
+#
+# Notes:
+# - clang/lld is required: commit 0027 of the series (bionic/NDK build support)
+#   links the SKAS stub with -Wl,--no-rosegment, which GNU ld (<= 2.43) does
+#   not understand. LLVM=1 selects lld for the kernel link, and the stub link
+#   goes through the clang driver, so STUB_EXE_LDFLAGS re-adds -fuse-ld=lld.
+# - The UML SMP backport (apply-smp.sh) is NOT applied here: it targets 6.x,
+#   and the port series was developed and gate-tested against plain 7.2.4.
 
 on:
   schedule:
@@ -16,7 +26,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v6
 
@@ -25,15 +35,35 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y build-essential libncurses-dev flex bison \
             libssl-dev libelf-dev bc dwarves wget curl jq tar xz-utils \
-            libglib2.0-dev libpcre3-dev pkg-config
+            pkg-config gnupg
 
-      - name: Pick newest LTS (excluding 6.12 — that’s the oldstable workflow)
+      - name: Install LLVM 18 (jammy archive ships clang 14 — too old for the 7.2 stub link)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
+            sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc >/dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" | \
+            sudo tee /etc/apt/sources.list.d/llvm-18.list >/dev/null
+          sudo apt-get update -y
+          sudo apt-get install -y clang-18 lld-18 llvm-18
+          # LLVM=1 and -fuse-ld=lld resolve unversioned tool names.
+          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
+                   llvm-objdump llvm-readelf llvm-strip; do
+            sudo ln -sf "$(command -v "$t-18")" "/usr/local/bin/$t"
+          done
+          clang --version | head -1
+          ld.lld --version | head -1
+
+      - name: Pick newest stable (requires >= 7.0 — the arm64 port series is rebased on 7.2.4)
         run: |
           KVER=$(curl -s https://www.kernel.org/releases.json | \
-            jq -r '.releases[] | select(.moniker=="longterm") | .version' | \
+            jq -r '.releases[] | select(.moniker=="stable") | .version' | \
             sort -V | tail -1)
           MAJOR=$(echo "$KVER" | cut -d. -f1)
           MINOR=$(echo "$KVER" | cut -d. -f2)
+          if [ "$MAJOR" -lt 7 ]; then
+            echo "::error::Newest stable is $KVER; the arm64 port targets 7.2.x. Pin the version manually."
+            exit 1
+          fi
           echo "KVER=$KVER" >> "$GITHUB_ENV"
           echo "KMAJOR=$MAJOR" >> "$GITHUB_ENV"
           echo "KMINOR=$MINOR" >> "$GITHUB_ENV"
@@ -46,16 +76,12 @@ jobs:
             "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" \
             "linux-${{ env.KVER }}"
 
-      - name: Apply UML SMP support
-        run: |
-          cd linux-${{ env.KVER }}
-          bash ../patches/apply-smp.sh ../patches
       - name: Apply bundled UML patches
         run: |
           cd linux-${{ env.KVER }}
           shopt -s nullglob
           for p in ../patches/*.patch; do
-            # arm64-port targets 7.2.x only; never fuzz-apply it onto other trees.
+            # Applied separately below — it must apply cleanly or the build fails.
             case "$(basename "$p")" in arm64-port-*) continue;; esac
             echo "[+] Applying $(basename "$p")"
             if git apply -v "$p"; then
@@ -75,10 +101,15 @@ jobs:
             fi
           done
 
-      - name: Apply backported UML fixes (linux-um-arm64)
+      - name: Apply arm64 port series (consolidated, must apply cleanly)
         run: |
           cd linux-${{ env.KVER }}
-          bash ../patches/apply-backports.sh ../patches
+          git apply --check ../patches/arm64-port-7.2.4.patch || {
+            echo "::error::arm64 port does not apply on ${{ env.KVER }} + bundled patches"
+            exit 1
+          }
+          git apply ../patches/arm64-port-7.2.4.patch
+          echo "[+] arm64 port applied"
 
       - name: Patch UML (unwind_user.h)
         run: |
@@ -89,10 +120,13 @@ jobs:
             echo "[+] Patched unwind_user.h"
           fi
 
-      - name: Configure & build
+      - name: Configure & build (arm64)
         run: |
           cd linux-${{ env.KVER }}
-          make ARCH=um defconfig
+          # LDFLAGS must reach the stub link too: see workflow header notes.
+          MAKE="make ARCH=um SUBARCH=arm64 LLVM=1"
+
+          $MAKE defconfig
 
           # --- cpu model override (blank = show host CPU at boot) ---
           if [ -n "${{ inputs.cpu_model }}" ]; then
@@ -117,19 +151,8 @@ jobs:
             -e NETFILTER -e NF_CONNTRACK -e NF_NAT \
             -e IP_FORWARD -e IP_MULTICAST -e IP_ADVANCED_ROUTER \
             -e IKCONFIG -e IKCONFIG_PROC -e CONFIG_IPV6 \
-            -e SMP --set-val NR_CPUS 64
-
-          # --- network transport ---
-          MAJOR=${{ env.KMAJOR }}; MINOR=${{ env.KMINOR }}
-          if [ "$MAJOR" -gt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -ge 16 ]; }; then
-            echo "[+] >= 6.16 → VECTOR transport"
-            scripts/config --file .config -e UML_NET_VECTOR
-          else
-            echo "[+] < 6.16 → SLIRP transport (fallback)"
-            scripts/config --file .config \
-              -e SLHC -e SLIP -e SLIP_COMPRESSED -e SLIP_SMART -e SLIP_MODE_SLIP6 \
-              -e UML_NET -e UML_NET_SLIRP -d UML_NET_DAEMON
-          fi
+            -e SMP --set-val NR_CPUS 64 \
+            -e UML_NET_VECTOR
 
           # Merge container config (Docker/Podman/LXC, cgroup v2, memdrop), then the
           # storage fragment (loop, squashfs, FAT/exFAT, XFS, btrfs, ISO/UDF,
@@ -183,7 +206,7 @@ jobs:
           echo "=== verify memdrop/container knobs ==="
           grep -E '^CONFIG_(PAGE_REPORTING|USER_NS|CPUSETS|CHECKPOINT_RESTORE|VETH|BRIDGE|SECCOMP_FILTER|MEMCG)=' .config || true
 
-          make ARCH=um olddefconfig
+          $MAKE olddefconfig
 
           echo "=== verify storage knobs ==="
           grep -E '^CONFIG_(BLK_DEV_LOOP|SQUASHFS|VFAT_FS|EXFAT_FS|XFS_FS|BTRFS_FS|ISO9660_FS|UDF_FS|BLK_DEV_DM|BLK_DEV_MD|DM_CRYPT|DM_THIN_PROVISIONING|NLS_UTF8|MODULES)=' .config || true
@@ -193,22 +216,22 @@ jobs:
             grep -q "^CONFIG_${sym}=[ym]" .config || {
               echo "::error::CONFIG_${sym} is not enabled after olddefconfig"; exit 1; }
           done
-          make ARCH=um -j"$(nproc)"
+          grep -q '^CONFIG_64BIT=y' .config || {
+            echo "::error::not an arm64 (64BIT) config — SUBARCH=arm64 did not stick"; exit 1; }
+
+          $MAKE STUB_EXE_LDFLAGS='-Wl,-n -Wl,--no-rosegment -static -fuse-ld=lld' \
+            -j"$(nproc)"
 
       - name: Strip & upload
         run: |
-          cp linux-${{ env.KVER }}/linux ./linux-uml
-          strip ./linux-uml
-          TRANSPORT="VECTOR"
-          MAJOR=${{ env.KMAJOR }}; MINOR=${{ env.KMINOR }}
-          if [ "$MAJOR" -lt 6 ] || { [ "$MAJOR" -eq 6 ] && [ "$MINOR" -lt 16 ]; }; then
-            TRANSPORT="SLIRP"
-          fi
-          echo "${{ env.KVER }} ($TRANSPORT)" > VERSION
+          cp linux-${{ env.KVER }}/linux ./linux-uml-arm64
+          strip ./linux-uml-arm64
+          echo "${{ env.KVER }} (arm64, VECTOR)" > VERSION
+          file ./linux-uml-arm64
 
       - uses: actions/upload-artifact@v6
         with:
-          name: linux-uml-lts-latest
+          name: linux-uml-stable-arm64
           path: |
-            linux-uml
+            linux-uml-arm64
             VERSION

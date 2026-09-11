@@ -23,7 +23,7 @@ jobs:
             runner: ubuntu-latest
             syslib: /usr/lib/x86_64-linux-gnu
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             syslib: /usr/lib/aarch64-linux-gnu
     steps:
       - uses: actions/checkout@v6

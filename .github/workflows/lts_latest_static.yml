@@ -58,6 +58,8 @@ jobs:
           cd linux-${{ env.KVER }}
           shopt -s nullglob
           for p in ../patches/*.patch; do
+            # arm64-port targets 7.2.x only; never fuzz-apply it onto other trees.
+            case "$(basename "$p")" in arm64-port-*) continue;; esac
             echo "[+] Applying $(basename "$p")"
             if git apply -v "$p"; then
               :
@@ -76,6 +78,11 @@ jobs:
             fi
           done
 
+
+      - name: Apply backported UML fixes (linux-um-arm64)
+        run: |
+          cd linux-${{ env.KVER }}
+          bash ../patches/apply-backports.sh ../patches
 
       - name: Patch UML (unwind_user.h)
         run: |

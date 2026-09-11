@@ -148,7 +148,13 @@ jobs:
             [ -f "$d/vde_plug" ] && cp "$d/vde_plug" "./release-assets/vde_plug${arch}"
           done
           find ./tmp-tools -type f -name "slirp.yaml" -exec cp {} ./release-assets/ \;
-          find ./tmp-images -type f -name "*.img.gz" -exec cp {} ./release-assets/ \;
+          # Base image artifacts are raw .img (compression moved out of the
+          # build matrix) — gzip here so release assets keep the .img.gz
+          # format.
+          find ./tmp-images -type f -name "*.img" | while read -r f; do
+            echo "[+] Compressing $(basename "$f")"
+            gzip -6 -c "$f" > "./release-assets/$(basename "$f").gz"
+          done
 
           echo "=== Staged Release Assets ==="
           ls -lh ./release-assets/
@@ -168,9 +174,9 @@ jobs:
             --title "UML Kernel & Networking Suite ($TAG)" \
             --notes "### Included Binaries
           * **\`linux-uml\`**: Kernel build for **${K_VERSION}** (x86_64)
-          * **\`slirp-x86_64\` / \`slirp-arm64\`**: Static slirp binary with enlarged DHCP pool
-          * **\`vde_plug-x86_64\` / \`vde_plug-arm64\`**: Static vde_plug binary with VECTOR transport support
+          * **\`slirp-x86_64\`** / **\`slirp-arm64\`**: Static slirp binaries with enlarged DHCP pool
+          * **\`vde_plug-x86_64\`** / **\`vde_plug-arm64\`**: Static vde_plug binaries with VECTOR transport support
 
           ### Included Images
-          * **\`base-*.img.gz\`**: Fresh UML rootfs cloud images (x86_64 + arm64; Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10) with cloud-init NoCloud networking baked in" \
+          * **\`base-*.img.gz\`**: Fresh UML rootfs cloud images (amd64 + arm64; Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10) with cloud-init NoCloud networking baked in" \
             --generate-notes
