@@ -14,7 +14,17 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            syslib: /usr/lib/x86_64-linux-gnu
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            syslib: /usr/lib/aarch64-linux-gnu
     steps:
       - uses: actions/checkout@v6
 
@@ -75,7 +85,7 @@ jobs:
             VDESLIRP_SRC=libvdeslirp \
             VDESLIRP_BUILD=libvdeslirp/build \
             SLIRP_PREFIX="$SLIRP_PREFIX" \
-            SYSLIB=/usr/lib/x86_64-linux-gnu
+            SYSLIB=${{ matrix.syslib }}
           strip slirp
           echo "=== slirp ==="
           file slirp && ls -lh slirp
@@ -96,7 +106,7 @@ jobs:
       - name: Upload slirp artifact
         uses: actions/upload-artifact@v6
         with:
-          name: slirp-static
+          name: slirp-static-${{ matrix.arch }}
           path: |
             slirp
             slirp.yaml
@@ -104,80 +114,5 @@ jobs:
       - name: Upload vde_plug artifact
         uses: actions/upload-artifact@v6
         with:
-          name: vde_plug-static
+          name: vde_plug-static-${{ matrix.arch }}
           path: vde_plug/vde_plug
-
-  # arm64 vde_plug for the UML arm64 kernel (stable_arm64.yml): built natively
-  # on an arm runner, same recipe as the x86 job above.  vde_plug/Makefile has
-  # no arch-specific paths (unlike the slirp Makefile's SYSLIB), so nothing
-  # changes except the runner.  The slirp (SLIP) helper stays x86-only for now.
-  vde_plug_arm64:
-    runs-on: ubuntu-22.04-arm
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake pkg-config git \
-            meson ninja-build \
-            libslirp-dev libglib2.0-dev libpcre3-dev \
-            libvdeplug-dev libyaml-dev
-
-      - name: Build libslirp with an enlarged DHCP pool
-        run: |
-          git clone --depth 1 https://gitlab.freedesktop.org/slirp/libslirp.git
-          cd libslirp
-          sed -i 's/^#define NB_BOOTP_CLIENTS .*/#define NB_BOOTP_CLIENTS 240/' src/bootp.h
-          grep -n 'NB_BOOTP_CLIENTS' src/bootp.h
-          meson setup build --prefix="$PWD/../slirp-prefix" -Ddefault_library=static
-          ninja -C build
-          ninja -C build install
-          cd ..
-          echo "SLIRP_PREFIX=$PWD/slirp-prefix" >> "$GITHUB_ENV"
-          find slirp-prefix -name 'libslirp.a'
-
-      - name: Build libvdeslirp (static .a)
-        run: |
-          git clone --depth 1 https://github.com/virtualsquare/libvdeslirp.git
-
-          cat > libvdeslirp/CMakeLists.txt << 'CMAKEOF'
-          cmake_minimum_required(VERSION 3.16)
-          project(vdeslirp LANGUAGES C)
-          set(CMAKE_C_STANDARD 11)
-          set(CMAKE_C_FLAGS "-O2 -Wall")
-          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-          include(GNUInstallDirs)
-          configure_file(config.h.in config.h)
-          add_library(vdeslirp STATIC libvdeslirp.c)
-          target_include_directories(vdeslirp PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}
-            $ENV{SLIRP_PREFIX}/include)
-          set_target_properties(vdeslirp PROPERTIES OUTPUT_NAME "vdeslirp")
-          install(TARGETS vdeslirp DESTINATION ${CMAKE_INSTALL_LIBDIR})
-          install(FILES libvdeslirp.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-          CMAKEOF
-
-          mkdir -p libvdeslirp/build && cd libvdeslirp/build
-          cmake ..
-          make -j$(nproc)
-
-      - name: Build static vde_plug (VECTOR transport, arm64)
-        run: |
-          cd vde_plug
-          make static \
-            VDESLIRP_SRC=../libvdeslirp \
-            VDESLIRP_BUILD=../libvdeslirp/build \
-            SLIRP_PREFIX="$SLIRP_PREFIX"
-          strip vde_plug
-          mv vde_plug ../vde_plug-arm64
-          echo "=== vde_plug-arm64 ==="
-          file ../vde_plug-arm64 && ls -lh ../vde_plug-arm64
-          ../vde_plug-arm64 --descr CI slirp:// 2>&1 | head -2 || true
-
-      - name: Upload vde_plug arm64 artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: vde_plug-static-arm64
-          path: vde_plug-arm64
