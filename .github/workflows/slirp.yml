@@ -14,7 +14,17 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            syslib: /usr/lib/x86_64-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            syslib: /usr/lib/aarch64-linux-gnu
     steps:
       - uses: actions/checkout@v6
 
@@ -75,7 +85,7 @@ jobs:
             VDESLIRP_SRC=libvdeslirp \
             VDESLIRP_BUILD=libvdeslirp/build \
             SLIRP_PREFIX="$SLIRP_PREFIX" \
-            SYSLIB=/usr/lib/x86_64-linux-gnu
+            SYSLIB=${{ matrix.syslib }}
           strip slirp
           echo "=== slirp ==="
           file slirp && ls -lh slirp
@@ -96,7 +106,7 @@ jobs:
       - name: Upload slirp artifact
         uses: actions/upload-artifact@v6
         with:
-          name: slirp-static
+          name: slirp-static-${{ matrix.arch }}
           path: |
             slirp
             slirp.yaml
@@ -104,5 +114,5 @@ jobs:
       - name: Upload vde_plug artifact
         uses: actions/upload-artifact@v6
         with:
-          name: vde_plug-static
+          name: vde_plug-static-${{ matrix.arch }}
           path: vde_plug/vde_plug

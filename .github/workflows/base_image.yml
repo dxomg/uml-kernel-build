@@ -8,7 +8,7 @@ name: "UML Base Image (distro-agnostic, VECTOR/VDE)"
 # Cloud-init is the network renderer: it writes the distro-native config
 # (netplan on Ubuntu, systemd-networkd on Debian, NetworkManager on EL).
 #
-# Artifacts: base-<distro>-<release>.img.gz + VERSION
+# Artifacts: base-<distro>-<release>-<arch>.img.gz + VERSION
 # Runs weekly Monday + manual trigger.
 
 on:
@@ -18,10 +18,17 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        sys:
+          - arch: x86_64
+            image: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            image: arm64
+            runner: ubuntu-24.04-arm
         include:
           - distro: ubuntu
             release: noble
@@ -53,7 +60,8 @@ jobs:
           URL_PATH=$(curl -s http://images.linuxcontainers.org/meta/1.0/index-system \
             | grep -v edge \
             | awk '-F;' -v d="${{ matrix.distro }}" -v r="${{ matrix.release }}" \
-              '(($1==d) && ($2==r) && ($3=="amd64") && ($4=="cloud")) {print $NF}')
+              -v a="${{ matrix.image }}" \
+              '(($1==d) && ($2==r) && ($3==a) && ($4=="cloud")) {print $NF}')
           if [ -z "$URL_PATH" ]; then
             echo "::error::No cloud variant found for ${{ matrix.distro }} ${{ matrix.release }}"
             exit 1
@@ -216,16 +224,16 @@ jobs:
         run: |
           cp --sparse=always base.img base-sparse.img
           mv -f base-sparse.img base.img
-          OUT=base-${{ matrix.distro }}-${{ matrix.release }}.img.gz
+          OUT=base-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.arch }}.img.gz
           gzip -6 -c base.img > "$OUT"
-          echo "$(date -u +%Y-%m-%d) distro=${{ matrix.distro }} release=${{ matrix.release }} rootfs=${{ env.SERIAL }}" \
+          echo "$(date -u +%Y-%m-%d) distro=${{ matrix.distro }} release=${{ matrix.release }} arch=${{ matrix.arch }} rootfs=${{ env.SERIAL }}" \
             > VERSION
           ls -lh "$OUT" VERSION
 
       - uses: actions/upload-artifact@v6
         with:
-          name: uml-base-${{ matrix.distro }}-${{ matrix.release }}
+          name: uml-base-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.arch }}
           path: |
-            base-${{ matrix.distro }}-${{ matrix.release }}.img.gz
+            base-${{ matrix.distro }}-${{ matrix.release }}-${{ matrix.arch }}.img.gz
             VERSION
           retention-days: 30
