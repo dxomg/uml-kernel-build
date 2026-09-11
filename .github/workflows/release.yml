@@ -41,13 +41,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "[+] Triggering 'UML Kernel — LTS latest (VECTOR/VDE)'..."
           EXTRA_ARGS=()
           if [ -n "${{ inputs.cpu_model }}" ]; then
-            echo "[+] Forwarding cpu_model='${{ inputs.cpu_model }}' to build workflow"
+            echo "[+] Forwarding cpu_model='${{ inputs.cpu_model }}' to build workflows"
             EXTRA_ARGS+=(-f "cpu_model=${{ inputs.cpu_model }}")
           fi
+
+          echo "[+] Triggering 'UML Kernel — LTS latest (VECTOR/VDE)'..."
           gh workflow run "UML Kernel — LTS latest (VECTOR/VDE)" --repo "$REPO" --ref "${{ github.ref_name }}" "${EXTRA_ARGS[@]}"
+
+          echo "[+] Triggering 'UML Kernel — stable arm64 (linux-um port)'..."
+          gh workflow run "UML Kernel — stable arm64 (linux-um port)" --repo "$REPO" --ref "${{ github.ref_name }}" "${EXTRA_ARGS[@]}"
 
           echo "[+] Triggering 'Build Static Binaries (slirp + vde_plug)'..."
           gh workflow run "Build Static Binaries (slirp + vde_plug)" --repo "$REPO" --ref "${{ github.ref_name }}"
@@ -102,6 +106,7 @@ jobs:
 
           # Wait for all build pipelines to finish building
           wait_for_workflow "UML Kernel — LTS latest (VECTOR/VDE)"
+          wait_for_workflow "UML Kernel — stable arm64 (linux-um port)"
           wait_for_workflow "Build Static Binaries (slirp + vde_plug)"
           wait_for_workflow "UML Base Image (distro-agnostic, VECTOR/VDE)"
 
@@ -110,11 +115,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          mkdir -p ./tmp-kernel ./tmp-tools ./tmp-images
+          mkdir -p ./tmp-kernel ./tmp-kernel-arm64 ./tmp-tools ./tmp-images
 
           KERNEL_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Kernel — LTS latest (VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
           echo "[+] Downloading artifacts from Kernel Run ID: $KERNEL_RUN_ID"
           gh run download "$KERNEL_RUN_ID" --repo "$REPO" --dir ./tmp-kernel
+
+          ARM64_KERNEL_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Kernel — stable arm64 (linux-um port)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          echo "[+] Downloading artifacts from arm64 Kernel Run ID: $ARM64_KERNEL_RUN_ID"
+          gh run download "$ARM64_KERNEL_RUN_ID" --repo "$REPO" --dir ./tmp-kernel-arm64
 
           TOOLS_RUN_ID=$(gh run list --repo "$REPO" --workflow "Build Static Binaries (slirp + vde_plug)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
           echo "[+] Downloading artifacts from Tools Run ID: $TOOLS_RUN_ID"
@@ -129,11 +138,13 @@ jobs:
           mkdir -p ./release-assets
 
           echo "=== Downloaded Files Structure ==="
-          find ./tmp-kernel ./tmp-tools ./tmp-images -type f
+          find ./tmp-kernel ./tmp-kernel-arm64 ./tmp-tools ./tmp-images -type f
 
           # Locate and copy target files regardless of artifact folder nesting
           find ./tmp-kernel -type f -name "linux-uml" -exec cp {} ./release-assets/ \;
           find ./tmp-kernel -type f -name "VERSION" -exec cp {} ./release-assets/ \;
+          find ./tmp-kernel-arm64 -type f -name "linux-uml-arm64" -exec cp {} ./release-assets/ \;
+          find ./tmp-kernel-arm64 -type f -name "VERSION" -exec cp {} ./release-assets/VERSION-arm64 \;
 
           # slirp/vde_plug artifacts are now arch-suffixed (x86_64 + arm64);
           # copy each into arch-tagged release assets and keep one slirp.yaml.
@@ -174,6 +185,7 @@ jobs:
             --title "UML Kernel & Networking Suite ($TAG)" \
             --notes "### Included Binaries
           * **\`linux-uml\`**: Kernel build for **${K_VERSION}** (x86_64)
+          * **\`linux-uml-arm64\`**: Kernel build for arm64 (VECTOR transport, via the linux-um port) — see \`VERSION-arm64\`
           * **\`slirp-x86_64\`** / **\`slirp-arm64\`**: Static slirp binaries with enlarged DHCP pool
           * **\`vde_plug-x86_64\`** / **\`vde_plug-arm64\`**: Static vde_plug binaries with VECTOR transport support
 
