@@ -37,6 +37,7 @@ import (
 	"uml-kernel-build/vdeplug-go/internal/link"
 	"uml-kernel-build/vdeplug-go/internal/nat"
 	"uml-kernel-build/vdeplug-go/internal/portfwd"
+	"uml-kernel-build/vdeplug-go/internal/tap"
 	"uml-kernel-build/vdeplug-go/internal/unixseq"
 	"uml-kernel-build/vdeplug-go/internal/vswitch"
 
@@ -71,18 +72,12 @@ func main() {
 	cfg.ApplyVNL(params)
 
 	if cfg.Uplink != "" && cfg.Uplink != "slirp" {
-		logf("uplink %q not supported yet (M4); using slirp", cfg.Uplink)
+		logf("uplink %q", cfg.Uplink)
 	}
 
 	ep := link.New(fd, link.FrameMax-18, vdeMAC)
 	sw := vswitch.New()
 
-	// Role resolution: standalone (noswitch), hub (owns the switch socket
-	// and the uplink) or peer (a wire into the hub).
-	if !cfg.SwitchEnabled() {
-		runStandalone(ep, sw, cfg, descr)
-		return
-	}
 	sockPath := resolveSwitchSocket(cfg, filepath.Dir(self))
 	f := &fleet{
 		ep:       ep,
@@ -91,6 +86,10 @@ func main() {
 		descr:    descr,
 		sockPath: sockPath,
 		mode:     cfg.SocketMode,
+	}
+	if !cfg.SwitchEnabled() {
+		f.runInstance(nil, nil) // one guest, one uplink; exits the process
+		return
 	}
 	f.loop() // DISCOVER → PEER ⇄ HUB; only os.Exit returns
 }
@@ -131,87 +130,117 @@ func dirWritable(dir string) bool {
 	return true
 }
 
-// runHub: owns the switch socket, the uplink (NAT + DHCP + portfwd) and the
-// local guest; every accepted peer is another switch port. Returns only on
-// shutdown.
-func (f *fleet) runHub(ln *unixseq.Listener, release func()) {
+// runInstance wires one guest to its uplink; in switch mode (ln != nil)
+// it also owns the switch socket, DHCP, portfwd and the beacons. Returns
+// only on shutdown.
+func (f *fleet) runInstance(ln *unixseq.Listener, release func()) {
 	ep, sw, cfg, descr := f.ep, f.sw, f.cfg, f.descr
-	// The uplink: netstack NAT. Its TX frames are switched like any port.
-	theNAT, err := nat.New(ep, nat.Options{
-		GatewayIP:  cfg.Gateway,
-		Nameserver: cfg.Nameserver,
-		Network:    cfg.Network,
-		IPv6:       cfg.IPv6,
-		MTU:        cfg.MTU,
-	})
-	if err != nil {
-		fatalf("nat: %v", err)
-	}
 
-	// DHCP at the frame layer (netstack sheds limited-broadcast DISCOVERs
-	// before the transport demuxer would see them). A promoted hub seeds
-	// the pool with the lease table the dead hub gossiped, so guests keep
-	// their addresses.
+	// The uplink port. slirp = netstack NAT (the default); tap:NAME = a
+	// raw host tap; none = an isolated guest.
+	var theNAT *nat.NAT
 	var leasePool *dhcp.Pool
 	var dhcpSrv *dhcp.Server
-	if start := net.ParseIP(cfg.DHCPStart); start != nil && cfg.DHCPStart != "" {
-		leasePool = dhcp.NewPool(start, 256)
-		f.mu.Lock()
-		seed := f.leases
-		f.leases = nil
-		f.mu.Unlock()
-		if len(seed) > 0 {
-			leasePool.Restore(seed)
-			logf("%s: promoted to hub, %d leases inherited", descr, len(seed))
+	var upl vswitch.Sink
+	var shutdownUplink func()
+	txErr := make(chan error, 1)
+
+	switch {
+	case cfg.Uplink == "none":
+		upl = blackhole{}
+		shutdownUplink = func() {}
+		fmt.Fprintf(os.Stderr, "[vde_plug-go] %s: no uplink (isolated)\n", descr)
+
+	case strings.HasPrefix(cfg.Uplink, "tap"):
+		name := "tap0"
+		if rest, ok := strings.CutPrefix(cfg.Uplink, "tap:"); ok && rest != "" {
+			name = rest
 		}
-		dhcpSrv = dhcp.New(dhcp.Options{
-			Network:    cfg.Network,
+		dev, err := tap.Open(name)
+		if err != nil {
+			fatalf("uplink tap: %v", err)
+		}
+		upl = dev
+		shutdownUplink = func() { dev.Close() }
+		// Host frames into the switch, like any uplink arrival.
+		go func() {
+			buf := make([]byte, link.FrameMax)
+			for {
+				n, err := dev.RecvFrame(buf)
+				if err != nil {
+					logf("tap %s gone: %v", name, err)
+					return
+				}
+				if n >= 14 {
+					frame := make([]byte, n)
+					copy(frame, buf[:n])
+					sw.Forward(vswitch.Uplink, frame)
+				}
+			}
+		}()
+		fmt.Fprintf(os.Stderr, "[vde_plug-go] %s: tap uplink %s\n", descr, dev.Name())
+
+	default: // slirp
+		if cfg.Uplink != "slirp" && cfg.Uplink != "" {
+			fatalf("unknown uplink %q (want slirp | tap[:NAME] | none)", cfg.Uplink)
+		}
+		var err error
+		theNAT, err = nat.New(ep, nat.Options{
 			GatewayIP:  cfg.Gateway,
 			Nameserver: cfg.Nameserver,
+			Network:    cfg.Network,
+			IPv6:       cfg.IPv6,
 			MTU:        cfg.MTU,
-		}, leasePool, vdeMAC)
+		})
+		if err != nil {
+			fatalf("nat: %v", err)
+		}
+
+		// DHCP at the frame layer (netstack sheds limited-broadcast
+		// DISCOVERs before the transport demuxer would see them). A
+		// promoted hub seeds the pool with the lease table the dead hub
+		// gossiped, so guests keep their addresses.
+		if start := net.ParseIP(cfg.DHCPStart); start != nil && cfg.DHCPStart != "" {
+			leasePool = dhcp.NewPool(start, 256)
+			f.mu.Lock()
+			seed := f.leases
+			f.leases = nil
+			f.mu.Unlock()
+			if len(seed) > 0 {
+				leasePool.Restore(seed)
+				logf("%s: promoted to hub, %d leases inherited", descr, len(seed))
+			}
+			dhcpSrv = dhcp.New(dhcp.Options{
+				Network:    cfg.Network,
+				GatewayIP:  cfg.Gateway,
+				Nameserver: cfg.Nameserver,
+				MTU:        cfg.MTU,
+			}, leasePool, vdeMAC)
+		}
+
+		upl = uplinkSink{ep: ep, dhcp: dhcpSrv, sw: sw, own: ownAddrs(cfg)}
+		shutdownUplink = theNAT.Close
+		// Netstack TX pump: pops packets netstack emits and switches them.
+		go func() { txErr <- ep.Start() }()
+		fmt.Fprintf(os.Stderr, "[vde_plug-go] %s: slirp nat on %s gw %s dns %s\n",
+			descr, cfg.Network, cfg.Gateway, cfg.Nameserver)
 	}
 
 	ep.SetSink(func(frame []byte) { sw.Forward(vswitch.Uplink, frame) })
-	sw.AddPort(vswitch.Uplink, uplinkSink{ep: ep, dhcp: dhcpSrv, sw: sw, own: ownAddrs(cfg)})
-
-	// Netstack TX pump: pops packets netstack emits and switches them.
-	txErr := make(chan error, 1)
-	go func() { txErr <- ep.Start() }()
-
-	// The local guest port.
+	sw.AddPort(vswitch.Uplink, upl)
 	sw.AddPort(vswitch.Local, guestSink{ep})
 	rxErr := make(chan error, 1)
 	go guestReader(ep, sw, rxErr)
 
-	// Peer accept loop: each connection becomes a port with its own
-	// reader and outbound queue.
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return // listener closed: shutting down
-			}
-			port, ok := sw.AddPeer(conn)
-			if !ok {
-				logf("switch: peer limit reached, refusing")
-				conn.Close()
-				continue
-			}
-			logf("switch: peer %d joined", port)
-			go peerReader(sw, port, conn)
-		}
-	}()
+	if ln != nil {
+		go f.acceptPeers(ln)
+		// Heartbeats: flood our state through the switch so peers notice
+		// a wedged hub (three missed beats) and a promoted peer inherits
+		// the lease table.
+		go f.sendBeacons(leasePool)
+	}
 
-	// Heartbeats: flood our state through the switch so peers notice a
-	// wedged hub (three missed beats) and a promoted peer inherits the
-	// lease table.
-	go f.sendBeacons(leasePool)
-
-	fmt.Fprintf(os.Stderr, "[vde_plug-go] %s: hub slirp nat on %s gw %s dns %s\n",
-		descr, cfg.Network, cfg.Gateway, cfg.Nameserver)
-
-	if cfg.PortFwd {
+	if theNAT != nil && cfg.PortFwd {
 		fallback := net.ParseIP(cfg.DHCPStart)
 		if leasePool != nil {
 			if first := leasePool.First(); first != nil {
@@ -227,62 +256,37 @@ func (f *fleet) runHub(ln *unixseq.Listener, release func()) {
 	}
 
 	waitShutdown(theNAT, sw, leasePool, rxErr, txErr)
-	ln.Close()
-	release() // drop the hub seat
+	shutdownUplink()
+	if ln != nil {
+		ln.Close()
+		release() // drop the hub seat
+	}
 	os.Exit(0)
 }
 
-// runStandalone: one guest, one uplink, no switch socket.
-func runStandalone(ep *link.EtherEndpoint, sw *vswitch.Switch, cfg *config.Config, descr string) {
-	theNAT, err := nat.New(ep, nat.Options{
-		GatewayIP:  cfg.Gateway,
-		Nameserver: cfg.Nameserver,
-		Network:    cfg.Network,
-		IPv6:       cfg.IPv6,
-		MTU:        cfg.MTU,
-	})
-	if err != nil {
-		fatalf("nat: %v", err)
-	}
-
-	var leasePool *dhcp.Pool
-	var dhcpSrv *dhcp.Server
-	if start := net.ParseIP(cfg.DHCPStart); start != nil && cfg.DHCPStart != "" {
-		leasePool = dhcp.NewPool(start, 256)
-		dhcpSrv = dhcp.New(dhcp.Options{
-			Network:    cfg.Network,
-			GatewayIP:  cfg.Gateway,
-			Nameserver: cfg.Nameserver,
-			MTU:        cfg.MTU,
-		}, leasePool, vdeMAC)
-	}
-
-	ep.SetSink(func(frame []byte) { sw.Forward(vswitch.Uplink, frame) })
-	sw.AddPort(vswitch.Uplink, uplinkSink{ep: ep, dhcp: dhcpSrv, sw: sw, own: ownAddrs(cfg)})
-
-	txErr := make(chan error, 1)
-	go func() { txErr <- ep.Start() }()
-
-	sw.AddPort(vswitch.Local, guestSink{ep})
-	rxErr := make(chan error, 1)
-	go guestReader(ep, sw, rxErr)
-
-	fmt.Fprintf(os.Stderr, "[vde_plug-go] %s: standalone slirp nat on %s gw %s dns %s\n",
-		descr, cfg.Network, cfg.Gateway, cfg.Nameserver)
-
-	if cfg.PortFwd {
-		fallback := net.ParseIP(cfg.DHCPStart)
-		pf, err := portfwd.Start(theNAT.Stack, cfg, fallback)
+// acceptPeers runs the hub's listener: each connection becomes a switch
+// port with its own reader and outbound queue.
+func (f *fleet) acceptPeers(ln *unixseq.Listener) {
+	for {
+		conn, err := ln.Accept()
 		if err != nil {
-			logf("portfwd: %v", err)
-		} else {
-			_ = pf
+			return // listener closed: shutting down
 		}
+		port, ok := f.sw.AddPeer(conn)
+		if !ok {
+			logf("switch: peer limit reached, refusing")
+			conn.Close()
+			continue
+		}
+		logf("switch: peer %d joined", port)
+		go peerReader(f.sw, port, conn)
 	}
-
-	waitShutdown(theNAT, sw, leasePool, rxErr, txErr)
-	os.Exit(0)
 }
+
+// blackhole is the "uplink: none" port: frames vanish.
+type blackhole struct{}
+
+func (blackhole) SendFrame([]byte) error { return nil }
 
 // ── failover state machine ─────────────────────────────────────────────
 
@@ -354,7 +358,7 @@ func (f *fleet) loop() {
 			release()
 			continue
 		}
-		f.runHub(ln, release) // returns only on shutdown
+		f.runInstance(ln, release) // returns only on shutdown
 	}
 }
 
@@ -542,7 +546,9 @@ loop:
 			break loop
 		}
 	}
-	theNAT.Close()
+	if theNAT != nil {
+		theNAT.Close()
+	}
 }
 
 // uplinkSink sends switched frames into netstack, except frames the
@@ -623,6 +629,10 @@ func mustMACBytes(s string) string {
 
 // dumpStats prints link, switch and netstack counters (SIGUSR1).
 func dumpStats(n *nat.NAT, sw *vswitch.Switch, pool *dhcp.Pool) {
+	if n == nil { // tap/none uplinks: no netstack to report
+		logf("stats: switch_drops=%d", sw.Dropped())
+		return
+	}
 	st := &n.EP.Stats
 	logf("stats: rx=%d tx=%d rxbytes=%d txbytes=%d dropped=%d switch_drops=%d",
 		st.RxPackets.Load(), st.TxPackets.Load(), st.RxBytes.Load(), st.TxBytes.Load(),
