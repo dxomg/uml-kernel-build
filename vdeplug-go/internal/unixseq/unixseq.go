@@ -18,6 +18,21 @@ type Listener struct {
 	path string
 }
 
+// TryConnect joins an existing switch at path, or returns an error when
+// nobody is listening. Unlike BindOrConnect it never binds, so the
+// failover state machine can probe without taking the hub seat.
+func TryConnect(path string) (*Conn, error) {
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		return nil, fmt.Errorf("socket: %w", err)
+	}
+	if err := unix.Connect(fd, &unix.SockaddrUnix{Name: path}); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	return &Conn{fd: fd}, nil
+}
+
 // BindOrConnect tries to join an existing switch at path; when nobody
 // answers it binds the socket and returns a Listener (hub side).
 //

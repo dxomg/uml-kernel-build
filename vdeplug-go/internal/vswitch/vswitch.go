@@ -66,11 +66,11 @@ type port struct {
 
 // Switch is the learning switch core.
 type Switch struct {
-	mu    sync.Mutex
-	macs  map[string]macEntry
-	ports map[Port]*port
-	drops atomic.Uint64 // frames shed under backpressure
-	direct bool         // only one destination port: inline sends, no queue
+	mu     sync.Mutex
+	macs   map[string]macEntry
+	ports  map[Port]*port
+	drops  atomic.Uint64 // frames shed under backpressure
+	peers  int           // connected peer wires; 0 = every send can inline
 }
 
 type macEntry struct {
@@ -92,7 +92,6 @@ func (s *Switch) AddPort(p Port, sink Sink) {
 	pt := &port{sink: sink, out: make(chan []byte, outQueue), done: make(chan struct{})}
 	s.mu.Lock()
 	s.ports[p] = pt
-	s.direct = len(s.ports) == 1
 	s.mu.Unlock()
 	go func() {
 		for {
@@ -119,6 +118,9 @@ func (s *Switch) RemovePort(p Port) {
 	if pt, ok := s.ports[p]; ok {
 		close(pt.done)
 		delete(s.ports, p)
+		if p >= 0 {
+			s.peers--
+		}
 	}
 	for mac, e := range s.macs {
 		if e.port == p {
@@ -135,7 +137,7 @@ func (s *Switch) AddPeer(sink Sink) (Port, bool) {
 		if _, used := s.ports[p]; !used {
 			pt := &port{sink: sink, out: make(chan []byte, outQueue), done: make(chan struct{})}
 			s.ports[p] = pt
-			s.direct = len(s.ports) == 1
+			s.peers++
 			go func(pt *port, p Port) {
 				for {
 					select {
@@ -188,18 +190,19 @@ func (s *Switch) Forward(from Port, frame []byte) {
 	s.emit(dst, frame)
 }
 
-// emit sends to one port. With a single destination port (standalone
-// mode's steady state) it sends inline — the caller's backpressure is the
+// emit sends to one port. Without peer wires (standalone, or a hub
+// nobody joined yet) sends are inline — the caller's backpressure is the
 // seqpacket's own, and the queue+goroutine hop costs ~2x CPU per frame.
+// Once peers exist, queues isolate a slow port from the switch core.
 func (s *Switch) emit(p Port, frame []byte) {
 	s.mu.Lock()
 	pt, ok := s.ports[p]
-	direct := s.direct
+	noPeers := s.peers == 0
 	s.mu.Unlock()
 	if !ok {
 		return
 	}
-	if direct {
+	if noPeers {
 		_ = pt.sink.SendFrame(frame) // caller's buffer fine: sync send
 		return
 	}

@@ -9,24 +9,31 @@
 // doing NAT (uplink slirp), a host tap device (uplink tap:NAME), or nothing
 // (uplink none).
 //
-// Switch mode (config `switch: true`, default): the first instance to bind
-// the switch socket becomes the hub and owns the uplink; later instances are
-// plain peer wires into the hub. M3 wires that path; today every instance
-// runs standalone with its own NAT.
+// Switch mode (config `switch: true`, default): the first instance to take
+// the hub seat becomes the hub and owns the uplink; the rest are plain peer
+// wires. When the hub dies, its peers contend for the seat (flock referee)
+// and one promotes — see the fleet state machine below.
 package main
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"uml-kernel-build/vdeplug-go/internal/config"
 	"uml-kernel-build/vdeplug-go/internal/dhcp"
+	"uml-kernel-build/vdeplug-go/internal/elect"
 	"uml-kernel-build/vdeplug-go/internal/link"
 	"uml-kernel-build/vdeplug-go/internal/nat"
 	"uml-kernel-build/vdeplug-go/internal/portfwd"
@@ -77,17 +84,15 @@ func main() {
 		return
 	}
 	sockPath := resolveSwitchSocket(cfg, filepath.Dir(self))
-	ln, peerConn, err := unixseq.BindOrConnect(sockPath, cfg.SocketMode)
-	if err != nil {
-		fatalf("switch socket %s: %v", sockPath, err)
+	f := &fleet{
+		ep:       ep,
+		sw:       sw,
+		cfg:      cfg,
+		descr:    descr,
+		sockPath: sockPath,
+		mode:     cfg.SocketMode,
 	}
-	if peerConn != nil {
-		logf("%s: peer of %s", descr, sockPath)
-		runPeerWire(ep, peerConn)
-		return
-	}
-	defer ln.Close()
-	runHub(ep, sw, cfg, descr, ln)
+	f.loop() // DISCOVER → PEER ⇄ HUB; only os.Exit returns
 }
 
 // resolveSwitchSocket follows the C binary's cascade: config `socket:` →
@@ -127,8 +132,10 @@ func dirWritable(dir string) bool {
 }
 
 // runHub: owns the switch socket, the uplink (NAT + DHCP + portfwd) and the
-// local guest; every accepted peer is another switch port.
-func runHub(ep *link.EtherEndpoint, sw *vswitch.Switch, cfg *config.Config, descr string, ln *unixseq.Listener) {
+// local guest; every accepted peer is another switch port. Returns only on
+// shutdown.
+func (f *fleet) runHub(ln *unixseq.Listener, release func()) {
+	ep, sw, cfg, descr := f.ep, f.sw, f.cfg, f.descr
 	// The uplink: netstack NAT. Its TX frames are switched like any port.
 	theNAT, err := nat.New(ep, nat.Options{
 		GatewayIP:  cfg.Gateway,
@@ -142,11 +149,21 @@ func runHub(ep *link.EtherEndpoint, sw *vswitch.Switch, cfg *config.Config, desc
 	}
 
 	// DHCP at the frame layer (netstack sheds limited-broadcast DISCOVERs
-	// before the transport demuxer would see them).
+	// before the transport demuxer would see them). A promoted hub seeds
+	// the pool with the lease table the dead hub gossiped, so guests keep
+	// their addresses.
 	var leasePool *dhcp.Pool
 	var dhcpSrv *dhcp.Server
 	if start := net.ParseIP(cfg.DHCPStart); start != nil && cfg.DHCPStart != "" {
 		leasePool = dhcp.NewPool(start, 256)
+		f.mu.Lock()
+		seed := f.leases
+		f.leases = nil
+		f.mu.Unlock()
+		if len(seed) > 0 {
+			leasePool.Restore(seed)
+			logf("%s: promoted to hub, %d leases inherited", descr, len(seed))
+		}
 		dhcpSrv = dhcp.New(dhcp.Options{
 			Network:    cfg.Network,
 			GatewayIP:  cfg.Gateway,
@@ -156,7 +173,7 @@ func runHub(ep *link.EtherEndpoint, sw *vswitch.Switch, cfg *config.Config, desc
 	}
 
 	ep.SetSink(func(frame []byte) { sw.Forward(vswitch.Uplink, frame) })
-	sw.AddPort(vswitch.Uplink, uplinkSink{ep: ep, dhcp: dhcpSrv, sw: sw})
+	sw.AddPort(vswitch.Uplink, uplinkSink{ep: ep, dhcp: dhcpSrv, sw: sw, own: ownAddrs(cfg)})
 
 	// Netstack TX pump: pops packets netstack emits and switches them.
 	txErr := make(chan error, 1)
@@ -186,11 +203,21 @@ func runHub(ep *link.EtherEndpoint, sw *vswitch.Switch, cfg *config.Config, desc
 		}
 	}()
 
+	// Heartbeats: flood our state through the switch so peers notice a
+	// wedged hub (three missed beats) and a promoted peer inherits the
+	// lease table.
+	go f.sendBeacons(leasePool)
+
 	fmt.Fprintf(os.Stderr, "[vde_plug-go] %s: hub slirp nat on %s gw %s dns %s\n",
 		descr, cfg.Network, cfg.Gateway, cfg.Nameserver)
 
 	if cfg.PortFwd {
 		fallback := net.ParseIP(cfg.DHCPStart)
+		if leasePool != nil {
+			if first := leasePool.First(); first != nil {
+				fallback = first // follow the first client, like the C binary
+			}
+		}
 		pf, err := portfwd.Start(theNAT.Stack, cfg, fallback)
 		if err != nil {
 			logf("portfwd: %v", err)
@@ -201,6 +228,7 @@ func runHub(ep *link.EtherEndpoint, sw *vswitch.Switch, cfg *config.Config, desc
 
 	waitShutdown(theNAT, sw, leasePool, rxErr, txErr)
 	ln.Close()
+	release() // drop the hub seat
 	os.Exit(0)
 }
 
@@ -230,7 +258,7 @@ func runStandalone(ep *link.EtherEndpoint, sw *vswitch.Switch, cfg *config.Confi
 	}
 
 	ep.SetSink(func(frame []byte) { sw.Forward(vswitch.Uplink, frame) })
-	sw.AddPort(vswitch.Uplink, uplinkSink{ep: ep, dhcp: dhcpSrv, sw: sw})
+	sw.AddPort(vswitch.Uplink, uplinkSink{ep: ep, dhcp: dhcpSrv, sw: sw, own: ownAddrs(cfg)})
 
 	txErr := make(chan error, 1)
 	go func() { txErr <- ep.Start() }()
@@ -256,14 +284,92 @@ func runStandalone(ep *link.EtherEndpoint, sw *vswitch.Switch, cfg *config.Confi
 	os.Exit(0)
 }
 
-// runPeerWire bridges the local guest and the hub; no NAT of its own.
-// Either side going away ends the process (UML restarts us).
-func runPeerWire(ep *link.EtherEndpoint, hub *unixseq.Conn) {
+// ── failover state machine ─────────────────────────────────────────────
+
+const (
+	beaconInterval = time.Second
+	// A hub that has beaconed before and then goes silent for three
+	// beats is treated as dead even though its socket may still accept:
+	// it is wedged (SIGSTOP, deadlock). Hubs that never beaconed (older
+	// binaries) are trusted until EOF — no false takeovers in mixed
+	// fleets.
+	beaconDeadline = 3 * beaconInterval
+)
+
+var errHubSilent = errors.New("no heartbeat for " + beaconDeadline.String())
+
+// fleet runs switch mode's DISCOVER → PEER ⇄ HUB loop:
+//
+//   - DISCOVER: join a listening hub as a peer; nobody there, contend
+//     for the hub seat (flock on <socket>.lock).
+//   - PEER: wire frames guest↔hub and watch heartbeats; hub loss
+//     returns to DISCOVER.
+//   - HUB: own the socket, the uplink, DHCP and portfwd until shutdown.
+//
+// The same loop bootstraps a cold fleet: the first instance up takes
+// the seat, the rest peer it. Split-brain is structurally impossible —
+// the lock is exclusive and the socket is only bound while holding it.
+type fleet struct {
+	ep       *link.EtherEndpoint
+	sw       *vswitch.Switch
+	cfg      *config.Config
+	descr    string
+	sockPath string
+	mode     uint32
+
+	mu     sync.Mutex
+	leases map[[6]byte][4]byte // DHCP state from hub gossip
+}
+
+func (f *fleet) loop() {
+	backoff := 250 * time.Millisecond
+	for {
+		// Join an existing hub?
+		if conn, err := unixseq.TryConnect(f.sockPath); err == nil {
+			backoff = 250 * time.Millisecond
+			reason := f.runPeer(conn)
+			logf("%s: hub lost (%v), rediscovering", f.descr, reason)
+			time.Sleep(time.Duration(rand.Intn(250)) * time.Millisecond)
+			continue
+		}
+		// Nobody answered: contend for the seat.
+		release, lockErr := elect.TryLock(f.sockPath)
+		if lockErr != nil {
+			// Another instance is promoting (or a wedged hub still
+			// holds the seat). Retry with jittered backoff.
+			time.Sleep(backoff + time.Duration(rand.Intn(int(backoff/2))+1))
+			if backoff < 2*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		// Under the seat: bind — or join a hub that appeared without
+		// taking the seat (an older binary). We do not fight it.
+		ln, conn, err := unixseq.BindOrConnect(f.sockPath, f.mode)
+		if err != nil {
+			release()
+			fatalf("switch socket %s: %v", f.sockPath, err)
+		}
+		if conn != nil {
+			release()
+			continue
+		}
+		f.runHub(ln, release) // returns only on shutdown
+	}
+}
+
+// runPeer wires the local guest to the hub and watches its heartbeat.
+// Returns when the hub is gone; the caller then redisCOVERs — possibly
+// promoting this instance.
+func (f *fleet) runPeer(hub *unixseq.Conn) error {
+	defer hub.Close()
 	done := make(chan error, 2)
+
+	// guest → hub
 	go func() {
 		buf := make([]byte, link.FrameMax)
 		for {
-			n, err := ep.RecvFrame(buf)
+			n, err := f.ep.RecvFrame(buf)
 			if err != nil {
 				done <- err
 				return
@@ -276,6 +382,11 @@ func runPeerWire(ep *link.EtherEndpoint, hub *unixseq.Conn) {
 			}
 		}
 	}()
+
+	// hub → guest, snooping heartbeats (control frames never reach the
+	// guest) and caching the gossiped lease table for a later promotion
+	var sawBeacon atomic.Bool
+	var lastBeacon atomic.Int64
 	go func() {
 		buf := make([]byte, link.FrameMax)
 		for {
@@ -284,16 +395,91 @@ func runPeerWire(ep *link.EtherEndpoint, hub *unixseq.Conn) {
 				done <- err
 				return
 			}
+			if n >= 14 && elect.IsBeacon(buf[:n]) {
+				lastBeacon.Store(time.Now().UnixNano())
+				sawBeacon.Store(true)
+				if _, leases, err := elect.ParseBeacon(buf[:n]); err == nil {
+					f.mu.Lock()
+					f.leases = leaseMap(leases)
+					f.mu.Unlock()
+				}
+				continue
+			}
 			if n >= 14 {
-				if err := ep.SendFrame(buf[:n]); err != nil {
+				if err := f.ep.SendFrame(buf[:n]); err != nil {
 					done <- err
 					return
 				}
 			}
 		}
 	}()
-	<-done
-	os.Exit(0)
+
+	// heartbeat watch: armed only after the first beat proves the hub
+	// speaks the beacon protocol
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(beaconInterval):
+			}
+			if !sawBeacon.Load() {
+				continue
+			}
+			if time.Since(time.Unix(0, lastBeacon.Load())) > beaconDeadline {
+				done <- errHubSilent
+				return
+			}
+		}
+	}()
+
+	err := <-done
+	close(stop)
+	return err
+}
+
+// sendBeacons floods the switch with the hub's state once per interval.
+// Runs until the process exits.
+func (f *fleet) sendBeacons(pool *dhcp.Pool) {
+	var seq uint32
+	var leases []elect.Lease
+	for {
+		if pool != nil {
+			leases = poolSnapshot(pool)
+		}
+		f.sw.Forward(vswitch.Uplink, elect.EncodeBeacon([]byte(vdeMAC), seq, leases))
+		seq++
+		time.Sleep(beaconInterval)
+	}
+}
+
+func poolSnapshot(p *dhcp.Pool) []elect.Lease {
+	snap := p.Leases()
+	out := make([]elect.Lease, 0, len(snap))
+	for macStr, ipStr := range snap {
+		var l elect.Lease
+		hw, err := net.ParseMAC(macStr)
+		if err != nil {
+			continue
+		}
+		copy(l.MAC[:], hw)
+		ip := net.ParseIP(ipStr).To4()
+		if ip == nil {
+			continue
+		}
+		copy(l.IP[:], ip)
+		out = append(out, l)
+	}
+	return out
+}
+
+func leaseMap(ls []elect.Lease) map[[6]byte][4]byte {
+	m := make(map[[6]byte][4]byte, len(ls))
+	for _, l := range ls {
+		m[l.MAC] = l.IP
+	}
+	return m
 }
 
 func guestReader(ep *link.EtherEndpoint, sw *vswitch.Switch, rxErr chan<- error) {
@@ -359,12 +545,16 @@ loop:
 	theNAT.Close()
 }
 
-// uplinkSink sends switched frames into netstack, except DHCP requests,
-// which the frame-layer DHCP service answers directly.
+// uplinkSink sends switched frames into netstack, except frames the
+// netstack must not see: DHCP requests (answered at the frame layer) and
+// ARP requests for addresses we don't own. With spoofing enabled,
+// netstack's ARP responder claims EVERY requested address, hijacking
+// guest-to-guest resolution on the switch — the real owner must answer.
 type uplinkSink struct {
 	ep   *link.EtherEndpoint
 	dhcp *dhcp.Server
 	sw   *vswitch.Switch
+	own  map[[4]byte]bool // netstack's addresses on the segment
 }
 
 func (u uplinkSink) SendFrame(frame []byte) error {
@@ -374,8 +564,41 @@ func (u uplinkSink) SendFrame(frame []byte) error {
 			return nil
 		}
 	}
+	if !arpForOwnAddr(frame, u.own) {
+		return nil // foreign ARP request: shed, the owner answers via the switch
+	}
 	u.ep.Inject(frame)
 	return nil
+}
+
+// arpForOwnAddr reports whether netstack should receive this frame:
+// everything but ARP, plus ARP whose target protocol address is ours
+// (requests we must answer, replies confirming our resolutions).
+func arpForOwnAddr(frame []byte, own map[[4]byte]bool) bool {
+	if len(frame) < 14 || binary.BigEndian.Uint16(frame[12:14]) != 0x0806 {
+		return true
+	}
+	if len(frame) < 14+28 {
+		return false // truncated ARP
+	}
+	arp := frame[14:]
+	if binary.BigEndian.Uint16(arp[6:8]) != 1 { // not a request
+		return true
+	}
+	var tpa [4]byte
+	copy(tpa[:], arp[24:28])
+	return own[tpa]
+}
+
+// ownAddrs collects the netstack's addresses on the segment.
+func ownAddrs(cfg *config.Config) map[[4]byte]bool {
+	own := map[[4]byte]bool{}
+	for _, s := range []string{cfg.Gateway, cfg.Nameserver} {
+		if ip := net.ParseIP(s).To4(); ip != nil {
+			own[[4]byte{ip[0], ip[1], ip[2], ip[3]}] = true
+		}
+	}
+	return own
 }
 
 // guestSink sends switched frames out the guest socket.

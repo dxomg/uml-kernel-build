@@ -75,6 +75,31 @@ func (p *Pool) GetOrAssign(mac net.HardwareAddr) (net.IP, error) {
 	return net.IP(append([]byte(nil), ip[:]...)), nil
 }
 
+// Restore seeds the pool with leases gossiped by a previous hub, so a
+// promoted peer hands out the same addresses. Entries outside the pool
+// range are dropped; the rest are re-registered in address order, so
+// First() again names the lowest leased address.
+func (p *Pool) Restore(leases map[[6]byte][4]byte) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for off := 0; off < p.size; off++ {
+		var ip [4]byte
+		copy(ip[:], p.base[:])
+		ip[3] += byte(off)
+		for mac, a := range leases {
+			if a != ip {
+				continue
+			}
+			if _, ok := p.assigned[mac]; !ok {
+				p.assigned[mac] = a
+				p.order = append(p.order, mac)
+			}
+			break
+		}
+	}
+	p.next = len(p.assigned)
+}
+
 // First returns the first assigned lease, or nil when nobody has asked yet.
 func (p *Pool) First() net.IP {
 	p.mu.Lock()
