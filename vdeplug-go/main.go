@@ -86,6 +86,7 @@ func main() {
 		descr:    descr,
 		sockPath: sockPath,
 		mode:     cfg.SocketMode,
+		rxErr:    make(chan error, 1),
 	}
 	if !cfg.SwitchEnabled() {
 		f.runInstance(nil, nil) // one guest, one uplink; exits the process
@@ -229,8 +230,7 @@ func (f *fleet) runInstance(ln *unixseq.Listener, release func()) {
 	ep.SetSink(func(frame []byte) { sw.Forward(vswitch.Uplink, frame) })
 	sw.AddPort(vswitch.Uplink, upl)
 	sw.AddPort(vswitch.Local, guestSink{ep})
-	rxErr := make(chan error, 1)
-	go guestReader(ep, sw, rxErr)
+	f.wireOnce.Do(func() { go f.wire() }) // single guest-wire reader, forever
 
 	if ln != nil {
 		go f.acceptPeers(ln)
@@ -255,7 +255,7 @@ func (f *fleet) runInstance(ln *unixseq.Listener, release func()) {
 		}
 	}
 
-	waitShutdown(theNAT, sw, leasePool, rxErr, txErr)
+	waitShutdown(theNAT, sw, leasePool, f.rxErr, txErr)
 	shutdownUplink()
 	if ln != nil {
 		ln.Close()
@@ -323,9 +323,47 @@ type fleet struct {
 
 	mu     sync.Mutex
 	leases map[[6]byte][4]byte // DHCP state from hub gossip
+
+	// The guest wire has exactly one reader for the process lifetime:
+	// frames route to the hub connection in peer mode, into the switch
+	// otherwise. Role changes are atomic pointer swaps, so a promotion
+	// can never leave a second reader racing for the fd (each seqpacket
+	// message is delivered to exactly one reader; a leaked pump would
+	// silently eat guest frames).
+	peerConn atomic.Pointer[unixseq.Conn]
+	wireOnce sync.Once
+	rxErr    chan error
+}
+
+// wire reads the guest socket forever, forwarding per current role.
+func (f *fleet) wire() {
+	buf := make([]byte, link.FrameMax)
+	for {
+		n, err := f.ep.RecvFrame(buf)
+		if err != nil {
+			f.rxErr <- err // guest side gone: shut the instance down
+			return
+		}
+		if n < 14 {
+			continue
+		}
+		frame := make([]byte, n)
+		copy(frame, buf[:n])
+		if peer := f.peerConn.Load(); peer != nil {
+			if err := peer.SendFrame(frame); err == nil {
+				continue
+			} else {
+				logf("guest frame to hub: %v", err)
+			}
+			// The hub died mid-flight; the switch takes it from here
+			// (a no-op until runInstance adds the ports).
+		}
+		f.sw.Forward(vswitch.Local, frame)
+	}
 }
 
 func (f *fleet) loop() {
+	f.wireOnce.Do(func() { go f.wire() }) // peers never reach runInstance
 	backoff := 250 * time.Millisecond
 	for {
 		// Join an existing hub?
@@ -366,26 +404,13 @@ func (f *fleet) loop() {
 // Returns when the hub is gone; the caller then redisCOVERs — possibly
 // promoting this instance.
 func (f *fleet) runPeer(hub *unixseq.Conn) error {
-	defer hub.Close()
-	done := make(chan error, 2)
-
-	// guest → hub
-	go func() {
-		buf := make([]byte, link.FrameMax)
-		for {
-			n, err := f.ep.RecvFrame(buf)
-			if err != nil {
-				done <- err
-				return
-			}
-			if n >= 14 {
-				if err := hub.SendFrame(buf[:n]); err != nil {
-					done <- err
-					return
-				}
-			}
-		}
+	defer func() {
+		f.peerConn.Store(nil) // route the wire back to the switch
+		hub.Close()
 	}()
+	f.peerConn.Store(hub)
+	logf("peer of %s", f.sockPath)
+	done := make(chan error, 1)
 
 	// hub → guest, snooping heartbeats (control frames never reach the
 	// guest) and caching the gossiped lease table for a later promotion
@@ -486,34 +511,20 @@ func leaseMap(ls []elect.Lease) map[[6]byte][4]byte {
 	return m
 }
 
-func guestReader(ep *link.EtherEndpoint, sw *vswitch.Switch, rxErr chan<- error) {
-	buf := make([]byte, link.FrameMax)
-	for {
-		n, err := ep.RecvFrame(buf)
-		if err != nil {
-			rxErr <- err
-			return
-		}
-		if n < 14 {
-			continue
-		}
-		frame := make([]byte, n)
-		copy(frame, buf[:n])
-		sw.Forward(vswitch.Local, frame)
-	}
-}
-
 // peerReader pumps one peer's frames into the switch; the peer port is
 // removed when the pipe breaks.
 func peerReader(sw *vswitch.Switch, port vswitch.Port, conn *unixseq.Conn) {
+	reason := error(nil)
 	defer func() {
 		sw.RemovePort(port)
 		conn.Close()
+		logf("switch: peer %d gone (%v)", port, reason)
 	}()
 	buf := make([]byte, link.FrameMax)
 	for {
 		n, err := conn.RecvFrame(buf)
 		if err != nil || n == 0 {
+			reason = err
 			return
 		}
 		if n < 14 {
@@ -525,8 +536,7 @@ func peerReader(sw *vswitch.Switch, port vswitch.Port, conn *unixseq.Conn) {
 	}
 }
 
-func waitShutdown(theNAT *nat.NAT, sw *vswitch.Switch, leasePool *dhcp.Pool, rxErr <-chan error, txErr <-chan error) {
-	sigs := make(chan os.Signal, 2)
+func waitShutdown(theNAT *nat.NAT, sw *vswitch.Switch, leasePool *dhcp.Pool, rxErr <-chan error, txErr <-chan error) {	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
 loop:
 	for {

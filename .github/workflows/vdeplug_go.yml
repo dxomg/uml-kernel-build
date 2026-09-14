@@ -1,0 +1,69 @@
+name: vdeplug-go (netstack vde_plug)
+
+on:
+  push:
+    paths:
+      - 'vdeplug-go/**'
+      - '.github/workflows/vdeplug_go.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: vdeplug-go/go.mod
+
+      - name: Vet
+        run: go vet ./...
+        working-directory: vdeplug-go
+
+      - name: Unit + e2e (fleet boot/switching/failover)
+        # The e2e test is self-contained: it builds the binary itself and
+        # drives fake guests over socketpairs — no UML kernel, no root.
+        run: go test -timeout 120s -v ./...
+        working-directory: vdeplug-go
+
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cgo: 0
+          - target: arm64
+            runner: ubuntu-22.04-arm
+            goos: linux
+            goarch: arm64
+            cgo: 0
+          - target: android-arm64
+            runner: ubuntu-latest
+            goos: android
+            goarch: arm64
+            cgo: 0
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: vdeplug-go/go.mod
+
+      - name: Build static vde_plug (${{ matrix.target }})
+        run: |
+          CGO_ENABLED=${{ matrix.cgo }} GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags="-s -w" -o vde_plug .
+          file vde_plug && ls -lh vde_plug
+        working-directory: vdeplug-go
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: vdeplug-go-${{ matrix.target }}
+          path: vdeplug-go/vde_plug
