@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -195,18 +196,20 @@ func (e *EtherEndpoint) SendFrame(b []byte) error {
 }
 
 // RecvFrame reads one frame from the guest. Blocking; retries EINTR.
-// Returns error when the guest side is gone.
+// Returns error when the guest side is gone — including the (0, nil) EOF
+// a SEQPACKET peer close delivers, so no consumer can spin on it.
 func (e *EtherEndpoint) RecvFrame(buf []byte) (int, error) {
 	for {
 		n, _, _, _, err := unix.Recvmsg(e.fd, buf, nil, 0)
 		if err == unix.EINTR {
 			continue
 		}
-		if n > 0 {
-			if m := tcpip.LinkAddress(buf[6:12]); len(buf) >= 12 {
-				mac := m
-				e.guestMAC.Store(&mac)
-			}
+		if n == 0 && err == nil {
+			return 0, io.EOF
+		}
+		if n >= 12 {
+			mac := tcpip.LinkAddress(buf[6:12])
+			e.guestMAC.Store(&mac)
 		}
 		return n, err
 	}

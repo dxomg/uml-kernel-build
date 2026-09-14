@@ -70,6 +70,7 @@ type Switch struct {
 	macs  map[string]macEntry
 	ports map[Port]*port
 	drops atomic.Uint64 // frames shed under backpressure
+	direct bool         // only one destination port: inline sends, no queue
 }
 
 type macEntry struct {
@@ -91,6 +92,7 @@ func (s *Switch) AddPort(p Port, sink Sink) {
 	pt := &port{sink: sink, out: make(chan []byte, outQueue), done: make(chan struct{})}
 	s.mu.Lock()
 	s.ports[p] = pt
+	s.direct = len(s.ports) == 1
 	s.mu.Unlock()
 	go func() {
 		for {
@@ -125,6 +127,36 @@ func (s *Switch) RemovePort(p Port) {
 	}
 }
 
+// AddPeer allocates the lowest free peer port and registers sink.
+func (s *Switch) AddPeer(sink Sink) (Port, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for p := Port(0); p < MaxPeers; p++ {
+		if _, used := s.ports[p]; !used {
+			pt := &port{sink: sink, out: make(chan []byte, outQueue), done: make(chan struct{})}
+			s.ports[p] = pt
+			s.direct = len(s.ports) == 1
+			go func(pt *port, p Port) {
+				for {
+					select {
+					case frame := <-pt.out:
+						err := pt.sink.SendFrame(frame)
+						putFrame(frame)
+						if err != nil {
+							s.RemovePort(p)
+							return
+						}
+					case <-pt.done:
+						return
+					}
+				}
+			}(pt, p)
+			return p, true
+		}
+	}
+	return 0, false
+}
+
 // Dropped reports how many frames were shed under backpressure.
 func (s *Switch) Dropped() uint64 { return s.drops.Load() }
 
@@ -156,11 +188,19 @@ func (s *Switch) Forward(from Port, frame []byte) {
 	s.emit(dst, frame)
 }
 
+// emit sends to one port. With a single destination port (standalone
+// mode's steady state) it sends inline — the caller's backpressure is the
+// seqpacket's own, and the queue+goroutine hop costs ~2x CPU per frame.
 func (s *Switch) emit(p Port, frame []byte) {
 	s.mu.Lock()
 	pt, ok := s.ports[p]
+	direct := s.direct
 	s.mu.Unlock()
 	if !ok {
+		return
+	}
+	if direct {
+		_ = pt.sink.SendFrame(frame) // caller's buffer fine: sync send
 		return
 	}
 	buf := getFrame(len(frame))
@@ -182,6 +222,13 @@ func (s *Switch) flood(from Port, frame []byte) {
 		}
 	}
 	s.mu.Unlock()
+	if len(targets) == 0 {
+		return
+	}
+	if len(targets) == 1 {
+		_ = targets[0].sink.SendFrame(frame)
+		return
+	}
 	for _, pt := range targets {
 		buf := getFrame(len(frame))
 		copy(buf, frame)
