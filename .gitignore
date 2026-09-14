@@ -10,6 +10,7 @@ build.log
 linux-uml
 slirp
 VERSION
+vde_plug/vde_plug
 
 __pycache__/
 *.py[cod]
