@@ -11,6 +11,9 @@
 package vswitch
 
 import (
+	"fmt"
+	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -131,6 +134,10 @@ func (s *Switch) Forward(from Port, frame []byte) {
 	if len(frame) < 14 {
 		return
 	}
+	if debug() {
+		log.Printf("[vde_plug-go] sw: from=%d len=%d dst=%s type=%02x%02x",
+			from, len(frame), tcpipMAC(frame[0:6]), frame[12], frame[13])
+	}
 	s.learn(frame[6:12], from)
 
 	broadcast := frame[0]&0x01 != 0
@@ -185,6 +192,14 @@ func (s *Switch) flood(from Port, frame []byte) {
 			putFrame(buf)
 		}
 	}
+}
+
+func debug() bool {
+	return os.Getenv("VDE_DEBUG") != ""
+}
+
+func tcpipMAC(b []byte) string {
+	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
 func (s *Switch) learn(mac []byte, from Port) {

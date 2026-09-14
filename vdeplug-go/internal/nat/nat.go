@@ -13,6 +13,7 @@ package nat
 import (
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -46,6 +47,7 @@ type Options struct {
 	Nameserver string // 10.0.2.3
 	Network    string // 10.0.2.0/24
 	IPv6       bool
+	MTU        int
 }
 
 // NAT owns the netstack instance and its host-side plumbing.
@@ -53,10 +55,10 @@ type NAT struct {
 	Stack *stack.Stack
 	EP    *link.EtherEndpoint
 
-	gatewayIP net.IP
-	nsIP      net.IP
-	resolvers []string
-	wg        sync.WaitGroup
+	resolvers  []string
+	localAddrs map[string]bool // our addresses on the segment (v4+v6)
+	dnsAddrs   map[string]bool // addresses serving DNS proxy
+	wg         sync.WaitGroup
 }
 
 // New builds the netstack stack and attaches ep as the Ethernet device.
@@ -69,13 +71,17 @@ func New(ep *link.EtherEndpoint, opts Options) (*NAT, error) {
 	if err := s.CreateNIC(nicID, ep); err != nil {
 		return nil, fmt.Errorf("CreateNIC: %s", err)
 	}
+	// The guest's frames carry its own MAC and 10.0.2.15 source; without
+	// these the stack treats them as spoofed/foreign and sheds them.
+	s.SetSpoofing(nicID, true)
+	s.SetPromiscuousMode(nicID, true)
 
 	n := &NAT{
-		Stack:     s,
-		EP:        ep,
-		gatewayIP: net.ParseIP(opts.GatewayIP),
-		nsIP:      net.ParseIP(opts.Nameserver),
-		resolvers: resolvers(),
+		Stack:      s,
+		EP:         ep,
+		resolvers:  resolvers(),
+		localAddrs: map[string]bool{},
+		dnsAddrs:   map[string]bool{},
 	}
 
 	// The gateway address answers ARP/ICMP/TCP on the segment. The DNS
@@ -89,6 +95,10 @@ func New(ep *link.EtherEndpoint, opts Options) (*NAT, error) {
 		}, stack.AddressProperties{}); err != nil {
 			return nil, fmt.Errorf("AddProtocolAddress(%s): %s", addr, err)
 		}
+		n.localAddrs[addr] = true
+		if addr == opts.Nameserver {
+			n.dnsAddrs[addr] = true
+		}
 	}
 
 	// Connected route for the guest subnet. A default route via our own
@@ -97,7 +107,30 @@ func New(ep *link.EtherEndpoint, opts Options) (*NAT, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.SetRouteTable([]tcpip.Route{{Destination: sub, NIC: nicID}})
+	routes := []tcpip.Route{{Destination: sub, NIC: nicID}}
+
+	// IPv6 mirrors libslirp's in6_enabled layout: site-local fec0::/64
+	// with the gateway at ::2 and DNS at ::3 (guests typically configure
+	// fec0::15 statically, like the shipped image does).
+	if opts.IPv6 {
+		for _, a := range []string{"fec0::2", "fec0::3"} {
+			if err := s.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+				Protocol:          ipv6.ProtocolNumber,
+				AddressWithPrefix: tcpip.AddrFrom16(as16(net.ParseIP(a))).WithPrefix(),
+			}, stack.AddressProperties{}); err != nil {
+				return nil, fmt.Errorf("AddProtocolAddress(%s): %s", a, err)
+			}
+			n.localAddrs[a] = true
+			if a == "fec0::3" {
+				n.dnsAddrs[a] = true
+			}
+		}
+		routes = append(routes, tcpip.Route{
+			Destination: tcpip.AddrFrom16(as16(net.ParseIP("fec0::"))).WithPrefix().Subnet(),
+			NIC:         nicID,
+		})
+	}
+	s.SetRouteTable(routes)
 
 	tcpFwd := tcp.NewForwarder(s, 0, 1024, n.tcpHandler)
 	s.SetTransportProtocolHandler(header.TCPProtocolNumber, tcpFwd.HandlePacket)
@@ -125,14 +158,22 @@ func subnetOf(cidr string) (tcpip.Subnet, error) {
 	)
 }
 
+// as16 converts a 16-byte net.IP into the array form netstack wants.
+func as16(ip net.IP) [16]byte {
+	var out [16]byte
+	copy(out[:], ip.To16())
+	return out
+}
+
 // ── TCP ────────────────────────────────────────────────────────────────
 
 func (n *NAT) tcpHandler(r *tcp.ForwarderRequest) {
 	id := r.ID()
-	// The guest's destination is the LOCAL side of the 4-tuple: we are the
-	// endpoint 10.0.2.2:port.
+	// The guest's destination is the LOCAL side of the 4-tuple: one of our
+	// own addresses (gateway/DNS) maps to host loopback, everything else is
+	// dialed literally (internet-bound v4/v6 NAT).
 	dst := id.LocalAddress.String()
-	if dst == n.gatewayIP.String() {
+	if n.localAddrs[dst] {
 		dst = "127.0.0.1"
 	}
 	hostConn, err := net.Dial("tcp", net.JoinHostPort(dst, strconv.Itoa(int(id.LocalPort))))
@@ -163,11 +204,6 @@ func pump(dst io.Writer, src io.Reader, done func()) {
 
 // ── UDP ────────────────────────────────────────────────────────────────
 
-type udpFlow struct {
-	conn *gonet.UDPConn
-	host net.Conn
-}
-
 // udpHandler forwards one guest UDP flow to the host. DNS traffic to the
 // nameserver address goes to the host resolver; flows to the gateway go to
 // host loopback; everything else is dialed literally.
@@ -175,6 +211,9 @@ func (n *NAT) udpHandler(r *udp.ForwarderRequest) bool {
 	id := r.ID()
 	dstIP := id.LocalAddress.String()
 	dstPort := id.LocalPort
+	if os.Getenv("VDE_DEBUG") != "" {
+		log.Printf("[vde_plug-go] udpfwd: dst=%s:%d src=%s:%d", dstIP, dstPort, id.RemoteAddress, id.RemotePort)
+	}
 
 	go func() {
 		host := n.dialUDP(dstIP, dstPort)
@@ -194,7 +233,7 @@ func (n *NAT) udpHandler(r *udp.ForwarderRequest) bool {
 }
 
 func (n *NAT) dialUDP(dstIP string, dstPort uint16) net.Conn {
-	if dstIP == n.nsIP.String() && dstPort == 53 {
+	if dstPort == 53 && n.dnsAddrs[dstIP] {
 		for _, server := range n.resolvers {
 			c, err := net.Dial("udp", net.JoinHostPort(server, "53"))
 			if err == nil {
@@ -203,7 +242,7 @@ func (n *NAT) dialUDP(dstIP string, dstPort uint16) net.Conn {
 		}
 		return nil
 	}
-	if dstIP == n.gatewayIP.String() {
+	if n.localAddrs[dstIP] {
 		dstIP = "127.0.0.1"
 	}
 	c, err := net.Dial("udp", net.JoinHostPort(dstIP, strconv.Itoa(int(dstPort))))

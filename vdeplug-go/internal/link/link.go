@@ -11,6 +11,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log"
+	"os"
+	"strings"
 	"sync/atomic"
 
 	"golang.org/x/sys/unix"
@@ -23,6 +26,17 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
+
+func debugEnabled() bool { return os.Getenv("VDE_DEBUG") != "" }
+
+// netAddr renders a raw MAC byte slice in colon notation for logs.
+func netAddr(b []byte) string {
+	parts := make([]string, len(b))
+	for i, c := range b {
+		parts[i] = fmt.Sprintf("%02x", c)
+	}
+	return strings.Join(parts, ":")
+}
 
 const (
 	// FrameMax fits a jumbo frame the way the C binary sized its buffers.
@@ -158,6 +172,10 @@ func (e *EtherEndpoint) Inject(frame []byte) {
 		return
 	}
 	pkt.NetworkProtocolNumber = proto
+	if debugEnabled() {
+		log.Printf("[vde_plug-go] inject: len=%d proto=%04x src=%s dst=%s",
+			len(frame), proto, netAddr(frame[6:12]), netAddr(frame[0:6]))
+	}
 	e.InjectInbound(proto, pkt)
 
 	e.Stats.RxPackets.Add(1)
