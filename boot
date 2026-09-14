@@ -1,0 +1,130 @@
+#!/bin/sh
+set -e
+BASE="$(cd "$(dirname "$0")" && pwd)"
+KERNEL="$BASE/linux"
+ROOTFS="${UML_ROOTFS:-$BASE/base.img}"
+CONFIG="$BASE/config.yaml"
+
+yaml_val() {
+    grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'
+}
+
+# --- network helper engine: netstack (the Go rewrite) | slirp (legacy C) ---
+# config.yaml `engine:` wins by default; UML_ENGINE overrides the config.
+ENGINE="${UML_ENGINE:-$(yaml_val engine)}"
+ENGINE="${ENGINE:-netstack}"
+case "$ENGINE" in
+    netstack) ENGINE_BIN="$BASE/vdeplug-netstack" ;;
+    slirp)    ENGINE_BIN="$BASE/vdeplug-slirp" ;;
+    *) echo "[ERROR] engine must be netstack|slirp, got: $ENGINE"; exit 1 ;;
+esac
+# The kernel's run_helper execs "vde_plug" by that exact name from PATH,
+# so point the name at the selected engine binary.
+ln -snf "$ENGINE_BIN" "$BASE/vde_plug"
+
+# --- arguments: [memory] [ncpus]  (both optional, config.yaml overrides) ---
+MEMORY="${1:-$(yaml_val memory)}"
+MEMORY="${MEMORY:-2G}"
+NCPUS="${2:-$(yaml_val ncpus)}"
+NCPUS="${NCPUS:-1}"
+# coerce to a positive integer (ignore garbage from config/argv)
+case "$NCPUS" in
+    ''|*[!0-9]*) NCPUS=1 ;;
+esac
+[ "$NCPUS" -lt 1 ] && NCPUS=1
+
+for f in "$KERNEL" "$ROOTFS" "$ENGINE_BIN"; do
+    if [ ! -f "$f" ]; then echo "[ERROR] Missing: $f"; exit 1; fi
+done
+if [ ! -x "$ENGINE_BIN" ]; then chmod +x "$ENGINE_BIN"; fi
+if [ ! -x "$KERNEL" ]; then chmod +x "$KERNEL"; fi
+
+# --- stable per-image guest MAC: generated once at first boot, kept
+# --- forever, so DHCP leases and switch learning survive reboots ---
+MACFILE="$ROOTFS.mac"
+if [ ! -s "$MACFILE" ]; then
+    printf '02:%02x:%02x:%02x:%02x:%02x\n' $(od -An -tu1 -N5 /dev/urandom) > "$MACFILE"
+    chmod 600 "$MACFILE"
+fi
+GUEST_MAC=$(tr -cd '0-9a-f:' < "$MACFILE")
+
+# --- detect whether the kernel was built with SMP ---
+KERNEL_HAS_SMP=0
+if command -v strings >/dev/null 2>&1 && strings "$KERNEL" 2>/dev/null | grep -q '^CONFIG_SMP=y'; then
+    KERNEL_HAS_SMP=1
+fi
+
+# --- /dev/shm usable? (used to decide the skas0 PTRACE fallback) ---
+SHM_TEST=$(mktemp /dev/shm/.uml_XXXXXX 2>/dev/null) || true
+if [ -n "$SHM_TEST" ]; then
+    printf '#!/bin/sh\nexit 0\n' > "$SHM_TEST"
+    chmod +x "$SHM_TEST" 2>/dev/null
+    if "$SHM_TEST" 2>/dev/null; then SHM_OK=1; else SHM_OK=0; fi
+    rm -f "$SHM_TEST"
+else
+    SHM_OK=0
+fi
+
+# --- build the kernel cmdline ---
+#
+# SMP rules (upstream UML since v6.19):
+#   * ncpus=N      — how many vCPUs to bring online (<= NR_CPUS, default 1).
+#   * seccomp=on   — REQUIRED for ncpus>1. SMP is incompatible with the
+#                    default PTRACE userspace mode; it must use seccomp.
+#                    Harmless for ncpus=1 / UP kernels.
+#   * mode=skas0   — forces PTRACE userspace (TT-less). INCOMPATIBLE with
+#                    SMP, so only used when ncpus==1 AND /dev/shm is slow.
+#                    (seccomp mode already avoids the /dev/shm dependency
+#                    via the memfd physmem backport.)
+SMP_ARGS=""
+SKAS_MODE=""
+
+if [ "$KERNEL_HAS_SMP" -eq 1 ] && [ "$NCPUS" -gt 1 ]; then
+    SMP_ARGS="ncpus=$NCPUS seccomp=on"
+elif [ "$KERNEL_HAS_SMP" -eq 1 ]; then
+    SMP_ARGS="ncpus=1 seccomp=on"
+else
+    if [ "$SHM_OK" -eq 0 ]; then
+        SKAS_MODE="mode=skas0"
+    fi
+fi
+
+if [ "$SHM_OK" -eq 0 ]; then
+    mkdir -p "$BASE/.uml_tmp"
+    export TMP="$BASE/.uml_tmp" TMPDIR="$BASE/.uml_tmp" TEMP="$BASE/.uml_tmp"
+fi
+
+export PATH="$BASE:$PATH"
+
+echo "========================================"
+echo "  UML Virtual Machine"
+echo "----------------------------------------"
+if [ "$KERNEL_HAS_SMP" -eq 1 ] && [ "$NCPUS" -gt 1 ]; then
+    echo "  CPUs     : $NCPUS (SMP, seccomp userspace)"
+elif [ "$KERNEL_HAS_SMP" -eq 1 ]; then
+    echo "  CPUs     : 1 (SMP kernel, 1 vCPU)"
+else
+    echo "  CPUs     : 1 (UP kernel)"
+fi
+echo "  Memory   : $MEMORY"
+echo "  Network  : VDE VECTOR + $ENGINE NAT"
+if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; fi
+echo "  Config   : $CONFIG"
+echo "----------------------------------------"
+echo "  Login: root / root"
+echo "========================================"
+echo ""
+
+cleanup() { if [ -n "$SKAS_MODE" ]; then rm -rf "$BASE/.uml_tmp" 2>/dev/null; fi; }
+trap cleanup EXIT
+
+exec "$KERNEL" \
+    mem="$MEMORY" \
+    $SKAS_MODE \
+    $SMP_ARGS \
+    ubd0="$ROOTFS" \
+    root=/dev/ubda rw \
+    init=/lib/systemd/systemd \
+    "vec0:transport=vde,vnl=slirp://,mac=$GUEST_MAC" \
+    con0=fd:0,fd:1 \
+    con=null
