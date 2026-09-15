@@ -20,32 +20,19 @@ jobs:
         with:
           go-version: stable
 
-      - name: Float deps and neutralize gVisor's stray bridge_test.go
+      - name: Float deps, keep gVisor at its known-good pin
         # go.mod cannot express "track latest" (Go pins exact versions), so
-        # resolve to the newest stable of every module at build time.
-        #
-        # gVisor intermittently ships pkg/tcpip/stack/bridge_test.go
-        # declaring `package bridge_test` next to the directory's package
-        # stack; any build/vet importing pkg/tcpip/stack then dies with
-        # "found packages stack and bridge" (gVisor builds with Bazel and
-        # never notices; release-20260907.0 and master tip both shipped it).
-        # The module cache re-extracts the hash-checked zip, so deleting
-        # the file does not stick — a compile-time overlay replaces its
-        # content instead. When upstream ships a clean tree, no overlay is
-        # generated and nothing changes.
+        # the other deps are resolved at build time. gVisor is restored to
+        # the committed version: its proxy @latest is the master tip and its
+        # release tags are cut from the same tree, and both have shipped
+        # uncompilable module states (bridge_test.go declares package bridge
+        # inside pkg/tcpip/stack). Bump the pin by hand once the deps canary
+        # job is green again.
         run: |
-          go get -u ./... && go mod tidy
-          go mod download gvisor.dev/gvisor
-          stray=$(echo "$(go env GOMODCACHE)"/gvisor.dev/gvisor@*/pkg/tcpip/stack/bridge_test.go)
-          if [ -f "$stray" ]; then
-            printf 'package stack\n' > "$RUNNER_TEMP/empty-bridge-test.go"
-            printf '{"Replace": {"%s": "%s"}}' "$stray" "$RUNNER_TEMP/empty-bridge-test.go" \
-              > "$RUNNER_TEMP/gvisor-overlay.json"
-            echo "GOFLAGS=-overlay=$RUNNER_TEMP/gvisor-overlay.json" >> "$GITHUB_ENV"
-            echo "overlaid stray $stray"
-          else
-            echo "no stray bridge_test.go — nothing to do"
-          fi
+          GV_PIN=$(go list -m gvisor.dev/gvisor | awk '{print $2}')
+          go get -u ./...
+          go get "gvisor.dev/gvisor@$GV_PIN"
+          go mod tidy
         working-directory: vdeplug-go
 
       - name: Vet
@@ -73,23 +60,6 @@ jobs:
 
       - name: Upgrade every module to latest
         run: go get -u ./... && go mod tidy
-        working-directory: vdeplug-go
-
-      - name: Drop gVisor's stray bridge_test.go via overlay
-        # Same neutralization as the test job's float step: the canary
-        # should only go red when upstream breaks in some OTHER way.
-        run: |
-          go mod download gvisor.dev/gvisor
-          stray=$(echo "$(go env GOMODCACHE)"/gvisor.dev/gvisor@*/pkg/tcpip/stack/bridge_test.go)
-          if [ -f "$stray" ]; then
-            printf 'package stack\n' > "$RUNNER_TEMP/empty-bridge-test.go"
-            printf '{"Replace": {"%s": "%s"}}' "$stray" "$RUNNER_TEMP/empty-bridge-test.go" \
-              > "$RUNNER_TEMP/gvisor-overlay.json"
-            echo "GOFLAGS=-overlay=$RUNNER_TEMP/gvisor-overlay.json" >> "$GITHUB_ENV"
-            echo "overlaid stray $stray"
-          else
-            echo "no stray bridge_test.go — nothing to do"
-          fi
         working-directory: vdeplug-go
 
       - name: Vet + test against latest deps
@@ -124,20 +94,12 @@ jobs:
         with:
           go-version: stable
 
-      - name: Float deps and neutralize gVisor's stray bridge_test.go
+      - name: Float deps, keep gVisor at its known-good pin
         run: |
-          go get -u ./... && go mod tidy
-          go mod download gvisor.dev/gvisor
-          stray=$(echo "$(go env GOMODCACHE)"/gvisor.dev/gvisor@*/pkg/tcpip/stack/bridge_test.go)
-          if [ -f "$stray" ]; then
-            printf 'package stack\n' > "$RUNNER_TEMP/empty-bridge-test.go"
-            printf '{"Replace": {"%s": "%s"}}' "$stray" "$RUNNER_TEMP/empty-bridge-test.go" \
-              > "$RUNNER_TEMP/gvisor-overlay.json"
-            echo "GOFLAGS=-overlay=$RUNNER_TEMP/gvisor-overlay.json" >> "$GITHUB_ENV"
-            echo "overlaid stray $stray"
-          else
-            echo "no stray bridge_test.go — nothing to do"
-          fi
+          GV_PIN=$(go list -m gvisor.dev/gvisor | awk '{print $2}')
+          go get -u ./...
+          go get "gvisor.dev/gvisor@$GV_PIN"
+          go mod tidy
         working-directory: vdeplug-go
 
       - name: Build static vde_plug (${{ matrix.target }})
