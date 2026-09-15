@@ -20,18 +20,17 @@ jobs:
         with:
           go-version: stable
 
-      - name: Float deps, keep gVisor at its known-good pin
+      - name: Float deps to upstream latest
         # go.mod cannot express "track latest" (Go pins exact versions), so
-        # the other deps are resolved at build time. gVisor is restored to
-        # the committed version: its proxy @latest is the master tip and its
-        # release tags are cut from the same tree, and both have shipped
-        # uncompilable module states (bridge_test.go declares package bridge
-        # inside pkg/tcpip/stack). Bump the pin by hand once the deps canary
-        # job is green again.
+        # resolve to the newest stable of every module at build time.
+        # gVisor floats to the `go` branch — upstream's auto-generated
+        # pure-Go tree, synced minutes after every master push — rather
+        # than the Bazel-first master, which intermittently ships a stray
+        # bridge_test.go that breaks Go module builds.
+        # The committed go.mod is the known-good floor for local dev.
         run: |
-          GV_PIN=$(go list -m gvisor.dev/gvisor | awk '{print $2}')
           go get -u ./...
-          go get "gvisor.dev/gvisor@$GV_PIN"
+          go get gvisor.dev/gvisor@go
           go mod tidy
         working-directory: vdeplug-go
 
@@ -43,27 +42,6 @@ jobs:
         # The e2e test is self-contained: it builds the binary itself and
         # drives fake guests over socketpairs — no UML kernel, no root.
         run: go test -timeout 120s -v ./...
-        working-directory: vdeplug-go
-
-  deps:
-    # Canary against the latest of everything: builds and tests with the
-    # newest Go + module versions instead of the pinned go.mod. Failure
-    # here means an upstream change is coming; it does not block builds.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version: stable
-
-      - name: Upgrade every module to latest
-        run: go get -u ./... && go mod tidy
-        working-directory: vdeplug-go
-
-      - name: Vet + test against latest deps
-        run: go vet ./... && go test -timeout 120s ./...
         working-directory: vdeplug-go
 
   build:
@@ -94,11 +72,12 @@ jobs:
         with:
           go-version: stable
 
-      - name: Float deps, keep gVisor at its known-good pin
+      - name: Float deps to upstream latest
+        # gVisor floats to the pure-Go `go` branch, not the Bazel-first
+        # master — see the test job's float step.
         run: |
-          GV_PIN=$(go list -m gvisor.dev/gvisor | awk '{print $2}')
           go get -u ./...
-          go get "gvisor.dev/gvisor@$GV_PIN"
+          go get gvisor.dev/gvisor@go
           go mod tidy
         working-directory: vdeplug-go
 

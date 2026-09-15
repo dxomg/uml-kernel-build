@@ -1,12 +1,20 @@
 # Auto-update dependencies: Go modules and workflow actions. PRs land
-# weekly; the vdeplug-go CI's deps canary job catches breakage against
-# unpinned latest even between PRs.
+# weekly.
+#
+# gvisor.dev/gvisor is excluded: dependabot tracks the module proxy's
+# latest, which follows the Bazel-first master branch — that tree keeps
+# shipping a stray pkg/tcpip/stack/bridge_test.go that breaks Go module
+# builds. The vdeplug-go CI instead floats gVisor to the pure-Go `go`
+# branch (upstream's auto-generated, always-buildable tree) on every
+# run, so no separate bump PRs are needed for it.
 version: 2
 updates:
   - package-ecosystem: gomod
     directory: /vdeplug-go
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: gvisor.dev/gvisor
   - package-ecosystem: github-actions
     directory: /
     schedule:
