@@ -42,7 +42,7 @@ jobs:
           apt-get update -y
           apt-get install -y build-essential libncurses-dev flex bison \
             libssl-dev libelf-dev bc dwarves wget curl jq tar xz-utils \
-            pkg-config gnupg git ca-certificates perl
+            pkg-config gnupg git ca-certificates perl file
 
       - uses: actions/checkout@v7
 
