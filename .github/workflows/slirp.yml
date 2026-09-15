@@ -81,9 +81,12 @@ jobs:
 
       - name: Build static slirp (legacy SLIP transport)
         run: |
+          # libvdeslirp was cloned at the workspace root; make -C legacy
+          # resolves relative VDESLIRP_* paths against legacy/, so pass
+          # absolute ones.
           make -C legacy static \
-            VDESLIRP_SRC=libvdeslirp \
-            VDESLIRP_BUILD=libvdeslirp/build \
+            VDESLIRP_SRC="$PWD/libvdeslirp" \
+            VDESLIRP_BUILD="$PWD/libvdeslirp/build" \
             SLIRP_PREFIX="$SLIRP_PREFIX" \
             SYSLIB=${{ matrix.syslib }}
           strip legacy/slirp
