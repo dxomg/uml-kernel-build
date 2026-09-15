@@ -2,9 +2,9 @@
 
 A drop-in replacement for the C `vde_plug` SLIRP helper that UML's VDE
 VECTOR transport execs, written in Go on top of gVisor's netstack.
-The C helper is still available (`engine: slirp`); this rewrite exists
-to fix its structural problems: CPU burn in the frame pump, no failover,
-and no isolation between guests.
+The C helpers (`legacy/`, `vde_plug/`) remain standalone builds; this
+rewrite exists to fix their structural problems: CPU burn in the frame
+pump, no failover, and no isolation between guests.
 
 ## Layout
 
@@ -62,14 +62,6 @@ UML derives the vec0 MAC from the kernel cmdline, so the launcher
 generates a random local MAC once per rootfs image (sidecar
 `<image>.mac`, mode 0600) and injects `mac=` on every boot. DHCP leases
 and switch learning stay stable across reboots.
-
-## Engine selection (M6)
-
-`config.yaml` `engine: netstack|slirp` — the launcher symlinks the
-chosen binary onto `vde_plug` (the kernel execs that exact name from
-PATH). `UML_ENGINE=slirp ./boot` overrides per boot for A/B testing.
-Both engines speak the same vde protocol and can serve different VMs
-side by side.
 
 ## Switch sockets (`socket_file_location:` in config.yaml)
 

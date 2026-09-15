@@ -26,8 +26,8 @@ cd dir-with-linux-and-base.img
 
 The launcher reads `config.yaml` (copy
 [`launcher/config.example.yaml`](launcher/config.example.yaml)) to pick
-the engine (`netstack` default / `slirp`), uplink mode, port forwards,
-and DHCP range. Guests DHCP by default — no network setup inside.
+the uplink mode, port forwards, and DHCP range. Guests DHCP by
+default — no network setup inside.
 
 ## Repository layout
 
@@ -36,7 +36,7 @@ and DHCP range. Guests DHCP by default — no network setup inside.
 | `vdeplug-go/` | The Go network helper (default engine) — [its README](vdeplug-go/README.md) |
 | `launcher/` | `boot` script + commented `config.example.yaml` |
 | `legacy/` | The generation-1 standalone `slirp` helper (kept building) |
-| `vde_plug/` | The C generation-2 helper (`engine: slirp`) |
+| `vde_plug/` | The C generation-2 helper (standalone build) |
 | `patches/` | Kernel patches + config fragments merged by every build |
 | `rootfs/nocloud/` | NoCloud seed baked into base images (DHCP by default) |
 | `docs/` | [Distributed setup](docs/distributed.md) · [Technical changelogs](docs/technical_changelogs.md) |

@@ -9,17 +9,11 @@ yaml_val() {
     grep -E "^${1}:" "$CONFIG" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '"'
 }
 
-# --- network helper engine: netstack (the Go rewrite) | slirp (legacy C) ---
-# config.yaml `engine:` wins by default; UML_ENGINE overrides the config.
-ENGINE="${UML_ENGINE:-$(yaml_val engine)}"
-ENGINE="${ENGINE:-netstack}"
-case "$ENGINE" in
-    netstack) ENGINE_BIN="$BASE/vdeplug-netstack" ;;
-    slirp)    ENGINE_BIN="$BASE/vdeplug-slirp" ;;
-    *) echo "[ERROR] engine must be netstack|slirp, got: $ENGINE"; exit 1 ;;
-esac
+# --- network helper: the Go netstack engine. The C slirp helpers
+# --- (legacy/ and vde_plug/) are built and run standalone when needed.
+ENGINE_BIN="$BASE/vdeplug-netstack"
 # The kernel's run_helper execs "vde_plug" by that exact name from PATH,
-# so point the name at the selected engine binary.
+# so point the name at the engine binary.
 ln -snf "$ENGINE_BIN" "$BASE/vde_plug"
 
 # --- arguments: [memory] [ncpus]  (both optional, config.yaml overrides) ---
@@ -107,7 +101,7 @@ else
     echo "  CPUs     : 1 (UP kernel)"
 fi
 echo "  Memory   : $MEMORY"
-echo "  Network  : VDE VECTOR + $ENGINE NAT"
+echo "  Network  : VDE VECTOR + netstack NAT"
 if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; fi
 echo "  Config   : $CONFIG"
 echo "----------------------------------------"

@@ -459,8 +459,8 @@ three generations in this repo:
 | Generation | Location | Transport | Status |
 |---|---|---|---|
 | 1. standalone slirp | `legacy/slirp.c` | SLIRP directly | superseded, kept building |
-| 2. C vde_plug | `vde_plug/` | VDE VECTOR + libvdeslirp uplink | shipped as `engine: slirp` |
-| 3. Go netstack rewrite | [`vdeplug-go/`](../vdeplug-go/) | VDE VECTOR + gVisor netstack | **default** (`engine: netstack`) |
+| 2. C vde_plug | `vde_plug/` | VDE VECTOR + libvdeslirp uplink | standalone build |
+| 3. Go netstack rewrite | [`vdeplug-go/`](../vdeplug-go/) | VDE VECTOR + gVisor netstack | **default** |
 
 Generation 3 details (architecture, switch model, uplinks, WebSocket
 bridge, testing) live in [`vdeplug-go/README.md`](../vdeplug-go/README.md);
@@ -691,7 +691,12 @@ Reverse-chronological, one line per user-visible change.
 
 **Repo layout**
 
-- this commit — `legacy/` (generation-1 slirp), `launcher/` (boot + config
+- this commit — the launcher boots the netstack engine only: the
+  `engine: netstack|slirp` selection (and `UML_ENGINE`) is gone. The C
+  helpers stay standalone builds in `legacy/` and `vde_plug/` (CI
+  artifacts); the helper's own `uplink: slirp` (netstack NAT) is
+  unaffected.
+- previous — `legacy/` (generation-1 slirp), `launcher/` (boot + config
   example), simple root README, technical history moved here
 
 **Kernels & CI** — 162 commits of kernel patching, arm64/bionic ports,
