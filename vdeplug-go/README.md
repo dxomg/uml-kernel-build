@@ -83,7 +83,7 @@ cascade). `socket_file_location:` names it explicitly:
   the hub seat's flock applies per machine, the TCP bind is the real
   seat across them.
 
-### Bridging over WebSocket (`cmd/vdews`)
+### Bridging over WebSocket (`helpers/vdews`)
 
 When the hub has no routable address, `vdews` carries the switch over
 WebSocket (TLS handled by the reverse proxy in front):
