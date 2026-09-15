@@ -104,7 +104,7 @@ jobs:
           ./vde_plug --descr CI slirp:// 2>&1 | head -2 || true
 
       - name: Upload slirp artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: slirp-static-${{ matrix.arch }}
           path: |
@@ -112,7 +112,7 @@ jobs:
             slirp.yaml
 
       - name: Upload vde_plug artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: vde_plug-static-${{ matrix.arch }}
           path: vde_plug/vde_plug

@@ -196,7 +196,7 @@ jobs:
           fi
           echo "${{ env.KVER }} ($TRANSPORT)" > VERSION
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-uml-mainline
           path: |

@@ -295,7 +295,7 @@ jobs:
             > VERSION
           ls -lh "$OUT" VERSION
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: uml-base-${{ matrix.distro }}-${{ matrix.release }}${{ matrix.suffix }}
           path: |

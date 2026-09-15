@@ -150,7 +150,7 @@ jobs:
           ls -lh "$RUNNER_TEMP/artifacts/"
 
       - name: Upload kernel artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: linux-bionic-arm64
           path: |
@@ -345,7 +345,7 @@ jobs:
           ./vde_plug_bionic --descr bionic-ci slirp:// 2>&1 | head -2 || true
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: helpers-bionic-arm64
           path: |
