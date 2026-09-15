@@ -51,3 +51,10 @@ default — no network setup inside.
 - [`docs/technical_changelogs.md`](docs/technical_changelogs.md) — the
   full technical record: every patch explained, benchmark and runtime
   verification results, design decisions, and the changelog.
+
+## License
+
+GPL-2.0 — see [LICENSE](LICENSE). The kernel patches in `patches/` are
+derived from Linux (GPL-2.0); the Go network helper, the launcher, the
+standalone helpers and the CI recipes are released under GPL-2.0 as
+well.
