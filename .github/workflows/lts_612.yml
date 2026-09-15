@@ -15,6 +15,11 @@ jobs:
     # GitHub has no hosted Debian runner — build in a bookworm container;
     # the Ubuntu label is only the VM host.
     container: debian:bookworm
+    # Container jobs run steps with dash(1) by default; the steps below
+    # use bashisms (shopt), so pin bash.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install deps
         run: |

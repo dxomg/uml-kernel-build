@@ -31,6 +31,11 @@ jobs:
     # the Ubuntu label is only the VM host. debian:bookworm is multi-arch,
     # so this is a native arm64 bookworm environment.
     container: debian:bookworm
+    # Container jobs run steps with dash(1) by default; the steps below
+    # use bashisms (shopt), so pin bash.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install deps
         run: |
