@@ -97,6 +97,14 @@ messages so packet boundaries survive end-to-end, and the peer's own
 retry loop drives reconnects. `socket_file_location:
 /tmp/vde-remote.sock` points the helper at the local end.
 
+Verified over the real internet (hub behind a reverse proxy at
+wss://quangdz.exe.xyz, a peer on a VPS across the world): ICMP both
+directions between a real UML guest and a `fakeguest` peer, 0% loss at
+one internet RTT (~225ms). Note the topology: the seat (flock + socket
+file) lives on the hub's machine, so distributed failover promotes
+within that machine only — remote peers keep retrying while the hub's
+machine is down, by design.
+
 ## Testing
 
     go vet ./... && go test ./...
