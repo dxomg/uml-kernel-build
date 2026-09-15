@@ -39,6 +39,14 @@ joins as a plain peer. Hub heartbeats also carry the DHCP lease table
 (≤32 leases per frame), so a promoted hub keeps issuing the addresses
 the old hub had handed out.
 
+Guests DHCP by default (NoCloud seed: `dhcp4: true` on vec0) and get
+one lease per MAC — nested LXC/Docker containers bridged onto the
+guest's NIC each get their own address from the same pool
+(`dhcp_start` + 256). Verified end-to-end: six live leases on one
+helper (guest + bridge + two veth CTs + a second guest), hub killed,
+the promoted hub inherited the exact table and the CTs reclaimed their
+old addresses through it.
+
 ## Uplinks (`uplink:` in config.yaml)
 
 - `slirp` — netstack NAT44 + DHCP + portfwd (default, C-binary parity)
