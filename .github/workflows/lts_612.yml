@@ -169,7 +169,7 @@ jobs:
           strip ./linux-uml
           echo "${{ env.KVER }} (SLIRP)" > VERSION
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-uml-6.12-slirp
           path: |
