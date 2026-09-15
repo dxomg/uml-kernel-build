@@ -20,19 +20,19 @@ jobs:
         with:
           go-version: stable
 
-      - name: Float deps, keep gVisor at its known-good pin
+      - name: Float deps to upstream latest
         # go.mod cannot express "track latest" (Go pins exact versions), so
-        # the other deps are resolved at build time. gVisor is restored to
-        # the committed version: its proxy @latest is the master tip and its
-        # release tags are cut from the same tree, and both have shipped
-        # uncompilable module states (bridge_test.go declares package bridge
-        # inside pkg/tcpip/stack). Bump the pin by hand once the deps canary
-        # job is green again.
-        run: |
-          GV_PIN=$(go list -m gvisor.dev/gvisor | awk '{print $2}')
-          go get -u ./...
-          go get "gvisor.dev/gvisor@$GV_PIN"
-          go mod tidy
+        # resolve to the newest stable of every module at build time. The
+        # committed go.mod is the known-good floor for local dev.
+        run: go get -u ./... && go mod tidy
+        working-directory: vdeplug-go
+
+      - name: Drop gVisor's stray bridge_test.go from the module cache
+        # gVisor intermittently ships pkg/tcpip/stack/bridge_test.go
+        # declaring `package bridge_test` next to the directory's package
+        # stack, which kills any module build importing pkg/tcpip/stack.
+        # The script drops it from the cache, making floating safe again.
+        run: ./fix-gvisor-cache.sh
         working-directory: vdeplug-go
 
       - name: Vet
@@ -60,6 +60,10 @@ jobs:
 
       - name: Upgrade every module to latest
         run: go get -u ./... && go mod tidy
+        working-directory: vdeplug-go
+
+      - name: Drop gVisor's stray bridge_test.go from the module cache
+        run: ./fix-gvisor-cache.sh
         working-directory: vdeplug-go
 
       - name: Vet + test against latest deps
@@ -94,12 +98,12 @@ jobs:
         with:
           go-version: stable
 
-      - name: Float deps, keep gVisor at its known-good pin
-        run: |
-          GV_PIN=$(go list -m gvisor.dev/gvisor | awk '{print $2}')
-          go get -u ./...
-          go get "gvisor.dev/gvisor@$GV_PIN"
-          go mod tidy
+      - name: Float deps to upstream latest
+        run: go get -u ./... && go mod tidy
+        working-directory: vdeplug-go
+
+      - name: Drop gVisor's stray bridge_test.go from the module cache
+        run: ./fix-gvisor-cache.sh
         working-directory: vdeplug-go
 
       - name: Build static vde_plug (${{ matrix.target }})
