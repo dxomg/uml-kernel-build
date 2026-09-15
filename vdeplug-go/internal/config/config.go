@@ -32,8 +32,11 @@ type Config struct {
 	IPv6       bool `yaml:"ipv6"`
 	Switch     *bool  `yaml:"switch"` // nil = default true
 	Socket     string `yaml:"socket"`
-	SocketMode uint32 `yaml:"socket_mode"`
-	Uplink     string `yaml:"uplink"` // slirp | tap:NAME | none
+	// SocketFileLocation overrides `socket:` and names the switch socket:
+	// a unix file path, or host:port for a remote raw TCP socket.
+	SocketFileLocation string `yaml:"socket_file_location"`
+	SocketMode         uint32 `yaml:"socket_mode"`
+	Uplink             string `yaml:"uplink"` // slirp | tap:NAME | none
 
 	Network    string `yaml:"network"`
 	Gateway    string `yaml:"gateway"`
@@ -74,6 +77,9 @@ func Load(path string) (*Config, error) {
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if cfg.SocketFileLocation != "" {
+		cfg.Socket = cfg.SocketFileLocation
 	}
 	return cfg, nil
 }

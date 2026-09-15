@@ -5,6 +5,9 @@ on:
     paths:
       - 'vdeplug-go/**'
       - '.github/workflows/vdeplug_go.yml'
+  schedule:
+    # Weekly canary: build + test against the latest module versions.
+    - cron: '0 6 * * 1'
   workflow_dispatch:
 
 jobs:
@@ -15,7 +18,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version-file: vdeplug-go/go.mod
+          go-version: stable
 
       - name: Vet
         run: go vet ./...
@@ -25,6 +28,27 @@ jobs:
         # The e2e test is self-contained: it builds the binary itself and
         # drives fake guests over socketpairs — no UML kernel, no root.
         run: go test -timeout 120s -v ./...
+        working-directory: vdeplug-go
+
+  deps:
+    # Canary against the latest of everything: builds and tests with the
+    # newest Go + module versions instead of the pinned go.mod. Failure
+    # here means an upstream change is coming; it does not block builds.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Upgrade every module to latest
+        run: go get -u ./... && go mod tidy
+        working-directory: vdeplug-go
+
+      - name: Vet + test against latest deps
+        run: go vet ./... && go test -timeout 120s ./...
         working-directory: vdeplug-go
 
   build:
@@ -53,7 +77,7 @@ jobs:
 
       - uses: actions/setup-go@v6
         with:
-          go-version-file: vdeplug-go/go.mod
+          go-version: stable
 
       - name: Build static vde_plug (${{ matrix.target }})
         run: |

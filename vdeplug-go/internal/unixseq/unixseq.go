@@ -135,3 +135,6 @@ func (c *Conn) RecvFrame(buf []byte) (int, error) {
 
 // Close drops the connection.
 func (c *Conn) Close() { unix.Close(c.fd) }
+
+// Fd exposes the raw socket fd (for wrapping in an os.File).
+func (c *Conn) Fd() int { return c.fd }

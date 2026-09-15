@@ -38,7 +38,7 @@ import (
 	"uml-kernel-build/vdeplug-go/internal/nat"
 	"uml-kernel-build/vdeplug-go/internal/portfwd"
 	"uml-kernel-build/vdeplug-go/internal/tap"
-	"uml-kernel-build/vdeplug-go/internal/unixseq"
+	"uml-kernel-build/vdeplug-go/internal/transport"
 	"uml-kernel-build/vdeplug-go/internal/vswitch"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -134,7 +134,7 @@ func dirWritable(dir string) bool {
 // runInstance wires one guest to its uplink; in switch mode (ln != nil)
 // it also owns the switch socket, DHCP, portfwd and the beacons. Returns
 // only on shutdown.
-func (f *fleet) runInstance(ln *unixseq.Listener, release func()) {
+func (f *fleet) runInstance(ln transport.Listener, release func()) {
 	ep, sw, cfg, descr := f.ep, f.sw, f.cfg, f.descr
 
 	// The uplink port. slirp = netstack NAT (the default); tap:NAME = a
@@ -266,7 +266,7 @@ func (f *fleet) runInstance(ln *unixseq.Listener, release func()) {
 
 // acceptPeers runs the hub's listener: each connection becomes a switch
 // port with its own reader and outbound queue.
-func (f *fleet) acceptPeers(ln *unixseq.Listener) {
+func (f *fleet) acceptPeers(ln transport.Listener) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -326,13 +326,27 @@ type fleet struct {
 
 	// The guest wire has exactly one reader for the process lifetime:
 	// frames route to the hub connection in peer mode, into the switch
-	// otherwise. Role changes are atomic pointer swaps, so a promotion
-	// can never leave a second reader racing for the fd (each seqpacket
+	// otherwise. Role changes are guarded swaps, so a promotion can
+	// never leave a second reader racing for the fd (each seqpacket
 	// message is delivered to exactly one reader; a leaked pump would
 	// silently eat guest frames).
-	peerConn atomic.Pointer[unixseq.Conn]
+	peerMu   sync.Mutex
+	peerConn transport.Conn
 	wireOnce sync.Once
 	rxErr    chan error
+}
+
+// setPeer routes the guest wire to the hub connection (nil = local switch).
+func (f *fleet) setPeer(p transport.Conn) {
+	f.peerMu.Lock()
+	f.peerConn = p
+	f.peerMu.Unlock()
+}
+
+func (f *fleet) currentPeer() transport.Conn {
+	f.peerMu.Lock()
+	defer f.peerMu.Unlock()
+	return f.peerConn
 }
 
 // wire reads the guest socket forever, forwarding per current role.
@@ -349,7 +363,7 @@ func (f *fleet) wire() {
 		}
 		frame := make([]byte, n)
 		copy(frame, buf[:n])
-		if peer := f.peerConn.Load(); peer != nil {
+		if peer := f.currentPeer(); peer != nil {
 			if err := peer.SendFrame(frame); err == nil {
 				continue
 			} else {
@@ -367,7 +381,7 @@ func (f *fleet) loop() {
 	backoff := 250 * time.Millisecond
 	for {
 		// Join an existing hub?
-		if conn, err := unixseq.TryConnect(f.sockPath); err == nil {
+		if conn, err := transport.TryConnect(f.sockPath); err == nil {
 			backoff = 250 * time.Millisecond
 			reason := f.runPeer(conn)
 			logf("%s: hub lost (%v), rediscovering", f.descr, reason)
@@ -387,7 +401,7 @@ func (f *fleet) loop() {
 		}
 		// Under the seat: bind — or join a hub that appeared without
 		// taking the seat (an older binary). We do not fight it.
-		ln, conn, err := unixseq.BindOrConnect(f.sockPath, f.mode)
+		ln, conn, err := transport.BindOrConnect(f.sockPath, f.mode)
 		if err != nil {
 			release()
 			fatalf("switch socket %s: %v", f.sockPath, err)
@@ -403,12 +417,12 @@ func (f *fleet) loop() {
 // runPeer wires the local guest to the hub and watches its heartbeat.
 // Returns when the hub is gone; the caller then redisCOVERs — possibly
 // promoting this instance.
-func (f *fleet) runPeer(hub *unixseq.Conn) error {
+func (f *fleet) runPeer(hub transport.Conn) error {
 	defer func() {
-		f.peerConn.Store(nil) // route the wire back to the switch
+		f.setPeer(nil) // route the wire back to the switch
 		hub.Close()
 	}()
-	f.peerConn.Store(hub)
+	f.setPeer(hub)
 	logf("peer of %s", f.sockPath)
 	done := make(chan error, 1)
 
@@ -513,7 +527,7 @@ func leaseMap(ls []elect.Lease) map[[6]byte][4]byte {
 
 // peerReader pumps one peer's frames into the switch; the peer port is
 // removed when the pipe breaks.
-func peerReader(sw *vswitch.Switch, port vswitch.Port, conn *unixseq.Conn) {
+func peerReader(sw *vswitch.Switch, port vswitch.Port, conn transport.Conn) {
 	reason := error(nil)
 	defer func() {
 		sw.RemovePort(port)

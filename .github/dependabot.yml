@@ -1,0 +1,13 @@
+# Auto-update dependencies: Go modules and workflow actions. PRs land
+# weekly; the vdeplug-go CI's deps canary job catches breakage against
+# unpinned latest even between PRs.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /vdeplug-go
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

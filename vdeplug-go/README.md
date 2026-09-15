@@ -71,6 +71,32 @@ PATH). `UML_ENGINE=slirp ./boot` overrides per boot for A/B testing.
 Both engines speak the same vde protocol and can serve different VMs
 side by side.
 
+## Switch sockets (`socket_file_location:` in config.yaml)
+
+The switch socket defaults to `/tmp/vde.socket` (the C binary's
+cascade). `socket_file_location:` names it explicitly:
+
+- a **file path** — a unix SOCK_SEQPACKET socket, as always;
+- **host:port** — a remote raw socket: the helper dials a TCP hub (or
+  binds the port itself when nobody answers), with a 2-byte
+  length-prefixed frame per message. Peers may live on other machines;
+  the hub seat's flock applies per machine, the TCP bind is the real
+  seat across them.
+
+### Bridging over WebSocket (`cmd/vdews`)
+
+When the hub has no routable address, `vdews` carries the switch over
+WebSocket (TLS handled by the reverse proxy in front):
+
+    vdews -mode serve -listen :5001 -upstream /tmp/vde.socket -token S   # hub side
+    vdews -mode connect -downstream /tmp/vde-remote.sock \
+          -url wss://hub.example/vde -token S                            # peer side
+
+Each peer wire = one WebSocket connection; frames ride as binary
+messages so packet boundaries survive end-to-end, and the peer's own
+retry loop drives reconnects. `socket_file_location:
+/tmp/vde-remote.sock` points the helper at the local end.
+
 ## Testing
 
     go vet ./... && go test ./...
