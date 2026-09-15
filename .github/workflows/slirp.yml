@@ -3,10 +3,10 @@ name: Build Static Binaries (slirp + vde_plug)
 on:
   push:
     paths:
-      - 'slirp.c'
+      - 'legacy/slirp.c'
       - 'vde_plug/**'
-      - 'Makefile'
-      - 'slirp.yaml'
+      - 'legacy/Makefile'
+      - 'launcher/config.example.yaml'
       - '.github/workflows/slirp.yml'
   schedule:
     - cron: '0 12 * * 1'
@@ -81,14 +81,14 @@ jobs:
 
       - name: Build static slirp (legacy SLIP transport)
         run: |
-          make static \
+          make -C legacy static \
             VDESLIRP_SRC=libvdeslirp \
             VDESLIRP_BUILD=libvdeslirp/build \
             SLIRP_PREFIX="$SLIRP_PREFIX" \
             SYSLIB=${{ matrix.syslib }}
-          strip slirp
+          strip legacy/slirp
           echo "=== slirp ==="
-          file slirp && ls -lh slirp
+          file legacy/slirp && ls -lh legacy/slirp
 
       - name: Build static vde_plug (VECTOR transport)
         run: |
@@ -108,8 +108,8 @@ jobs:
         with:
           name: slirp-static-${{ matrix.arch }}
           path: |
-            slirp
-            slirp.yaml
+            legacy/slirp
+            launcher/config.example.yaml
 
       - name: Upload vde_plug artifact
         uses: actions/upload-artifact@v7

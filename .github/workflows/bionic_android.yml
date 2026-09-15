@@ -42,7 +42,7 @@ on:
   push:
     paths:
       - 'vde_plug/**'
-      - 'slirp.c'
+      - 'legacy/slirp.c'
       - 'patches/**'
       - '.github/workflows/bionic_android.yml'
 
@@ -322,7 +322,7 @@ jobs:
                 $PREFIX/lib/libpcre2-8.a $PREFIX/lib/libffi.a \
                 -lm"
           $CC $CFLAGS -o vde_plug_bionic vde_plug/vde_plug.c $LIBS
-          $CC $CFLAGS -o slirp_bionic slirp.c $LIBS
+          $CC $CFLAGS -o slirp_bionic legacy/slirp.c $LIBS
 
       - name: Verify (no PT_INTERP, android static, LOAD aligned >= 16K)
         run: |

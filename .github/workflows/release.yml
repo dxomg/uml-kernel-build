@@ -147,7 +147,7 @@ jobs:
           find ./tmp-kernel-arm64 -type f -name "VERSION" -exec cp {} ./release-assets/VERSION-arm64 \;
 
           # slirp/vde_plug artifacts are now arch-suffixed (x86_64 + arm64);
-          # copy each into arch-tagged release assets and keep one slirp.yaml.
+          # copy each into arch-tagged release assets and keep one config example.
           for d in ./tmp-tools/*; do
             [ -d "$d" ] || continue
             case "$(basename "$d")" in
@@ -158,7 +158,7 @@ jobs:
             [ -f "$d/slirp" ]    && cp "$d/slirp"    "./release-assets/slirp${arch}"
             [ -f "$d/vde_plug" ] && cp "$d/vde_plug" "./release-assets/vde_plug${arch}"
           done
-          find ./tmp-tools -type f -name "slirp.yaml" -exec cp {} ./release-assets/ \;
+          find ./tmp-tools -type f -name "config.example.yaml" -exec cp {} ./release-assets/ \;
           # Base image artifacts are raw .img (compression moved out of the
           # build matrix) — gzip here so release assets keep the .img.gz
           # format.

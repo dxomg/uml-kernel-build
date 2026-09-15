@@ -1,6 +1,15 @@
-# slirp.yaml / config.yaml — network configuration for the vde_plug bridge
-#
-# Place next to the vde_plug binary (it is located via /proc/self/exe).
+# config.yaml — configuration for the launcher (../boot) and the vde_plug
+# network helper. Copy to `config.yaml` next to the launcher and the engine
+# binary (both are located via /proc/self/exe, so PATH lookup still works).
+
+# ── Launcher (boot) ────────────────────────────────────────────────────────
+# engine: netstack | slirp — which vde_plug engine binary to symlink in.
+#   netstack = the Go rewrite (default), slirp = the C engine (vde_plug/).
+# memory: guest RAM, passed as mem= (default 2G). Command line: ./boot 4G
+# ncpus:   guest vCPUs (default 1; seccomp=on is added automatically).
+# engine: netstack
+# memory: 2G
+# ncpus: 1
 
 # ── Private switch between instances on the same host ──────────────────────
 # switch: true   — instances sharing `socket` land on one L2 segment.
