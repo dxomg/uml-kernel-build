@@ -1,7 +1,8 @@
-name: "UML Kernel — LTS 6.12 (SLIRP)"
+name: "UML Kernel — LTS 6.12 (VECTOR + SLIRP)"
 
-# Builds the 6.12.x LTS kernel — last branch with UML_NET_SLIRP.
-# Use with: eth0=slirp,,./slirp
+# Builds the 6.12.x LTS kernel. VECTOR is enabled, so it boots with the
+# launcher's vec0:transport=vde,vnl=slirp:// like every other kernel in
+# this repo; SLIRP is kept for the legacy eth0=slirp,,./slirp helper path.
 
 on:
   schedule:
@@ -10,16 +11,20 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    # GitHub has no hosted Debian runner — build in a bookworm container;
+    # the Ubuntu label is only the VM host.
+    container: debian:bookworm
     steps:
-      - uses: actions/checkout@v7
-
       - name: Install deps
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y build-essential libncurses-dev flex bison \
+          apt-get update -y
+          apt-get install -y build-essential libncurses-dev flex bison \
             libssl-dev libelf-dev bc dwarves wget curl jq tar xz-utils \
-            libglib2.0-dev libpcre3-dev pkg-config
+            libglib2.0-dev libpcre3-dev pkg-config \
+            git ca-certificates perl
+
+      - uses: actions/checkout@v7
 
       - name: Pick latest 6.12.x LTS
         run: |
@@ -86,6 +91,7 @@ jobs:
             -e NET -e INET -e PACKET -e NETDEVICES -e NET_CORE -e TUN \
             -e SLHC -e SLIP -e SLIP_COMPRESSED -e SLIP_SMART -e SLIP_MODE_SLIP6 \
             -e UML_NET -e UML_NET_SLIRP -d UML_NET_DAEMON \
+            -e UML_NET_VECTOR \
             -e TTY -e UNIX98_PTYS -e DEVTMPFS -e DEVTMPFS_MOUNT \
             -e TMPFS -e TMPFS_POSIX_ACL -e TMPFS_XATTR \
             -e PROC_FS -e SYSFS -e FHANDLE \
@@ -167,11 +173,11 @@ jobs:
         run: |
           cp linux-${{ env.KVER }}/linux ./linux-uml
           strip ./linux-uml
-          echo "${{ env.KVER }} (SLIRP)" > VERSION
+          echo "${{ env.KVER }} (VECTOR+SLIRP)" > VERSION
 
       - uses: actions/upload-artifact@v7
         with:
-          name: linux-uml-6.12-slirp
+          name: linux-uml-6.12
           path: |
             linux-uml
             VERSION
