@@ -10,16 +10,20 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # GitHub has no hosted Debian runner — build in a bookworm container;
+    # the Ubuntu label is only the VM host.
+    container: debian:bookworm
     steps:
-      - uses: actions/checkout@v7
-
       - name: Install deps
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y build-essential libncurses-dev flex bison \
+          apt-get update -y
+          apt-get install -y build-essential libncurses-dev flex bison \
             libssl-dev libelf-dev bc dwarves wget curl jq tar xz-utils \
-            libglib2.0-dev libpcre3-dev pkg-config
+            libglib2.0-dev libpcre3-dev pkg-config \
+            git ca-certificates perl
+
+      - uses: actions/checkout@v7
 
       - name: Pick mainline version
         run: |

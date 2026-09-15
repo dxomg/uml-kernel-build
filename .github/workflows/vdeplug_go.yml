@@ -12,7 +12,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -35,7 +35,7 @@ jobs:
     # newest Go + module versions instead of the pinned go.mod. Failure
     # here means an upstream change is coming; it does not block builds.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -58,17 +58,17 @@ jobs:
       matrix:
         include:
           - target: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             goos: linux
             goarch: amd64
             cgo: 0
           - target: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
             cgo: 0
           - target: android-arm64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             goos: android
             goarch: arm64
             cgo: 0

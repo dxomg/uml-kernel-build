@@ -52,7 +52,7 @@ env:
 
 jobs:
   kernel:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -159,7 +159,7 @@ jobs:
             ${{ runner.temp }}/artifacts/build-bionic-*.log
 
   helpers:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -168,7 +168,12 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y build-essential cmake ninja-build pkg-config file unzip
-          pip3 install --user meson ninja
+
+      - name: Meson + ninja via pip (decouple glib's floor from the distro's meson)
+        run: |
+          # Ubuntu 24.04 marks python as PEP 668 externally managed, hence
+          # the flag; a user-level install is exactly what we want.
+          pip3 install --user --break-system-packages meson ninja
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Download Android NDK r27c

@@ -26,29 +26,34 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-24.04-arm
+    # GitHub has no hosted Debian runner — build in a bookworm container;
+    # the Ubuntu label is only the VM host. debian:bookworm is multi-arch,
+    # so this is a native arm64 bookworm environment.
+    container: debian:bookworm
     steps:
-      - uses: actions/checkout@v7
-
       - name: Install deps
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y build-essential libncurses-dev flex bison \
+          apt-get update -y
+          apt-get install -y build-essential libncurses-dev flex bison \
             libssl-dev libelf-dev bc dwarves wget curl jq tar xz-utils \
-            pkg-config gnupg
+            pkg-config gnupg git ca-certificates perl
 
-      - name: Install LLVM 18 (jammy archive ships clang 14 — too old for the 7.2 stub link)
+      - uses: actions/checkout@v7
+
+      - name: Install LLVM 18 (bookworm archive ships clang 14 — too old for the 7.2 stub link)
         run: |
+          install -d /etc/apt/keyrings
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
-            sudo tee /etc/apt/trusted.gpg.d/llvm-snapshot.asc >/dev/null
-          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" | \
-            sudo tee /etc/apt/sources.list.d/llvm-18.list >/dev/null
-          sudo apt-get update -y
-          sudo apt-get install -y clang-18 lld-18 llvm-18
+            gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-18 main" | \
+            tee /etc/apt/sources.list.d/llvm-18.list >/dev/null
+          apt-get update -y
+          apt-get install -y clang-18 lld-18 llvm-18
           # LLVM=1 and -fuse-ld=lld resolve unversioned tool names.
           for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
                    llvm-objdump llvm-readelf llvm-strip; do
-            sudo ln -sf "$(command -v "$t-18")" "/usr/local/bin/$t"
+            ln -sf "$(command -v "$t-18")" "/usr/local/bin/$t"
           done
           clang --version | head -1
           ld.lld --version | head -1

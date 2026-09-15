@@ -74,42 +74,42 @@ jobs:
           - distro: ubuntu
             release: noble
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             suffix: "-arm64"
           - distro: ubuntu
             release: resolute
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             suffix: "-arm64"
           - distro: debian
             release: bookworm
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             suffix: "-arm64"
           - distro: debian
             release: trixie
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             suffix: "-arm64"
           - distro: rockylinux
             release: "9"
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             suffix: "-arm64"
           - distro: rockylinux
             release: "10"
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             suffix: "-arm64"
           - distro: almalinux
             release: "9"
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             suffix: "-arm64"
           - distro: almalinux
             release: "10"
             arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             suffix: "-arm64"
 
     steps:
