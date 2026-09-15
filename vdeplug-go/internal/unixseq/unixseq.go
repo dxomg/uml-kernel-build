@@ -16,6 +16,11 @@ import (
 type Listener struct {
 	fd   int
 	path string
+	// fileIno/fileDev = the socket file's identity captured at bind
+	// time (fstat on the fd would report the sockfs inode, not the
+	// filesystem file's).
+	fileIno uint64
+	fileDev uint64
 }
 
 // TryConnect joins an existing switch at path, or returns an error when
@@ -52,7 +57,17 @@ func BindOrConnect(path string, mode uint32) (*Listener, *Conn, error) {
 	}
 	unix.Close(connFD)
 
-	// 2. Nobody answered: clear the stale file and take the socket.
+	// 2. Nobody answered. One retry before declaring the file stale —
+	// a transient refusal against a live listener must not end with us
+	// unlinking someone else's socket.
+	connFD2, err := unix.Socket(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("socket: %w", err)
+	}
+	if err := unix.Connect(connFD2, addr); err == nil {
+		return nil, &Conn{fd: connFD2}, nil
+	}
+	unix.Close(connFD2)
 	_ = os.Remove(path)
 
 	hubFD, err := unix.Socket(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
@@ -83,7 +98,11 @@ func BindOrConnect(path string, mode uint32) (*Listener, *Conn, error) {
 	}
 	_ = os.Chmod(path, os.FileMode(socketMode))
 
-	return &Listener{fd: hubFD, path: path}, nil, nil
+	ln := &Listener{fd: hubFD, path: path}
+	if st, err := Stat(path); err == nil {
+		ln.fileIno, ln.fileDev = st.Ino, st.Dev
+	}
+	return ln, nil, nil
 }
 
 // Accept returns the next peer connection fd.
@@ -95,10 +114,39 @@ func (l *Listener) Accept() (*Conn, error) {
 	return &Conn{fd: fd}, nil
 }
 
-// Close stops listening and removes the socket file.
+// Stat returns the socket FILE's inode identity (captured at bind
+// time), for callers to verify the path still resolves to this
+// listener.
+func (l *Listener) Stat() (Stat_t, error) {
+	return Stat_t{Ino: l.fileIno, Dev: l.fileDev}, nil
+}
+
+// Close stops listening and removes the socket file — only when the
+// path still refers to the file created at bind time. A rogue rebinder
+// (or another helper that cleared a "stale" file) must not have its
+// live socket unlinked from under it.
 func (l *Listener) Close() {
 	unix.Close(l.fd)
-	_ = os.Remove(l.path)
+	if l.fileIno == 0 {
+		return // never captured: be conservative, leave the file alone
+	}
+	pathSt, err := Stat(l.path)
+	if err != nil {
+		return // file already gone
+	}
+	if pathSt.Ino == l.fileIno && pathSt.Dev == l.fileDev {
+		_ = os.Remove(l.path)
+	}
+}
+
+// Stat_t and Stat re-export the unix stat plumbing so callers can
+// verify socket-file identity without pulling x/sys/unix in directly.
+type Stat_t = unix.Stat_t
+
+func Stat(path string) (Stat_t, error) {
+	var st Stat_t
+	err := unix.Stat(path, &st)
+	return st, err
 }
 
 // Conn is one SEQPACKET connection (a peer wire).

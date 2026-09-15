@@ -20,7 +20,7 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	"time"
 
 	"golang.org/x/net/websocket"
 	"uml-kernel-build/vdeplug-go/internal/unixseq"
@@ -87,6 +87,50 @@ func serveWS(ws *websocket.Conn) {
 	pump(ws, file)
 }
 
+func acceptLoop(ln *unixseq.Listener, wsURL string, done chan struct{}) {
+	defer close(done)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return // listener closed: rebinding or shutting down
+		}
+		go func() {
+			file := os.NewFile(uintptr(conn.Fd()), "peer")
+			ws, err := websocket.Dial(wsURL, "", "https://localhost")
+			if err != nil {
+				log.Printf("dial %s: %v", *url, err)
+				file.Close()
+				return
+			}
+			log.Printf("bridge up: %s", *url)
+			pump(ws, file)
+			log.Printf("bridge down: %s", *url)
+		}()
+	}
+}
+
+// watchListener blocks until the socket file no longer refers to this
+// listener's inode (someone rebound or unlinked the path), then closes
+// the listener so the outer loop rebinds.
+func watchListener(ln *unixseq.Listener, done <-chan struct{}) {
+	own, err := ln.Stat()
+	if err != nil {
+		return
+	}
+	for {
+		select {
+		case <-done:
+			return
+		case <-time.After(2 * time.Second):
+		}
+		cur, err := unixseq.Stat(*downstream)
+		if err != nil || cur.Ino != own.Ino || cur.Dev != own.Dev {
+			ln.Close()
+			return
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
 	log.SetFlags(log.LstdFlags)
@@ -118,32 +162,22 @@ func main() {
 			}
 			wsURL += sep + "token=" + *token
 		}
-		ln, _, err := unixseq.BindOrConnect(*downstream, 0o600)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if ln == nil {
-			log.Fatalf("%s: someone is already listening", *downstream)
-		}
-		defer os.Remove(*downstream)
-		log.Printf("vdews connect %s -> %s", *downstream, *url)
+		// A helper that declares our socket file stale unlinks it; when
+		// the path no longer resolves to our listener's inode, rebind a
+		// fresh listener so the bridge stays reachable.
 		for {
-			conn, err := ln.Accept()
+			ln, _, err := unixseq.BindOrConnect(*downstream, 0o600)
 			if err != nil {
 				log.Fatal(err)
 			}
-			go func() {
-				file := os.NewFile(uintptr(conn.Fd()), filepath.Base(*downstream))
-				ws, err := websocket.Dial(wsURL, "", "https://"+filepath.Base(*downstream))
-				if err != nil {
-					log.Printf("dial %s: %v", *url, err)
-					file.Close()
-					return
-				}
-				log.Printf("bridge up: %s", *url)
-				pump(ws, file)
-				log.Printf("bridge down: %s", *url)
-			}()
+			if ln == nil {
+				log.Fatalf("%s: someone is already listening", *downstream)
+			}
+			log.Printf("listening on %s", *downstream)
+			done := make(chan struct{})
+			go acceptLoop(ln, wsURL, done)
+			watchListener(ln, done)
+			log.Printf("socket file replaced under us; rebinding")
 		}
 
 	default:
