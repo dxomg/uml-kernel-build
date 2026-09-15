@@ -20,20 +20,18 @@ jobs:
         with:
           go-version: stable
 
-      - name: Float deps, pin gVisor to its latest stable release
+      - name: Float deps, keep gVisor at its known-good pin
         # go.mod cannot express "track latest" (Go pins exact versions), so
-        # resolve deps at build time: everything floats to newest, but
-        # gVisor is pinned back to its newest release-* tag — the module
-        # proxy's @latest is the master tip (mainline), which breaks too
-        # often. The committed go.mod stays the known-good floor for
-        # local dev.
-        env:
-          GH_TOKEN: ${{ github.token }}
+        # the other deps are resolved at build time. gVisor is restored to
+        # the committed version: its proxy @latest is the master tip and its
+        # release tags are cut from the same tree, and both have shipped
+        # uncompilable module states (bridge_test.go declares package bridge
+        # inside pkg/tcpip/stack). Bump the pin by hand once the deps canary
+        # job is green again.
         run: |
+          GV_PIN=$(go list -m gvisor.dev/gvisor | awk '{print $2}')
           go get -u ./...
-          GV_TAG=$(gh api repos/google/gvisor/releases/latest --jq .tag_name)
-          echo "pinning gvisor.dev/gvisor to $GV_TAG"
-          go get "gvisor.dev/gvisor@$GV_TAG"
+          go get "gvisor.dev/gvisor@$GV_PIN"
           go mod tidy
         working-directory: vdeplug-go
 
@@ -96,14 +94,11 @@ jobs:
         with:
           go-version: stable
 
-      - name: Float deps, pin gVisor to its latest stable release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Float deps, keep gVisor at its known-good pin
         run: |
+          GV_PIN=$(go list -m gvisor.dev/gvisor | awk '{print $2}')
           go get -u ./...
-          GV_TAG=$(gh api repos/google/gvisor/releases/latest --jq .tag_name)
-          echo "pinning gvisor.dev/gvisor to $GV_TAG"
-          go get "gvisor.dev/gvisor@$GV_TAG"
+          go get "gvisor.dev/gvisor@$GV_PIN"
           go mod tidy
         working-directory: vdeplug-go
 
