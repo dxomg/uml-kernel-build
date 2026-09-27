@@ -11,6 +11,55 @@ on:
         description: 'CPU model name to report in /proc/cpuinfo (blank = show the host CPU)'
         required: false
         type: string
+      kernel_lts_latest:
+        description: 'x86_64 LTS-latest kernel (VECTOR/VDE)'
+        required: false
+        type: boolean
+        default: true
+      kernel_arm64:
+        description: 'arm64 stable kernel (linux-um port)'
+        required: false
+        type: boolean
+        default: true
+      kernel_612:
+        description: 'x86_64 LTS 6.12 kernel (VECTOR + SLIRP)'
+        required: false
+        type: boolean
+        default: true
+      kernel_static:
+        description: 'x86_64 LTS-latest STATIC kernel (no libc dependency)'
+        required: false
+        type: boolean
+        default: true
+      kernel_stable:
+        description: 'x86_64 Stable kernel (latest non-LTS release)'
+        required: false
+        type: boolean
+        default: true
+      kernel_mainline:
+        description: 'x86_64 Mainline kernel (RC, not for production)'
+        required: false
+        type: boolean
+        default: true
+      kernel_bionic:
+        description: 'Android (bionic) kernel + network helpers'
+        required: false
+        type: boolean
+        default: true
+      bionic_kernel_version:
+        description: 'Bionic kernel version (release like 7.3.0, or -rc like 7.3-rc2; empty = latest stable)'
+        required: false
+        type: string
+      tools_vdeplug_go:
+        description: 'Go netstack vde_plug binaries'
+        required: false
+        type: boolean
+        default: true
+      build_images:
+        description: 'UML base images (distro-agnostic, VECTOR/VDE)'
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   trigger-build-and-release:
@@ -41,23 +90,62 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
+          # cpu_model is only forwarded to workflows that declare it
+          # (LTS latest + stable arm64); the others take no inputs.
           EXTRA_ARGS=()
           if [ -n "${{ inputs.cpu_model }}" ]; then
-            echo "[+] Forwarding cpu_model='${{ inputs.cpu_model }}' to build workflows"
+            echo "[+] Forwarding cpu_model='${{ inputs.cpu_model }}' to supporting kernel workflows"
             EXTRA_ARGS+=(-f "cpu_model=${{ inputs.cpu_model }}")
           fi
 
-          echo "[+] Triggering 'UML Kernel — LTS latest (VECTOR/VDE)'..."
-          gh workflow run "UML Kernel — LTS latest (VECTOR/VDE)" --repo "$REPO" --ref "${{ github.ref_name }}" "${EXTRA_ARGS[@]}"
+          BIONIC_ARGS=()
+          if [ -n "${{ inputs.bionic_kernel_version }}" ]; then
+            echo "[+] Forwarding kernel_version='${{ inputs.bionic_kernel_version }}' to the bionic workflow"
+            BIONIC_ARGS+=(-f "kernel_version=${{ inputs.bionic_kernel_version }}")
+          fi
 
-          echo "[+] Triggering 'UML Kernel — stable arm64 (linux-um port)'..."
-          gh workflow run "UML Kernel — stable arm64 (linux-um port)" --repo "$REPO" --ref "${{ github.ref_name }}" "${EXTRA_ARGS[@]}"
+          trigger() {
+            local name="$1"
+            shift
+            echo "[+] Triggering '$name'..."
+            gh workflow run "$name" --repo "$REPO" --ref "${{ github.ref_name }}" "$@"
+          }
 
-          echo "[+] Triggering 'vdeplug-go (netstack vde_plug)'..."
-          gh workflow run "vdeplug-go (netstack vde_plug)" --repo "$REPO" --ref "${{ github.ref_name }}"
+          if [ "${{ inputs.kernel_lts_latest }}" = "true" ]; then
+            trigger "UML Kernel — LTS latest (VECTOR/VDE)" "${EXTRA_ARGS[@]}"
+          fi
 
-          echo "[+] Triggering 'UML Base Image (distro-agnostic, VECTOR/VDE)'..."
-          gh workflow run "UML Base Image (distro-agnostic, VECTOR/VDE)" --repo "$REPO" --ref "${{ github.ref_name }}"
+          if [ "${{ inputs.kernel_arm64 }}" = "true" ]; then
+            trigger "UML Kernel — stable arm64 (linux-um port)" "${EXTRA_ARGS[@]}"
+          fi
+
+          if [ "${{ inputs.kernel_612 }}" = "true" ]; then
+            trigger "UML Kernel — LTS 6.12 (VECTOR + SLIRP)"
+          fi
+
+          if [ "${{ inputs.kernel_static }}" = "true" ]; then
+            trigger "UML Kernel — LTS latest STATIC (no libc dependency)"
+          fi
+
+          if [ "${{ inputs.kernel_stable }}" = "true" ]; then
+            trigger "UML Kernel — Stable (latest non-LTS release)"
+          fi
+
+          if [ "${{ inputs.kernel_mainline }}" = "true" ]; then
+            trigger "UML Kernel — Mainline (RC, not for production)"
+          fi
+
+          if [ "${{ inputs.kernel_bionic }}" = "true" ]; then
+            trigger "Build bionic (Android NDK) — kernel + network helpers" "${BIONIC_ARGS[@]}"
+          fi
+
+          if [ "${{ inputs.tools_vdeplug_go }}" = "true" ]; then
+            trigger "vdeplug-go (netstack vde_plug)"
+          fi
+
+          if [ "${{ inputs.build_images }}" = "true" ]; then
+            trigger "UML Base Image (distro-agnostic, VECTOR/VDE)"
+          fi
 
           # Give GitHub API a few seconds to register the new runs
           sleep 10
@@ -104,95 +192,224 @@ jobs:
             done
           }
 
-          # Wait for all build pipelines to finish building
-          wait_for_workflow "UML Kernel — LTS latest (VECTOR/VDE)"
-          wait_for_workflow "UML Kernel — stable arm64 (linux-um port)"
-          wait_for_workflow "vdeplug-go (netstack vde_plug)"
-          wait_for_workflow "UML Base Image (distro-agnostic, VECTOR/VDE)"
+          # Wait only for the pipelines selected above
+          if [ "${{ inputs.kernel_lts_latest }}" = "true" ]; then
+            wait_for_workflow "UML Kernel — LTS latest (VECTOR/VDE)"
+          fi
+          if [ "${{ inputs.kernel_arm64 }}" = "true" ]; then
+            wait_for_workflow "UML Kernel — stable arm64 (linux-um port)"
+          fi
+          if [ "${{ inputs.kernel_612 }}" = "true" ]; then
+            wait_for_workflow "UML Kernel — LTS 6.12 (VECTOR + SLIRP)"
+          fi
+          if [ "${{ inputs.kernel_static }}" = "true" ]; then
+            wait_for_workflow "UML Kernel — LTS latest STATIC (no libc dependency)"
+          fi
+          if [ "${{ inputs.kernel_stable }}" = "true" ]; then
+            wait_for_workflow "UML Kernel — Stable (latest non-LTS release)"
+          fi
+          if [ "${{ inputs.kernel_mainline }}" = "true" ]; then
+            wait_for_workflow "UML Kernel — Mainline (RC, not for production)"
+          fi
+          if [ "${{ inputs.kernel_bionic }}" = "true" ]; then
+            wait_for_workflow "Build bionic (Android NDK) — kernel + network helpers"
+          fi
+          if [ "${{ inputs.tools_vdeplug_go }}" = "true" ]; then
+            wait_for_workflow "vdeplug-go (netstack vde_plug)"
+          fi
+          if [ "${{ inputs.build_images }}" = "true" ]; then
+            wait_for_workflow "UML Base Image (distro-agnostic, VECTOR/VDE)"
+          fi
 
       - name: Fetch Artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          mkdir -p ./tmp-kernel ./tmp-kernel-arm64 ./tmp-vdeplug-go ./tmp-images
+          fetch() {
+            # $1 = workflow name, $2 = destination dir
+            RUN_ID=$(gh run list --repo "$REPO" --workflow "$1" --status success --limit 1 --json databaseId -q '.[0].databaseId')
+            echo "[+] Downloading artifacts from '$1' (Run ID: $RUN_ID)"
+            gh run download "$RUN_ID" --repo "$REPO" --dir "$2"
+          }
 
-          KERNEL_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Kernel — LTS latest (VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
-          echo "[+] Downloading artifacts from Kernel Run ID: $KERNEL_RUN_ID"
-          gh run download "$KERNEL_RUN_ID" --repo "$REPO" --dir ./tmp-kernel
+          if [ "${{ inputs.kernel_lts_latest }}" = "true" ]; then
+            fetch "UML Kernel — LTS latest (VECTOR/VDE)" ./tmp-kernel
+          fi
 
-          ARM64_KERNEL_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Kernel — stable arm64 (linux-um port)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
-          echo "[+] Downloading artifacts from arm64 Kernel Run ID: $ARM64_KERNEL_RUN_ID"
-          gh run download "$ARM64_KERNEL_RUN_ID" --repo "$REPO" --dir ./tmp-kernel-arm64
+          if [ "${{ inputs.kernel_arm64 }}" = "true" ]; then
+            fetch "UML Kernel — stable arm64 (linux-um port)" ./tmp-kernel-arm64
+          fi
 
-          VDEPLUG_RUN_ID=$(gh run list --repo "$REPO" --workflow "vdeplug-go (netstack vde_plug)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
-          echo "[+] Downloading artifacts from vdeplug-go Run ID: $VDEPLUG_RUN_ID"
-          gh run download "$VDEPLUG_RUN_ID" --repo "$REPO" --dir ./tmp-vdeplug-go
+          if [ "${{ inputs.kernel_612 }}" = "true" ]; then
+            fetch "UML Kernel — LTS 6.12 (VECTOR + SLIRP)" ./tmp-kernel-612
+          fi
 
-          IMAGE_RUN_ID=$(gh run list --repo "$REPO" --workflow "UML Base Image (distro-agnostic, VECTOR/VDE)" --status success --limit 1 --json databaseId -q '.[0].databaseId')
-          echo "[+] Downloading artifacts from Image Run ID: $IMAGE_RUN_ID"
-          gh run download "$IMAGE_RUN_ID" --repo "$REPO" --dir ./tmp-images
+          if [ "${{ inputs.kernel_static }}" = "true" ]; then
+            fetch "UML Kernel — LTS latest STATIC (no libc dependency)" ./tmp-kernel-static
+          fi
+
+          if [ "${{ inputs.kernel_stable }}" = "true" ]; then
+            fetch "UML Kernel — Stable (latest non-LTS release)" ./tmp-kernel-stable
+          fi
+
+          if [ "${{ inputs.kernel_mainline }}" = "true" ]; then
+            fetch "UML Kernel — Mainline (RC, not for production)" ./tmp-kernel-mainline
+          fi
+
+          if [ "${{ inputs.kernel_bionic }}" = "true" ]; then
+            fetch "Build bionic (Android NDK) — kernel + network helpers" ./tmp-kernel-bionic
+          fi
+
+          if [ "${{ inputs.tools_vdeplug_go }}" = "true" ]; then
+            fetch "vdeplug-go (netstack vde_plug)" ./tmp-vdeplug-go
+          fi
+
+          if [ "${{ inputs.build_images }}" = "true" ]; then
+            fetch "UML Base Image (distro-agnostic, VECTOR/VDE)" ./tmp-images
+          fi
 
       - name: Organize Release Assets
         run: |
           mkdir -p ./release-assets
 
           echo "=== Downloaded Files Structure ==="
-          find ./tmp-kernel ./tmp-kernel-arm64 ./tmp-vdeplug-go ./tmp-images -type f
+          find ./tmp-* -type f 2>/dev/null | head -100 || true
 
-          # Locate and copy target files regardless of artifact folder nesting
-          find ./tmp-kernel -type f -name "linux-uml" -exec cp {} ./release-assets/ \;
-          find ./tmp-kernel -type f -name "VERSION" -exec cp {} ./release-assets/ \;
-          find ./tmp-kernel-arm64 -type f -name "linux-uml-arm64" -exec cp {} ./release-assets/ \;
-          find ./tmp-kernel-arm64 -type f -name "VERSION" -exec cp {} ./release-assets/VERSION-arm64 \;
+          # Every x86_64 kernel workflow ships a `linux-uml` + `VERSION`
+          # pair, so each variant is renamed on the way into the release
+          # (LTS latest keeps the historic bare `linux-uml` name).
+          if [ -d ./tmp-kernel ]; then
+            find ./tmp-kernel -type f -name "linux-uml" -exec cp {} ./release-assets/ \;
+            find ./tmp-kernel -type f -name "VERSION" -exec cp {} ./release-assets/ \;
+          fi
+          if [ -d ./tmp-kernel-arm64 ]; then
+            find ./tmp-kernel-arm64 -type f -name "linux-uml-arm64" -exec cp {} ./release-assets/ \;
+            find ./tmp-kernel-arm64 -type f -name "VERSION" -exec cp {} ./release-assets/VERSION-arm64 \;
+          fi
+          if [ -d ./tmp-kernel-612 ]; then
+            find ./tmp-kernel-612 -type f -name "linux-uml" -exec cp {} ./release-assets/linux-uml-6.12 \;
+            find ./tmp-kernel-612 -type f -name "VERSION" -exec cp {} ./release-assets/VERSION-6.12 \;
+          fi
+          if [ -d ./tmp-kernel-static ]; then
+            find ./tmp-kernel-static -type f -name "linux-uml" -exec cp {} ./release-assets/linux-uml-static \;
+            find ./tmp-kernel-static -type f -name "VERSION" -exec cp {} ./release-assets/VERSION-static \;
+          fi
+          if [ -d ./tmp-kernel-stable ]; then
+            find ./tmp-kernel-stable -type f -name "linux-uml" -exec cp {} ./release-assets/linux-uml-stable \;
+            find ./tmp-kernel-stable -type f -name "VERSION" -exec cp {} ./release-assets/VERSION-stable \;
+          fi
+          if [ -d ./tmp-kernel-mainline ]; then
+            find ./tmp-kernel-mainline -type f -name "linux-uml" -exec cp {} ./release-assets/linux-uml-mainline \;
+            find ./tmp-kernel-mainline -type f -name "VERSION" -exec cp {} ./release-assets/VERSION-mainline \;
+          fi
+          if [ -d ./tmp-kernel-bionic ]; then
+            find ./tmp-kernel-bionic -type f -name "linux-bionic" -exec cp {} ./release-assets/ \;
+            find ./tmp-kernel-bionic -type f -name "stub_exe_bionic" -exec cp {} ./release-assets/ \;
+            find ./tmp-kernel-bionic -type f -name "vde_plug_bionic" -exec cp {} ./release-assets/ \;
+            find ./tmp-kernel-bionic -type f -name "slirp_bionic" -exec cp {} ./release-assets/ \;
+          fi
 
-          # vdeplug-go artifacts are per-target (vdeplug-go-x86_64,
-          # vdeplug-go-arm64, vdeplug-go-android-arm64), each holding a
-          # single `vde_plug` binary — copy each into an arch-tagged
-          # release asset.
-          for d in ./tmp-vdeplug-go/*; do
-            [ -d "$d" ] || continue
-            case "$(basename "$d")" in
-              *android-arm64) arch=-android-arm64 ;;
-              *arm64)         arch=-arm64 ;;
-              *x86_64)        arch=-x86_64 ;;
-              *)              arch= ;;
-            esac
-            [ -f "$d/vde_plug" ] && cp "$d/vde_plug" "./release-assets/vde_plug${arch}"
-          done
-          # The Go workflow ships binaries only — the config example lives
-          # in the checkout.
-          cp ./launcher/config.example.yaml ./release-assets/ 2>/dev/null || true
-          cp ./launcher/boot ./release-assets/ 2>/dev/null || true
-          # Base image artifacts are raw .img (compression moved out of the
-          # build matrix) — gzip here so release assets keep the .img.gz
-          # format.
-          find ./tmp-images -type f -name "*.img" | while read -r f; do
-            echo "[+] Compressing $(basename "$f")"
-            gzip -6 -c "$f" > "./release-assets/$(basename "$f").gz"
-          done
+          if [ -d ./tmp-vdeplug-go ]; then
+            # vdeplug-go artifacts are per-target (vdeplug-go-x86_64,
+            # vdeplug-go-arm64, vdeplug-go-android-arm64), each holding a
+            # single `vde_plug` binary — copy each into an arch-tagged
+            # release asset.
+            for d in ./tmp-vdeplug-go/*; do
+              [ -d "$d" ] || continue
+              case "$(basename "$d")" in
+                *android-arm64) arch=-android-arm64 ;;
+                *arm64)         arch=-arm64 ;;
+                *x86_64)        arch=-x86_64 ;;
+                *)              arch= ;;
+              esac
+              [ -f "$d/vde_plug" ] && cp "$d/vde_plug" "./release-assets/vde_plug${arch}"
+            done
+            # The Go workflow ships binaries only — the config example lives
+            # in the checkout.
+            cp ./launcher/config.example.yaml ./release-assets/ 2>/dev/null || true
+            cp ./launcher/boot ./release-assets/ 2>/dev/null || true
+          fi
+
+          if [ -d ./tmp-images ]; then
+            # Base image artifacts are raw .img (compression moved out of the
+            # build matrix) — gzip here so release assets keep the .img.gz
+            # format.
+            find ./tmp-images -type f -name "*.img" | while read -r f; do
+              echo "[+] Compressing $(basename "$f")"
+              gzip -6 -c "$f" > "./release-assets/$(basename "$f").gz"
+            done
+          fi
 
           echo "=== Staged Release Assets ==="
           ls -lh ./release-assets/
+
+          if [ -z "$(ls -A ./release-assets/)" ]; then
+            echo "::error::No assets staged — enable at least one kernel, tool, or image input"
+            exit 1
+          fi
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.vars.outputs.tag_name }}"
-          
-          K_VERSION="Latest LTS"
-          if [ -f ./release-assets/VERSION ]; then
-            K_VERSION=$(cat ./release-assets/VERSION)
+
+          version_of() {
+            # $1 = VERSION file; prints its content or "unknown"
+            [ -f "$1" ] && cat "$1" || echo "unknown"
+          }
+
+          NOTES="### Included Kernels"
+          if [ -f ./release-assets/linux-uml ]; then
+            NOTES="$NOTES
+          * \`linux-uml\`: x86_64 LTS latest (**$(version_of ./release-assets/VERSION)**)"
+          fi
+          if [ -f ./release-assets/linux-uml-arm64 ]; then
+            NOTES="$NOTES
+          * \`linux-uml-arm64\`: arm64 stable via the linux-um port (**$(version_of ./release-assets/VERSION-arm64)**)"
+          fi
+          if [ -f ./release-assets/linux-uml-6.12 ]; then
+            NOTES="$NOTES
+          * \`linux-uml-6.12\`: x86_64 LTS 6.12 (**$(version_of ./release-assets/VERSION-6.12)**)"
+          fi
+          if [ -f ./release-assets/linux-uml-static ]; then
+            NOTES="$NOTES
+          * \`linux-uml-static\`: x86_64 LTS latest, static (no libc dependency) (**$(version_of ./release-assets/VERSION-static)**)"
+          fi
+          if [ -f ./release-assets/linux-uml-stable ]; then
+            NOTES="$NOTES
+          * \`linux-uml-stable\`: x86_64 stable, latest non-LTS (**$(version_of ./release-assets/VERSION-stable)**)"
+          fi
+          if [ -f ./release-assets/linux-uml-mainline ]; then
+            NOTES="$NOTES
+          * \`linux-uml-mainline\`: x86_64 mainline RC, not for production (**$(version_of ./release-assets/VERSION-mainline)**)"
+          fi
+          if [ -f ./release-assets/linux-bionic ]; then
+            NOTES="$NOTES
+          * \`linux-bionic\` + \`stub_exe_bionic\`: Android (bionic) arm64 kernel and userspace stub"
+          fi
+
+          if [ -f ./release-assets/vde_plug-x86_64 ] || [ -f ./release-assets/vde_plug-arm64 ]; then
+            NOTES="$NOTES
+
+          ### Networking"
+            for asset in vde_plug-x86_64 vde_plug-arm64 vde_plug-android-arm64; do
+              [ -f "./release-assets/$asset" ] && NOTES="$NOTES
+          * \`$asset\`: Go netstack vde_plug (gVisor-based NAT, DHCP, switch + failover)"
+            done
+            [ -f ./release-assets/vde_plug_bionic ] && NOTES="$NOTES
+          * \`vde_plug_bionic\` / \`slirp_bionic\`: bionic (Android NDK) network helpers"
+          fi
+
+          if ls ./release-assets/base-*.img.gz >/dev/null 2>&1; then
+            NOTES="$NOTES
+
+          ### Included Images
+          * \`base-*.img.gz\`: Fresh UML rootfs cloud images (amd64 + arm64; Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10) with cloud-init NoCloud networking baked in"
           fi
 
           gh release create "$TAG" ./release-assets/* \
             --title "UML Kernel & Networking Suite ($TAG)" \
-            --notes "### Included Binaries
-          * **\`linux-uml\`**: Kernel build for **${K_VERSION}** (x86_64)
-          * **\`linux-uml-arm64\`**: Kernel build for arm64 (VECTOR transport, via the linux-um port) — see \`VERSION-arm64\`
-          * **\`vde_plug-x86_64\`** / **\`vde_plug-arm64\`** / **\`vde_plug-android-arm64\`**: Go netstack vde_plug binaries (gVisor-based NAT, DHCP, switch + failover) with VECTOR transport support
-
-          ### Included Images
-          * **\`base-*.img.gz\`**: Fresh UML rootfs cloud images (amd64 + arm64; Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10) with cloud-init NoCloud networking baked in" \
+            --notes "$NOTES" \
             --generate-notes
