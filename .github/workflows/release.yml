@@ -55,6 +55,11 @@ on:
         required: false
         type: boolean
         default: true
+      tools_legacy:
+        description: 'Legacy C slirp + vde_plug static binaries'
+        required: false
+        type: boolean
+        default: true
       build_images:
         description: 'UML base images (distro-agnostic, VECTOR/VDE)'
         required: false
@@ -143,6 +148,10 @@ jobs:
             trigger "vdeplug-go (netstack vde_plug)"
           fi
 
+          if [ "${{ inputs.tools_legacy }}" = "true" ]; then
+            trigger "Build Static Binaries (slirp + vde_plug)"
+          fi
+
           if [ "${{ inputs.build_images }}" = "true" ]; then
             trigger "UML Base Image (distro-agnostic, VECTOR/VDE)"
           fi
@@ -217,6 +226,9 @@ jobs:
           if [ "${{ inputs.tools_vdeplug_go }}" = "true" ]; then
             wait_for_workflow "vdeplug-go (netstack vde_plug)"
           fi
+          if [ "${{ inputs.tools_legacy }}" = "true" ]; then
+            wait_for_workflow "Build Static Binaries (slirp + vde_plug)"
+          fi
           if [ "${{ inputs.build_images }}" = "true" ]; then
             wait_for_workflow "UML Base Image (distro-agnostic, VECTOR/VDE)"
           fi
@@ -263,6 +275,10 @@ jobs:
 
           if [ "${{ inputs.tools_vdeplug_go }}" = "true" ]; then
             fetch "vdeplug-go (netstack vde_plug)" ./tmp-vdeplug-go
+          fi
+
+          if [ "${{ inputs.tools_legacy }}" = "true" ]; then
+            fetch "Build Static Binaries (slirp + vde_plug)" ./tmp-tools-legacy
           fi
 
           if [ "${{ inputs.build_images }}" = "true" ]; then
@@ -331,6 +347,24 @@ jobs:
             cp ./launcher/boot ./release-assets/ 2>/dev/null || true
           fi
 
+          if [ -d ./tmp-tools-legacy ]; then
+            # Legacy C artifacts are per-arch (slirp-static-*, vde_plug-static-*).
+            # The C vde_plug is suffixed `-legacy` so it never collides with
+            # the Go `vde_plug-*` assets.
+            for d in ./tmp-tools-legacy/*; do
+              [ -d "$d" ] || continue
+              case "$(basename "$d")" in
+                *x86_64) arch=-x86_64 ;;
+                *arm64)  arch=-arm64 ;;
+                *)       arch= ;;
+              esac
+              f=$(find "$d" -maxdepth 2 -type f -name "slirp" 2>/dev/null | head -1)
+              [ -n "$f" ] && cp "$f" "./release-assets/slirp${arch}"
+              f=$(find "$d" -maxdepth 2 -type f -name "vde_plug" 2>/dev/null | head -1)
+              [ -n "$f" ] && cp "$f" "./release-assets/vde_plug-legacy${arch}"
+            done
+          fi
+
           if [ -d ./tmp-images ]; then
             # Base image artifacts are raw .img (compression moved out of the
             # build matrix) — gzip here so release assets keep the .img.gz
@@ -390,13 +424,21 @@ jobs:
           * \`linux-bionic\` + \`stub_exe_bionic\`: Android (bionic) arm64 kernel and userspace stub"
           fi
 
-          if [ -f ./release-assets/vde_plug-x86_64 ] || [ -f ./release-assets/vde_plug-arm64 ]; then
+          if [ -f ./release-assets/vde_plug-x86_64 ] || [ -f ./release-assets/vde_plug-arm64 ] || [ -f ./release-assets/slirp-x86_64 ] || [ -f ./release-assets/slirp-arm64 ]; then
             NOTES="$NOTES
 
           ### Networking"
             for asset in vde_plug-x86_64 vde_plug-arm64 vde_plug-android-arm64; do
               [ -f "./release-assets/$asset" ] && NOTES="$NOTES
           * \`$asset\`: Go netstack vde_plug (gVisor-based NAT, DHCP, switch + failover)"
+            done
+            for asset in slirp-x86_64 slirp-arm64; do
+              [ -f "./release-assets/$asset" ] && NOTES="$NOTES
+          * \`$asset\`: legacy C slirp helper (SLIP transport, static, enlarged DHCP pool)"
+            done
+            for asset in vde_plug-legacy-x86_64 vde_plug-legacy-arm64; do
+              [ -f "./release-assets/$asset" ] && NOTES="$NOTES
+          * \`$asset\`: legacy C vde_plug helper (VECTOR transport, static)"
             done
             [ -f ./release-assets/vde_plug_bionic ] && NOTES="$NOTES
           * \`vde_plug_bionic\` / \`slirp_bionic\`: bionic (Android NDK) network helpers"
