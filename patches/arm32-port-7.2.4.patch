@@ -584,6 +584,46 @@ index 000000000..48d50a87c
 +#include <uapi/asm/mman.h>
 +
 +#endif /* __UM_ARM_MMAN_H */
+diff --git a/arch/arm/um/asm/module.h b/arch/arm/um/asm/module.h
+new file mode 100644
+index 000000000..36abd3e17
+--- /dev/null
++++ b/arch/arm/um/asm/module.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_MODULE_H
++#define __UM_ARM_MODULE_H
++
++#include <asm-generic/module.h>
++
++/*
++ * UML arm32 shadow of <asm/module.h>. UML's generated <asm/module.h>
++ * wrapper (arch/um/include/generated/asm, which the top-level Makefile
++ * puts ahead of the parent architecture's own headers) only knows the
++ * generic content; this file supplies what arch/arm/kernel/module.c --
++ * which UML builds unmodified -- still needs.
++ *
++ * arm's struct mod_arch_specific gains fields only under
++ * CONFIG_ARM_UNWIND (unwind tables) and CONFIG_ARM_MODULE_PLTS (PLT
++ * bookkeeping); neither can apply to a UML guest, so the struct stays
++ * empty, exactly as arch/arm's own copy reduces to it with those
++ * options off. UML's subarch Kconfig selects HAVE_MOD_ARCH_SPECIFIC,
++ * which is what keeps the generic copy's empty struct out of the way
++ * of the one defined here.
++ */
++struct mod_arch_specific {
++};
++
++/*
++ * arch/arm declares this for its relocation path; module.c calls it
++ * under a runtime CONFIG_ARM_MODULE_PLTS check that is always false
++ * here, so only the declaration matters. The definition lives in
++ * arch/arm/kernel/module-plts.c, which UML does not build.
++ */
++struct module;
++u32 get_module_plt(struct module *mod, unsigned long loc, unsigned long val);
++
++#endif /* __UM_ARM_MODULE_H */
 diff --git a/arch/arm/um/asm/processor.h b/arch/arm/um/asm/processor.h
 new file mode 100644
 index 000000000..76e006be3
@@ -863,6 +903,30 @@ index 000000000..1e01e752e
 +extern void arch_switch_to(struct task_struct *to);
 +
 +#endif /* __UM_ARM_PTRACE_H */
+diff --git a/arch/arm/um/asm/qspinlock.h b/arch/arm/um/asm/qspinlock.h
+new file mode 100644
+index 000000000..dee51c5ca
+--- /dev/null
++++ b/arch/arm/um/asm/qspinlock.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_QSPINLOCK_H
++#define __UM_ARM_QSPINLOCK_H
++
++/*
++ * UML arm32 shadow of <asm/qspinlock.h>. The arm kernel uses ticket
++ * spinlocks and ships no header of that name, and Kbuild's
++ * mandatory-header fallback does not wrap one either. But this subarch
++ * selects ARCH_USE_QUEUED_SPINLOCKS exactly as x86 and arm64 UML do,
++ * so with CONFIG_QUEUED_SPINLOCKS set, <asm-generic/rqspinlock.h> and
++ * kernel/bpf/rqspinlock.c both include <asm/qspinlock.h>. Point it at
++ * the generic queued implementation: guest queued locks are plain C on
++ * top of the architecture's atomics, which ARCH_SUPPORTS_ATOMIC_RMW
++ * covers.
++ */
++#include <asm-generic/qspinlock.h>
++
++#endif /* __UM_ARM_QSPINLOCK_H */
 diff --git a/arch/arm/um/asm/segment.h b/arch/arm/um/asm/segment.h
 new file mode 100644
 index 000000000..08449df7c
