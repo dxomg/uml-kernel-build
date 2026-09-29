@@ -1,9 +1,9 @@
 diff --git a/arch/arm/Makefile.um b/arch/arm/Makefile.um
 new file mode 100644
-index 000000000..3226d6373
+index 000000000..046f35987
 --- /dev/null
 +++ b/arch/arm/Makefile.um
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,133 @@
 +# SPDX-License-Identifier: GPL-2.0
 +#
 +# Build glue for ARCH=um SUBARCH=arm.
@@ -75,6 +75,22 @@ index 000000000..3226d6373
 +# stub's resume path is compared against that word in
 +# arch/arm/um/shared/sysdep/ptrace_user.h), so pin the state here as well.
 +KBUILD_AFLAGS += -march=armv7-a -marm
++
++# The vmlinux link runs through $(CC), which appends its implicit -lgcc after
++# every explicit input. Once anything in the link leaves a member of libgcc's
++# division family to satisfy, ld pulls that member in -- and its __udivsi3 /
++# __aeabi_uidiv / __divsi3 / __aeabi_idiv then collide with the very same
++# symbols arm-klib.o defines out of the kernel's own arch/arm/lib/lib1funcs.S.
++# Those copies cannot be dropped: modpost reads vmlinux.o, which has no
++# libgcc, and the module loader patches guest .ko relocations against
++# vmlinux's symbol table, so the kernel's own helpers have to be what
++# vmlinux defines. --allow-multiple-definition makes the pulled members
++# no-ops: the first definition wins, and vmlinux.a (whole-archived ahead of
++# -lgcc) is first, so every reference keeps binding to the kernel's copy
++# exactly as it did before the pull. Scoped to KBUILD_LDFLAGS, which
++# arch/um/Makefile folds into CFLAGS_vmlinux with a -Wl, prefix per flag;
++# relocatable links ignore it.
++KBUILD_LDFLAGS += --allow-multiple-definition
 +
 +LINK-$(CONFIG_LD_SCRIPT_DYN_RPATH) += -Wl,-rpath,/lib
 +
