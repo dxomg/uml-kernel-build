@@ -121,6 +121,34 @@ index 000000000..3226d6373
 +# arch/arm/um/bionic-syms.redef for the list and for why -D is the wrong tool.
 +export UM_REDEF_SYMS := $(srctree)/arch/arm/um/bionic-syms.redef
 +endif
+diff --git a/arch/arm/lib/bitops.h b/arch/arm/lib/bitops.h
+index f069d1b23..a74cb1199
+--- a/arch/arm/lib/bitops.h
++++ b/arch/arm/lib/bitops.h
+@@ -1,6 +1,17 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ #include <asm/assembler.h>
+ #include <asm/unwind.h>
++
++/*
++ * The macro definitions below are meant to reach the assembler once per
++ * assembly input. The parent arm build is built that way: every
++ * arch/arm/lib .S file is assembled as its own object, so each preprocessor
++ * sees this file exactly once. UML's arm32 port links several of those files
++ * into a single object (arch/arm/um/arm-klib.S), so guard the block or the
++ * .macro definitions would reach gas once per included file.
++ */
++#ifndef ARCH_ARM_LIB_BITOPS_H
++#define ARCH_ARM_LIB_BITOPS_H
+ 
+ #if __LINUX_ARM_ARCH__ >= 6
+ 	.macro	bitop, name, instr
+@@ -113,3 +124,5 @@
+ ENDPROC(\name		)
+ 	.endm
+ #endif
++
++#endif /* ARCH_ARM_LIB_BITOPS_H */
 diff --git a/arch/arm/um/Kconfig b/arch/arm/um/Kconfig
 new file mode 100644
 index 000000000..d3f472aed
@@ -278,13 +306,12 @@ index 000000000..d3f472aed
 +# KB-page requirement the arm64 port exists for (Android 15+) is an
 +# arm64-only Android configuration, and a 4 KB UML guest cannot boot on a
 +# 16 KB host anyway, so offering the symbol would be untestable decoration.
-
 diff --git a/arch/arm/um/Makefile b/arch/arm/um/Makefile
 new file mode 100644
-index 000000000..99ee08af2 100644
+index 000000000..f7219fe12
 --- /dev/null
 +++ b/arch/arm/um/Makefile
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,71 @@
 +# SPDX-License-Identifier: GPL-2.0
 +#
 +# arch/arm/um -- subarch support for ARCH=um SUBARCH=arm
@@ -318,6 +345,35 @@ index 000000000..99ee08af2 100644
 +	-Iarch/arm/include/generated
 +targets += user-offsets.s
 +
++# Re-apply the one assembler force-include that the parent architecture's own
++# build always applies, from the top of arch/arm/Makefile:
++#
++# 	KBUILD_AFLAGS += ... -include $(srctree)/arch/arm/include/asm/unified.h
++#
++# That file is not parsed for ARCH=um, and without it nothing in this
++# directory's .S context knows that the arch/arm/lib sources are being
++# assembled in a unified-syntax, ARM-state setting:
++#
++# - unified.h defines the W() / ARM() / THUMB() macros that asm/assembler.h
++#   and the arch/arm/lib .S files all use (W(pldw), ARM(fpreg .req r11),
++#   THUMB(orr ...), ...) and emits `.syntax unified` in assembly contexts.
++#   Unified syntax is what lets gas accept the ARM-state mnemonics those
++#   files contain whatever the toolchain's default instruction set state
++#   is: the armel cross gcc and gas are built with Thumb as the default
++#   state, so the syntax has to be forced rather than assumed.
++#
++# - -march=armv7-a gives gas the v7 instruction set the sources expect
++#   (pldw, dmb, .arch_extension mp) and -marm states what the .S sources
++#   state on their own (.arm directives in setjmp_arm.S and arm-klib.S).
++#
++# asflags-y rather than KBUILD_AFLAGS: it has to hold in the directory
++# sub-make that assembles this directory's objects, and that is the level
++# Kbuild guarantees (scripts/Makefile.build folds subdir-asflags-y into
++# a_flags there); the top-level KBUILD_AFLAGS reaches that sub-make only
++# as an exported environment value.
++asflags-y += -include $(srctree)/arch/arm/include/asm/unified.h
++asflags-y += -march=armv7-a -marm
++
 +include/generated/user_constants.h: $(obj)/user-offsets.s FORCE
 +	$(call filechk,offsets,__USER_CONSTANT_H__)
 +
@@ -329,10 +385,10 @@ index 000000000..99ee08af2 100644
 +include $(srctree)/arch/um/scripts/Makefile.rules
 diff --git a/arch/arm/um/arm-klib.S b/arch/arm/um/arm-klib.S
 new file mode 100644
-index 000000000..38ac7229f 100644
+index 000000000..f512a7b99
 --- /dev/null
 +++ b/arch/arm/um/arm-klib.S
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,79 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * arch/arm/lib objects, pulled into the UML host binary.
@@ -388,6 +444,14 @@ index 000000000..38ac7229f 100644
 +#ifndef __has_attribute
 +#define __has_attribute(x)	0
 +#endif
++
++/*
++ * The included files are written for the ARM instruction set, but the
++ * assembler's default state is a toolchain property -- the armel cross
++ * gas starts in Thumb state -- so pin it, or the plain ARM mnemonics
++ * (strbne, movs, ldrex, ...) would not assemble at all.
++ */
++	.arm
 +
 +#include "../lib/clearbit.S"
 +#include "../lib/setbit.S"
@@ -488,7 +552,6 @@ index 000000000..d5e897789
 + */
 +
 +#endif /* __UM_ARM_ASM_H */
-
 diff --git a/arch/arm/um/asm/checksum.h b/arch/arm/um/asm/checksum.h
 new file mode 100644
 index 000000000..ea45419d5
@@ -543,7 +606,6 @@ index 000000000..376b1edd0
 +#include "../../../x86/include/asm/cpufeatures.h"
 +
 +#endif /* __UM_ARM_CPUFEATURES_H */
-
 diff --git a/arch/arm/um/asm/cpuinfo.h b/arch/arm/um/asm/cpuinfo.h
 new file mode 100644
 index 000000000..e63d9059e
@@ -758,7 +820,6 @@ index 000000000..f9b35ddbc
 + */
 +
 +#endif /* __UM_ARM_LDT_H */
-
 diff --git a/arch/arm/um/asm/mman.h b/arch/arm/um/asm/mman.h
 new file mode 100644
 index 000000000..48d50a87c
@@ -980,7 +1041,6 @@ index 000000000..ec5070b17
 +			   unsigned long addr, unsigned long data);
 +
 +#endif /* __UM_ARM_PTRACE_ABI_H */
-
 diff --git a/arch/arm/um/asm/ptrace.h b/arch/arm/um/asm/ptrace.h
 new file mode 100644
 index 000000000..f48a43dc5 100644
@@ -1130,7 +1190,6 @@ index 000000000..08449df7c
 +#define GDT_ENTRY_TLS_ENTRIES 0
 +
 +#endif /* __UM_ARM_SEGMENT_H */
-
 diff --git a/arch/arm/um/asm/string.h b/arch/arm/um/asm/string.h
 new file mode 100644
 index 000000000..628e48718
@@ -2185,7 +2244,6 @@ index 000000000..c999953bc
 +	__const_udelay(nsecs * 0x00005); /* 2**32 / 1000000000 (rounded up) */
 +}
 +EXPORT_SYMBOL(__ndelay);
-
 diff --git a/arch/arm/um/fault.c b/arch/arm/um/fault.c
 new file mode 100644
 index 000000000..e16bf0605
@@ -2963,10 +3021,10 @@ index 000000000..548afb835
 +arch_initcall(init_regset_fp_info);
 diff --git a/arch/arm/um/setjmp_arm.S b/arch/arm/um/setjmp_arm.S
 new file mode 100644
-index 000000000..c917d3af4
+index 000000000..38796d7f9
 --- /dev/null
 +++ b/arch/arm/um/setjmp_arm.S
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,88 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * setjmp/longjmp for ARCH=um SUBARCH=arm.
@@ -3001,9 +3059,14 @@ index 000000000..c917d3af4
 + *
 + * The stub and this file are plain 32-bit ARM (no Thumb, no position
 + * independence tricks needed): the binary's svc #0 system calls and the
-+ * host-resume code both require it.
++ * host-resume code both require it. Pin the state explicitly, because the
++ * assembler's default state is a toolchain property, not a source one --
++ * the armel cross compilers ship Thumb as the default, and an encoded
++ * Thumb state here would put the svc #0 the stub steps over in a shape
++ * its resume check does not recognise.
 + */
 +
++	.arm
 +	.text
 +	.align 2
 +	.globl kernel_setjmp
@@ -4323,7 +4386,6 @@ index 000000000..11a6ec36a
 +	force_sig(SIGSEGV);
 +	return 0;
 +}
-
 diff --git a/arch/arm/um/stub_segv.c b/arch/arm/um/stub_segv.c
 new file mode 100644
 index 000000000..3f9d93199
