@@ -408,10 +408,10 @@ index 000000000..e63d9059e
 +#endif /* __UM_ARM_CPUINFO_H */
 diff --git a/arch/arm/um/asm/elf.h b/arch/arm/um/asm/elf.h
 new file mode 100644
-index 000000000..2e8b86cd4
+index 000000000..91dc43515
 --- /dev/null
 +++ b/arch/arm/um/asm/elf.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,140 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef __UM_ARM_ELF_H
 +#define __UM_ARM_ELF_H
@@ -440,6 +440,38 @@ index 000000000..2e8b86cd4
 +#define ELF_CLASS	ELFCLASS32
 +#define ELF_DATA	ELFDATA2LSB
 +#define ELF_ARCH	EM_ARM
++
++/*
++ * The R_ARM_* relocation numbers arch/arm/kernel/module.c's
++ * apply_relocate() switch is built against: module.c is compiled in as
++ * subarch code (arch/arm/um/Makefile) and so includes this shadow, not
++ * the parent arch/arm/include/asm/elf.h, which is where the constants
++ * live in a real arm build. They are plain ABI values, independent of
++ * the board-specific declarations this file drops.
++ */
++#define R_ARM_NONE		0
++#define R_ARM_PC24		1
++#define R_ARM_ABS32		2
++#define R_ARM_REL32		3
++#define R_ARM_CALL		28
++#define R_ARM_JUMP24		29
++#define R_ARM_TARGET1		38
++#define R_ARM_V4BX		40
++#define R_ARM_PREL31		42
++#define R_ARM_MOVW_ABS_NC	43
++#define R_ARM_MOVT_ABS		44
++#define R_ARM_MOVW_PREL_NC	45
++#define R_ARM_MOVT_PREL		46
++#define R_ARM_ALU_PC_G0_NC	57
++#define R_ARM_ALU_PC_G1_NC	59
++#define R_ARM_LDR_PC_G2		63
++
++#define R_ARM_THM_CALL		10
++#define R_ARM_THM_JUMP24	30
++#define R_ARM_THM_MOVW_ABS_NC	47
++#define R_ARM_THM_MOVT_ABS	48
++#define R_ARM_THM_MOVW_PREL_NC	49
++#define R_ARM_THM_MOVT_PREL	50
 +
 +typedef unsigned long elf_greg_t;
 +typedef unsigned long elf_freg_t[3];
@@ -1007,10 +1039,10 @@ index 000000000..628e48718
 +#endif /* __UM_ARM_STRING_H */
 diff --git a/arch/arm/um/asm/syscall.h b/arch/arm/um/asm/syscall.h
 new file mode 100644
-index 000000000..b9a873d82
+index 000000000..9b2483f16
 --- /dev/null
 +++ b/arch/arm/um/asm/syscall.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,37 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef __UM_ARM_SYSCALL_H
 +#define __UM_ARM_SYSCALL_H
@@ -1025,12 +1057,22 @@ index 000000000..b9a873d82
 +
 +#include <asm/syscall-generic.h>
 +#include <uapi/linux/audit.h>
++#include <asm/unistd.h>
 +
 +typedef asmlinkage long (*sys_call_ptr_t)(unsigned long, unsigned long,
 +					  unsigned long, unsigned long,
 +					  unsigned long, unsigned long);
 +
 +extern const sys_call_ptr_t sys_call_table[];
++
++/*
++ * The guest syscall table's entry count, the same definition as the
++ * parent arch/arm/include/asm/syscall.h: arch/arm/include/asm/seccomp.h
++ * uses it in SECCOMP_ARCH_NATIVE_NR. __NR_syscalls comes from
++ * <asm/unistd.h>, which in this build reaches the port's <asm/unistd-nr.h>
++ * shadow for the count.
++ */
++#define NR_syscalls (__NR_syscalls)
 +
 +static inline int syscall_get_arch(struct task_struct *task)
 +{
@@ -4608,3 +4650,76 @@ index 8fdc0bd9a..9dd4145ec 100644
  generic-y += parport.h
  generic-y += percpu.h
  generic-y += percpu_types.h
+diff --git a/arch/um/kernel/skas/stub_exe.c b/arch/um/kernel/skas/stub_exe.c
+index cbafaa684..1a903f302 100644
+--- a/arch/um/kernel/skas/stub_exe.c
++++ b/arch/um/kernel/skas/stub_exe.c
+@@ -40,6 +40,12 @@
+ 	/* Needed in SECCOMP mode (and safe to do anyway) */
+ 	stub_syscall5(__NR_prctl, PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+ 
++	/*
++	 * Whatever this architecture has to settle in a fresh stub, before the
++	 * seccomp filter is installed and so still able to make any syscall.
++	 */
++	stub_arch_init();
++
+ 	/* read information from STDIN and close it */
+ 	res = stub_syscall3(__NR_read, 0,
+ 			    (unsigned long)&init_data, sizeof(init_data));
+@@ -143,11 +149,25 @@
+ 			BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+ 				 (offsetof(struct seccomp_data, instruction_pointer))),
+ 
+-			/* [3] Mask out lower bits */
+-			BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xfffff000),
++			/*
++			 * [3] Mask out lower bits.
++			 *
++			 * This was 0xfffff000, i.e. a hardcoded 4K page. The
++			 * filter is checking whether the trapping instruction
++			 * pointer lies on the stub's code page, so the mask has
++			 * to be the *host's* page mask -- on a 16K-page host
++			 * (Android 15 and later) a 4K mask would compare
++			 * against the wrong page and reject legitimate stub
++			 * syscalls. BPF_K is 32-bit and so is seccomp_data's
++			 * view here, hence the cast.
++			 */
++			BPF_STMT(BPF_ALU | BPF_AND | BPF_K,
++				 (unsigned int)UM_KERN_PAGE_MASK),
+ 
+ 			/* [4] Jump to [6] if the lower bits are not on the expected page */
+-			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (init_data.stub_start) & 0xfffff000, 1, 0),
++			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
++				 (init_data.stub_start) & (unsigned int)UM_KERN_PAGE_MASK,
++				 1, 0),
+ 
+ 			/* [5] Trap call, allow */
+ 			BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+@@ -176,13 +196,20 @@
+ 				 4, 0),
+ 			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_munmap,
+ 				 3, 0),
+-#ifdef __i386__
+-			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_set_thread_area,
++			/*
++			 * The syscall the stub needs in order to reinstate
++			 * guest TLS, which is architecture-specific:
++			 * set_thread_area on i386, arch_prctl on x86-64,
++			 * and nothing at all on arm32, where R8 is an
++			 * ordinary register the guest writes itself.
++			 * STUB_SECCOMP_TLS_SYSCALL is -1 in that case,
++			 * which no real syscall number can match, so the
++			 * slot is inert while every jump offset below
++			 * stays as it is.
++			 */
++			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
++				 (unsigned int)STUB_SECCOMP_TLS_SYSCALL,
+ 				 2, 0),
+-#else
+-			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_arch_prctl,
+-				 2, 0),
+-#endif
+ 			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigreturn,
+ 				 1, 0),
+ 
