@@ -586,10 +586,10 @@ index 000000000..48d50a87c
 +#endif /* __UM_ARM_MMAN_H */
 diff --git a/arch/arm/um/asm/processor.h b/arch/arm/um/asm/processor.h
 new file mode 100644
-index 000000000..e1f7461be
+index 000000000..76e006be3
 --- /dev/null
 +++ b/arch/arm/um/asm/processor.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,109 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef __UM_ARM_PROCESSOR_H
 +#define __UM_ARM_PROCESSOR_H
@@ -639,6 +639,41 @@ index 000000000..e1f7461be
 +
 +#define ARCH_IS_STACKGROW(address) \
 +	(address + 65536 + 32 * sizeof(unsigned long) >= UPT_SP(&current->thread.regs.regs))
++
++/*
++ * arch/arm/include/asm/processor.h (which this file shadows) provides the
++ * SMP-on-UP patching machinery that arch/arm/include/asm/spinlock.h
++ * relies on, and WASM() comes from arch/arm/include/asm/unified.h.
++ * Neither definition survives the shadow, so mirror them here. The UML
++ * arm32 guest is never a Thumb-2 kernel, so the non-thumb definition of
++ * WASM is the only one that applies.
++ */
++#define WASM(instr)	#instr
++
++#ifdef CONFIG_SMP
++#define __ALT_SMP_ASM(smp, up)					\
++	"9998:	" smp "\n"					\
++	"	.pushsection \".alt.smp.init\", \"a\"\n"	\
++	"	.align	2\n"					\
++	"	.long	9998b - .\n"				\
++	"	" up "\n"					\
++	"	.popsection\n"
++#else
++#define __ALT_SMP_ASM(smp, up)	up
++#endif
++
++/*
++ * Generic UML um_arch.c and asm-offsets.c reference struct alt_instr,
++ * which x86 provides through arch/x86/include/asm/alternative.h; the arm
++ * tree has no such header. The .alt.smp.init entries emitted by
++ * __ALT_SMP_ASM() above are a back-reference offset plus the replacement
++ * instruction, and UML's apply_alternatives() is a no-op that never links
++ * that section, so only the sizeof() being well-defined matters.
++ */
++struct alt_instr {
++	long offset;
++	long insn;
++};
 +
 +/*
 + * x86 emits PAUSE here. The arm equivalent is the YIELD hint: a no-op on
