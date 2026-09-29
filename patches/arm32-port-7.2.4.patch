@@ -4537,10 +4537,10 @@ index 000000000..1636ab005
 +}
 diff --git a/arch/um/configs/arm_defconfig b/arch/um/configs/arm_defconfig
 new file mode 100644
-index 000000000..763f54f01
+index 000000000..93c391648
 --- /dev/null
 +++ b/arch/um/configs/arm_defconfig
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,91 @@
 +#
 +# 4 KB pages, explicitly: guest pages are host mmap()s, so the guest's page
 +# size cannot be smaller than the host's. Every arm32 host kernel runs 4 KB
@@ -4589,6 +4589,10 @@ index 000000000..763f54f01
 +CONFIG_CC_OPTIMIZE_FOR_SIZE=y
 +CONFIG_MODULES=y
 +CONFIG_MODULE_UNLOAD=y
++# UGL builds arch/arm/kernel/module.c without arch/arm/kernel/module-plts.c,
++# so the PLT-veneer lookup get_module_plt() that module.c calls when this
++# option is on has no definition; keep it off.
++CONFIG_ARM_MODULE_PLTS=n
 +# CONFIG_BLK_DEV_BSG is not set
 +CONFIG_IOSCHED_BFQ=m
 +CONFIG_SSL=y
@@ -4628,7 +4632,6 @@ index 000000000..763f54f01
 +CONFIG_NLS=y
 +CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 +CONFIG_DEBUG_KERNEL=y
-
 diff --git a/arch/um/include/asm/Kbuild b/arch/um/include/asm/Kbuild
 index 8fdc0bd9a..9dd4145ec 100644
 --- a/arch/um/include/asm/Kbuild
