@@ -2909,10 +2909,10 @@ index 000000000..b7ce76850
 +#endif /* _KLIBC_ARCHSETJMP_H */
 diff --git a/arch/arm/um/shared/sysdep/faultinfo.h b/arch/arm/um/shared/sysdep/faultinfo.h
 new file mode 100644
-index 000000000..127212d68
+index 000000000..fecb95025 100644
 --- /dev/null
 +++ b/arch/arm/um/shared/sysdep/faultinfo.h
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,103 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Fault information for ARCH=um SUBARCH=arm.
@@ -2973,12 +2973,17 @@ index 000000000..127212d68
 + * subarch's own is stub_segv_handler() in arch/arm/um/stub_segv.c, whose
 + * parameter is named accordingly. The macro therefore expands a reference
 + * to `si`; a caller that does not have one fails to compile rather than
-+ * fill in a wrong address.
++ * fill in a wrong address. That `si` is dereferenced through the glibc
++ * siginfo_t it actually is: UML's own tagged struct siginfo is only
++ * forward-declared in host-side TUs, so a direct dereference of it is
++ * ill-formed, and every caller's `si` points at a glibc siginfo_t whose
++ * si_addr sits at the same offset.
 + */
 +#define GET_FAULTINFO_FROM_MC(fi, mc)					\
 +	do {								\
++		siginfo_t *__si = (siginfo_t *)(si);			\
 +		(fi).ec = (unsigned int)(mc)->error_code;		\
-+		(fi).addr = (unsigned long)(void *)(si)->si_addr;	\
++		(fi).addr = (unsigned long)(void *)__si->si_addr;	\
 +	} while (0)
 +
 +/*
@@ -4730,3 +4735,16 @@ index cbafaa684..1a903f302 100644
  			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_rt_sigreturn,
  				 1, 0),
  
+diff --git a/arch/um/kernel/trap.c b/arch/um/kernel/trap.c
+index 177615820..f00e3c657 100644
+--- a/arch/um/kernel/trap.c
++++ b/arch/um/kernel/trap.c
+@@ -251,7 +251,7 @@
+ 		task_pid_nr(tsk) > 1 ? KERN_INFO : KERN_EMERG,
+ 		tsk->comm, task_pid_nr(tsk), FAULT_ADDRESS(*fi),
+ 		(void *)UPT_IP(regs), (void *)UPT_SP(regs),
+-		fi->error_code);
++		FAULT_ERROR_CODE(*fi));
+ 
+ 	print_vma_addr(KERN_CONT " in ", UPT_IP(regs));
+ 	printk(KERN_CONT "\n");
