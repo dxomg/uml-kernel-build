@@ -296,8 +296,8 @@ jobs:
           cp linux ../linux-uml-arm32
           # Ship the built stub next to the kernel: the stub_exe=<path> boot
           # argument (the Android memfd-exec workaround) wants a copy of
-          # exactly this file. (We are inside linux-$KVER here.)
-          cp arch/um/kernel/skas/stub_exe ../stub_exe
+          # exactly this file.
+          cp linux-${{ env.KVER }}/arch/um/kernel/skas/stub_exe ../stub_exe
           cd ..
           arm-linux-gnueabi-strip linux-uml-arm32
           echo "${{ env.KVER }} (arm32, VECTOR, cross)" > VERSION
@@ -550,7 +550,7 @@ jobs:
             exit 1; }
           cp linux ../linux-uml-arm32-static
           # The static stub, for the same stub_exe=<path> workaround.
-          cp arch/um/kernel/skas/stub_exe ../stub_exe-static
+          cp linux-${{ env.KVER }}/arch/um/kernel/skas/stub_exe ../stub_exe-static
           cd ..
           arm-linux-gnueabi-strip linux-uml-arm32-static
           echo "${{ env.KVER }} (arm32, VECTOR, static)" > VERSION
