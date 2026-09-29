@@ -25,6 +25,10 @@ name: "UML Kernel — stable arm32 (linux-um port, cross-built)"
 #   not ship.
 # - The main kernel image links with the armel cross binutils ld (it does not
 #   use -no-rosegment), so only the stub needs lld.
+# - arch/arm/Makefile.um pins -march=armv7-a together with -marm, so the cross
+#   gcc must accept that combination: noble's armel gcc-13 does, but a bare
+#   -march=armv7 is refused by cross drivers built with a Thumb default mode
+#   ("target CPU does not support ARM mode").
 # - The UML SMP backport (apply-smp.sh) is NOT applied here: 7.2.x has native
 #   SMP, and the arm32 port was developed and gate-tested against plain 7.2.4.
 

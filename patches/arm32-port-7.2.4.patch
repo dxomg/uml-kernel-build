@@ -1,9 +1,9 @@
 diff --git a/arch/arm/Makefile.um b/arch/arm/Makefile.um
 new file mode 100644
-index 000000000..db015ffbc
+index 000000000..3226d6373
 --- /dev/null
 +++ b/arch/arm/Makefile.um
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,117 @@
 +# SPDX-License-Identifier: GPL-2.0
 +#
 +# Build glue for ARCH=um SUBARCH=arm.
@@ -51,27 +51,30 @@ index 000000000..db015ffbc
 +# not our binary; it is exec'd from guest memory and its VFP use is exactly
 +# what UGL is preserving.
 +#
-+# -march=armv7 pins the host baseline explicitly. The guest is armv7 (the
++# -march=armv7-a pins the host baseline explicitly. The guest is armv7 (the
 +# subarch's 32-bit EABI), and the host must not be able to drift below it --
 +# a build on an old armv5 host would emit code the stub cannot run, and no
-+# error anywhere in the build would say so.
++# error anywhere in the build would say so. The -a is mandatory, not style:
++# gcc refuses a bare "-march=armv7 -marm" with "target CPU does not support
++# ARM mode" (the generic armv7 target carries no ARM state), and the distro
++# cross gcc -- Ubuntu's armel toolchain is built --with-mode=thumb -- takes
++# Thumb as its default state anyway, so the state has to be pinned here.
 +#
-+# -marm pins ARM (32-bit) state: gcc's default for -march=armv7 is Thumb,
-+# and the two states encode the same source differently -- "svc #0" is
-+# 0xea000000 in ARM state and 0xdf00 in Thumb. UGL compares the host
-+# instruction word it is about to step over against UM_SYSCALL_TRAP_INSN, a
-+# 32-bit value (arch/arm/um/shared/sysdep/ptrace_user.h), so the stub's code
-+# must be ARM state without exception. Interworking stays on, so glibc or
-+# bionic objects with mixed code link fine.
++# -marm pins ARM (32-bit) state: the two states encode the same source
++# differently -- "svc #0" is 0xea000000 in ARM state and 0xdf00 in Thumb.
++# UGL compares the host instruction word it is about to step over against
++# UM_SYSCALL_TRAP_INSN, a 32-bit value (arch/arm/um/shared/sysdep/ptrace_user.h),
++# so the stub's code must be ARM state without exception. Interworking stays
++# on, so glibc or bionic objects with mixed code link fine.
 +
-+KBUILD_CFLAGS += -mfloat-abi=soft -march=armv7 -marm
++KBUILD_CFLAGS += -mfloat-abi=soft -march=armv7-a -marm
 +
 +# The .S files are assembled through the host's gcc, and gas takes its
 +# ARM/Thumb state from the driver's default, which UGL cannot rely on:
 +# setjmp_arm.S is written for the ARM state ("svc #0" is 0xea000000, the
 +# stub's resume path is compared against that word in
 +# arch/arm/um/shared/sysdep/ptrace_user.h), so pin the state here as well.
-+KBUILD_AFLAGS += -march=armv7 -marm
++KBUILD_AFLAGS += -march=armv7-a -marm
 +
 +LINK-$(CONFIG_LD_SCRIPT_DYN_RPATH) += -Wl,-rpath,/lib
 +
@@ -1685,7 +1688,7 @@ index 000000000..b5d562c37
 + * A calibrated spin. "yield" is a hint the core may ignore, so the loop is a
 + * real dependent-subtract chain rather than relying on the hint for timing --
 + * exactly like the aligned jump chain x86 uses. ARM state (the UML binary is
-+ * compiled with -march=armv7, no thumb) means fixed-width 32-bit instructions,
++ * compiled with -march=armv7-a, no thumb) means fixed-width 32-bit instructions,
 + * so no alignment tricks are needed.
 + */
 +void __delay(unsigned long loops)
@@ -3509,7 +3512,7 @@ index 000000000..08f3731d1
 +
 +/*
 + * Where the handler returns to when the guest did not supply SA_RESTORER.
-+ * Plain ARM state, not thumb: the UML binary is built -march=armv7 with no
++ * Plain ARM state, not thumb: the UML binary is built -march=armv7-a with no
 + * thumb mix, and this function is executed in whatever state the handler
 + * leaves, which is ARM.
 + *
