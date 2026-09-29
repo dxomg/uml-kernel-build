@@ -2991,10 +2991,10 @@ index 000000000..67cbbfc64
 +#endif
 diff --git a/arch/arm/um/shared/sysdep/mcontext.h b/arch/arm/um/shared/sysdep/mcontext.h
 new file mode 100644
-index 000000000..5537f7a64
+index 000000000..7e5861f4b
 --- /dev/null
 +++ b/arch/arm/um/shared/sysdep/mcontext.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,49 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef __SYS_SIGCONTEXT_ARM_H
 +#define __SYS_SIGCONTEXT_ARM_H
@@ -3008,6 +3008,20 @@ index 000000000..5537f7a64
 + * sigcontext.
 + */
 +#include <sys/ucontext.h>
++
++/*
++ * Forward-declare the two struct types the prototypes below take by
++ * pointer. This header is kept freestanding (it is also included from
++ * stub_segv.c, which is compiled with no other UML headers), so it must
++ * not pull in the headers that define these types: struct uml_pt_regs
++ * comes from sysdep/ptrace.h and struct stub_data from the skas
++ * stub-data.h. Without the forward declarations a struct named only
++ * inside a parameter list is a *different* type than the one the
++ * definitions in os-Linux/mcontext.c see after they include those
++ * headers, which is a "conflicting types for 'get_stub_state'" error.
++ */
++struct uml_pt_regs;
++struct stub_data;
 +
 +extern void get_regs_from_mc(struct uml_pt_regs *regs, mcontext_t *mc);
 +extern void get_mc_from_regs(struct uml_pt_regs *regs, mcontext_t *mc,
@@ -3262,10 +3276,10 @@ index 000000000..f05d52f17
 +#endif /* __ARCH_STUB_DATA_H */
 diff --git a/arch/arm/um/shared/sysdep/stub.h b/arch/arm/um/shared/sysdep/stub.h
 new file mode 100644
-index 000000000..c2147a7d2
+index 000000000..9d32cd21e
 --- /dev/null
 +++ b/arch/arm/um/shared/sysdep/stub.h
-@@ -0,0 +1,352 @@
+@@ -0,0 +1,359 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef __SYSDEP_ARM_STUB_H
 +#define __SYSDEP_ARM_STUB_H
@@ -3290,7 +3304,13 @@ index 000000000..c2147a7d2
 + * add to the clobber list beyond memory.
 + */
 +
-+#define STUB_MMAP_NR __NR_mmap
++/*
++ * arm EABI has no __NR_mmap: the EABI table only carries __NR_mmap2
++ * (192), whose offset is in page units. That is the same shape as the
++ * x86 32-bit stub, which also maps through __NR_mmap2 and converts the
++ * byte offset to a page offset with MMAP_OFFSET below.
++ */
++#define STUB_MMAP_NR __NR_mmap2
 +/*
 + * arm needs no syscall to restore guest TLS: R8 is an ordinary register the
 + * guest writes itself, so stub_seccomp_restore_state() below is a single
@@ -3298,7 +3318,8 @@ index 000000000..c2147a7d2
 + * subarchs without permitting anything, since no syscall number is -1.
 + */
 +#define STUB_SECCOMP_TLS_SYSCALL (-1)
-+#define MMAP_OFFSET(o) (o)
++/* __NR_mmap2 takes its offset in page units, like the x86 32-bit stub. */
++#define MMAP_OFFSET(o) ((o) >> UM_KERN_PAGE_SHIFT)
 +
 +static __always_inline long stub_syscall0(long syscall)
 +{
