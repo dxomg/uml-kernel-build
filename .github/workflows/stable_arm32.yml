@@ -1,25 +1,32 @@
-name: "UML Kernel — stable arm32 (linux-um port)"
+name: "UML Kernel — stable arm32 (linux-um port, cross-built)"
 
-# Builds the newest stable kernel (currently 7.2.x) for UML with SUBARCH=arm
-# (32-bit armv7l, OABI/EABI), using this repo's arm32 port series (patches/
-# arm32-port-7.2.4.patch, rebased onto v7.2.4 and merged with this repo's
-# bundled patches).
+# Cross-builds the newest stable kernel (currently 7.2.x) for UML with
+# SUBARCH=arm (32-bit armv7l, armel EABI) on an x86_64 runner, using this
+# repo's arm32 port series (patches/arm32-port-7.2.4.patch, rebased onto
+# v7.2.4 and merged with this repo's bundled patches).
 #
-# Runner prerequisite: SUBARCH=arm builds the UML kernel as an ordinary
-# 32-bit ARM userspace executable that links the host's own glibc — it cannot
-# be cross-compiled from x86_64 or arm64, and GitHub's public pool has no
-# arm32 runner. Point `runs-on` at a self-hosted arm32 (armv7l) runner with a
-# Docker daemon: `debian:bookworm` is multi-arch, so it resolves to the armhf
-# variant there and gives a native arm32 bookworm build environment.
+# The UML kernel is an ordinary userspace process, so it cross-compiles the
+# same way any other userspace program does: ubuntu-latest's apt archive
+# ships the armel cross toolchain (gcc-arm-linux-gnueabi + the cross binutils
+# and libc dev headers), and that cross gcc is the build CC. The result is a
+# 32-bit ARM executable that links the target's own glibc — the arm32 glibc
+# the cross sysroot provides at link time — so no arm32 runner or separate
+# sysroot download is needed. This mirrors how bionic_android.yml cross-builds
+# the arm64 kernel from an x86_64 runner.
 #
 # Notes:
-# - clang/lld is required: the generic UML SKAS stub link in the base kernel
-#   already sets STUB_EXE_LDFLAGS = -Wl,-n -Wl,--no-rosegment -static, which
-#   GNU ld (<= 2.43) does not understand. LLVM=1 selects lld for the kernel
-#   link, and the stub link goes through the clang driver, so STUB_EXE_LDFLAGS
-#   is re-passed with -fuse-ld=lld to keep the stub on lld as well.
-# - The UML SMP backport (apply-smp.sh) is NOT applied here: it targets 6.x,
-#   and the arm32 port was developed and gate-tested against plain 7.2.4.
+# - lld is required for the SKAS stub link: the generic UML build in the base
+#   kernel sets STUB_EXE_LDFLAGS = -Wl,-n -Wl,--no-rosegment -static, which
+#   GNU ld (<= 2.43, including the armel cross binutils) does not understand.
+#   The host's lld is multi-target and links arm32 objects fine, so the stub
+#   link is forced onto it with -fuse-ld=lld. -static is dropped from the
+#   stub so it links the arm32 glibc dynamically (the target device supplies
+#   it) rather than needing the arm32 static libc the cross dev package does
+#   not ship.
+# - The main kernel image links with the armel cross binutils ld (it does not
+#   use -no-rosegment), so only the stub needs lld.
+# - The UML SMP backport (apply-smp.sh) is NOT applied here: 7.2.x has native
+#   SMP, and the arm32 port was developed and gate-tested against plain 7.2.4.
 
 on:
   schedule:
@@ -33,41 +40,39 @@ on:
 
 jobs:
   build:
-    runs-on: [self-hosted, arm32]
-    # See the runner prerequisite in the header comment: native arm32 host.
-    # Container jobs run steps with dash(1) by default; the steps below
-    # use bashisms (shopt), so pin bash.
-    container: debian:bookworm
+    runs-on: ubuntu-latest
+    # Native x86_64 host; everything below is a cross-build via the armel
+    # cross toolchain, so no container and no arm32 machine is involved.
     defaults:
       run:
         shell: bash
     steps:
-      - name: Install deps
+      - name: Install deps (host build tools + armel cross toolchain + lld)
         run: |
-          apt-get update -y
-          apt-get install -y build-essential libncurses-dev flex bison \
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential libncurses-dev flex bison \
             libssl-dev libelf-dev bc dwarves wget curl jq tar xz-utils \
-            pkg-config gnupg git ca-certificates perl file
+            pkg-config gnupg git ca-certificates perl file \
+            gcc-arm-linux-gnueabi libc6-dev-armel-cross lld
 
       - uses: actions/checkout@v7
 
-      - name: Install LLVM 18 (bookworm archive ships clang 14 — too old for the 7.2 stub link)
+      - name: Make the host lld findable by the cross gcc driver
         run: |
-          install -d /etc/apt/keyrings
-          install -d /etc/apt/keyrings
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | \
-            gpg --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg
-          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-18 main" | \
-            tee /etc/apt/sources.list.d/llvm-18.list >/dev/null
-          apt-get update -y
-          apt-get install -y clang-18 lld-18 llvm-18
-          # LLVM=1 and -fuse-ld=lld resolve unversioned tool names.
-          for t in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy \
-                   llvm-objdump llvm-readelf llvm-strip; do
-            ln -sf "$(command -v "$t-18")" "/usr/local/bin/$t"
-          done
-          clang --version | head -1
+          # The armel cross gcc is the build CC, so the stub link (forced onto
+          # lld via STUB_EXE_LDFLAGS -fuse-ld=lld) uses the host's multi-target
+          # lld to link the arm32 objects. gcc may look for the linker under
+          # both the bare and the cross-target-prefixed names, so symlink both.
+          LLD="$(command -v ld.lld)"
+          ln -sf "$LLD" /usr/local/bin/ld.lld
+          ln -sf "$LLD" /usr/local/bin/arm-linux-gnueabi-ld.lld
           ld.lld --version | head -1
+          # Sanity: the cross toolchain really is an arm32 (armel) compiler,
+          # not a host fallback — otherwise the build would silently produce
+          # an x86_64 binary and the artifact check below is the last guard.
+          echo "cross gcc target: $(arm-linux-gnueabi-gcc -dumpmachine)"
+          arm-linux-gnueabi-gcc -dumpmachine | grep -q '^arm-linux-gnueabi' || {
+            echo "::error::cross gcc is not arm32 (armel) — expected arm-linux-gnueabi"; exit 1; }
 
       - name: Pick newest stable (requires >= 7.0 — the arm32 port targets 7.2.x)
         run: |
@@ -138,11 +143,13 @@ jobs:
             echo "[+] Patched unwind_user.h"
           fi
 
-      - name: Configure & build (arm32)
+      - name: Configure & build (arm32, cross from x86_64)
         run: |
           cd linux-${{ env.KVER }}
-          # LDFLAGS must reach the stub link too: see workflow header notes.
-          MAKE="make ARCH=um SUBARCH=arm LLVM=1"
+          # Cross-build: the armel cross gcc is the build CC (the kernel and
+          # the SKAS stub are both arm32 userspace objects). The host stays
+          # the host for the host tools (HOSTCC). lld is only for the stub.
+          MAKE="make ARCH=um SUBARCH=arm CROSS_COMPILE=arm-linux-gnueabi-"
 
           $MAKE defconfig
 
@@ -243,15 +250,29 @@ jobs:
           grep -q '^CONFIG_64BIT=y' .config && {
             echo "::error::unexpectedly a 64BIT config — SUBARCH=arm did not stick"; exit 1; }
 
-          $MAKE STUB_EXE_LDFLAGS='-Wl,-n -Wl,--no-rosegment -static -fuse-ld=lld' \
+          # Cross link: the kernel + stub are arm32 userspace objects, linked
+          # against the arm32 glibc from the cross sysroot. The stub is forced
+          # onto the host's multi-target lld (its -no-rosegment is not
+          # understood by the armel binutils ld); -static is dropped so the
+          # stub links glibc dynamically.
+          $MAKE STUB_EXE_LDFLAGS='-Wl,-n -Wl,--no-rosegment -fuse-ld=lld' \
             -j"$(nproc)"
 
-      - name: Strip & upload
+      - name: Verify + strip
         run: |
-          cp linux-${{ env.KVER }}/linux ./linux-uml-arm32
-          strip ./linux-uml-arm32
-          echo "${{ env.KVER }} (arm32, VECTOR)" > VERSION
-          file ./linux-uml-arm32
+          cd linux-${{ env.KVER }}
+          # The cross build must have produced a 32-bit ARM ELF, or the
+          # toolchain silently fell back to the host (x86_64) and we would
+          # ship the wrong binary.
+          file -b linux | grep -qE 'ELF 32-bit .* ARM' || {
+            echo "::error::'linux' is not a 32-bit ARM ELF — cross toolchain did not stick"
+            echo "actual: $(file -b linux)"
+            exit 1; }
+          cp linux ../linux-uml-arm32
+          cd ..
+          arm-linux-gnueabi-strip linux-uml-arm32
+          echo "${{ env.KVER }} (arm32, VECTOR, cross)" > VERSION
+          file linux-uml-arm32
 
       - uses: actions/upload-artifact@v7
         with:
