@@ -1,0 +1,4352 @@
+diff --git a/arch/arm/Makefile.um b/arch/arm/Makefile.um
+new file mode 100644
+index 000000000..db015ffbc
+--- /dev/null
++++ b/arch/arm/Makefile.um
+@@ -0,0 +1,114 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Build glue for ARCH=um SUBARCH=arm.
++#
++# Included by arch/um/Makefile as $(HOST_DIR)/Makefile.um. Everything here
++# describes the *host* ABI the UML binary is built against, because for UML the
++# "architecture" is an ordinary armv7 (EABI) userspace process.
++
++# Link address of the UML kernel binary. Guest processes live in separate host
++# address spaces under SKAS, so this only has to stay clear of the UML kernel's
++# own mappings of guest physical memory, which are placed above the binary.
++# 0x8048000 is the classic 32-bit non-PIE text base that the i386 UML port has
++# used for decades, and it is what arm32 toolchains link non-PIE executables
++# to by default as well.
++START := 0x8048000
++
++ELF_ARCH	:= arm
++ELF_FORMAT	:= elf32-littlearm
++
++CHECKFLAGS	+= -D__arm__
++
++# The parent architecture's headers must believe they are looking at ARMv7,
++# or their barriers and atomic operations degrade to nothing: arch/arm's
++# barrier.h only emits a real "dsb" when the code is compiled for v6 or later,
++# and its cmpxchg64 / queued-spinlock helpers switch on the same. Without
++# this a UML host silently gets a UP stub barrier and a word-at-a-time
++# cmpxchg, and every multi-CPU guest build breaks. There is no per-CPU_32v*
++# kernel config to ask for it -- the parent Kconfig is not sourced for ARCH=um
++# -- so the architecture level has to come from the preprocessor.
++KBUILD_CPPFLAGS += -D__LINUX_ARM_ARCH__=7
++
++# Keep the FPU out of the whole UML binary, for two independent reasons:
++#
++# The guest's VFP/NEON state belongs to the guest. UGL preserves it through
++# PTRACE_GETVFPREGS/SETVFPREGS (boot probe) and the VFP block in host
++# sigframes, and the stub never runs host code that would touch V registers.
++# If any object in the binary used V registers, the state saved for the guest
++# would be whatever the host compiler last left there -- and the guest's float
++# arithmetic would be wrong in ways that only surface on a slow CPU.
++#
++# -mfloat-abi=soft is not just "don't use the FPU in arithmetic". The host
++# compiler's code motion and inlining may still emit VFP instructions for
++# struct copies or function prologues, so the flag has to hold for the kernel
++# and the USER objects alike. It does no harm to them: guest user-space is
++# not our binary; it is exec'd from guest memory and its VFP use is exactly
++# what UGL is preserving.
++#
++# -march=armv7 pins the host baseline explicitly. The guest is armv7 (the
++# subarch's 32-bit EABI), and the host must not be able to drift below it --
++# a build on an old armv5 host would emit code the stub cannot run, and no
++# error anywhere in the build would say so.
++#
++# -marm pins ARM (32-bit) state: gcc's default for -march=armv7 is Thumb,
++# and the two states encode the same source differently -- "svc #0" is
++# 0xea000000 in ARM state and 0xdf00 in Thumb. UGL compares the host
++# instruction word it is about to step over against UM_SYSCALL_TRAP_INSN, a
++# 32-bit value (arch/arm/um/shared/sysdep/ptrace_user.h), so the stub's code
++# must be ARM state without exception. Interworking stays on, so glibc or
++# bionic objects with mixed code link fine.
++
++KBUILD_CFLAGS += -mfloat-abi=soft -march=armv7 -marm
++
++# The .S files are assembled through the host's gcc, and gas takes its
++# ARM/Thumb state from the driver's default, which UGL cannot rely on:
++# setjmp_arm.S is written for the ARM state ("svc #0" is 0xea000000, the
++# stub's resume path is compared against that word in
++# arch/arm/um/shared/sysdep/ptrace_user.h), so pin the state here as well.
++KBUILD_AFLAGS += -march=armv7 -marm
++
++LINK-$(CONFIG_LD_SCRIPT_DYN_RPATH) += -Wl,-rpath,/lib
++
++# Building against bionic (the Android NDK) collides with the kernel's own
++# definitions of a set of standard-library names. glibc does not show this:
++# its libc.a is finely split, so the objects carrying memcpy, snprintf and the
++# rest are simply never pulled in once the kernel's definitions satisfy every
++# reference. bionic's libc.a is coarser -- the objects that *are* needed also
++# define these -- and the static link then fails with twenty duplicate symbols.
++#
++# Resolving it with --allow-multiple-definition is worse than not building:
++# link order puts the kernel first, so libc's internals end up calling the
++# kernel's memcpy and sem_init, and the binary segfaults before main().
++#
++# The string family is handled in arch/arm/um/asm/string.h instead, by
++# declaring __HAVE_ARCH_* so lib/string.c does not compile its own -- renaming
++# those fights CONFIG_FORTIFY_SOURCE, which redefines them as macros.
++#
++# The rest are renamed, which is exactly what UML already does for
++# errno, sigprocmask, mktime and strrchr in arch/um/Makefile. These defines
++# reach kernel objects only, never USER_OBJS, so host-side code and libc keep
++# the real names. Compiler-emitted implicit calls (struct copies lowering to
++# memcpy) also keep the real name and get libc's implementation, which is
++# correct and usually faster than the kernel's generic C.
++#
++# The list is not guesswork and not the duplicate-symbol errors either. Those
++# only catch names both sides *define*; the dangerous case is a name libc
++# merely *references* while the kernel defines it, because then there is no
++# error at all -- the reference simply binds to the kernel's function.
++#
++# So the list is the intersection of "undefined in bionic's libc.a" with
++# "defined in vmlinux.a", computed with llvm-nm:
++#
++#   llvm-nm --undefined-only libc.a         | sort -u > A
++#   llvm-nm --defined-only --extern-only vmlinux.a | sort -u > B
++#   comm -12 A B
++#
++# Detected from the compiler rather than configured, because the whole
++# difference is which libc the target triple selects.
++UM_BIONIC := $(shell echo | $(CC) $(CLANG_FLAGS) -dM -E - 2>/dev/null | grep -c __ANDROID__)
++
++ifeq ($(UM_BIONIC),1)
++# Renamed on the object files at link time, not here: see
++# arch/arm/um/bionic-syms.redef for the list and for why -D is the wrong tool.
++export UM_REDEF_SYMS := $(srctree)/arch/arm/um/bionic-syms.redef
++endif
+diff --git a/arch/arm/um/Kconfig b/arch/arm/um/Kconfig
+new file mode 100644
+index 000000000..1152a6d3c
+--- /dev/null
++++ b/arch/arm/um/Kconfig
+@@ -0,0 +1,135 @@
++# SPDX-License-Identifier: GPL-2.0
++
++config UML_ARM
++	def_bool y
++	select ARCH_SUPPORTS_ATOMIC_RMW
++	#
++	# SMP. The subarch pieces it needs are already correct rather than
++	# merely untested: setjmp_arm.S saves the AAPCS callee-saved set
++	# (r4-r11) plus sp and lr and nothing thread-local, so a switch_buf
++	# built on one CPU thread is safe to longjmp from another. The one
++	# register a host compiler may use for per-thread TLS, R8, is the
++	# guest's and is carried like every other general register -- it is
++	# part of the GP regset PTRACE_GETREGS returns, and
++	# os-Linux/registers.c synchronizes it on every switch. VFP state
++	# never lives in the stub's registers at all: the UGL binary is
++	# built without any FP, so a shared stub cannot lose a guest's.
++	#
++	# NR_CPUS is only a ceiling: the count that is actually brought up is
++	# the ncpus= boot argument, clamped to it. So one binary serves any
++	# host, and a host that cannot do SMP at all (ptrace userspace) boots
++	# on one CPU rather than refusing to boot.
++	select UML_SUBARCH_SUPPORTS_SMP
++	#
++	# The parent arch/arm does not select these, but its decision was made
++	# for a machine with MMU, IOMMU and hardware spin-table errata to
++	# worry about. UML guest spinlocks serialize threads of one process,
++	# so the generic queued implementations -- plain C on top of the
++	# architecture's atomics, which ARCH_SUPPORTS_ATOMIC_RMW above
++	# covers -- are the right ones, exactly as the x86 and arm64 UML
++	# subarchs select them.
++	select ARCH_USE_QUEUED_RWLOCKS
++	select ARCH_USE_QUEUED_SPINLOCKS
++	#
++	# The guest is ARMv7, which has the efficient unaligned access
++	# hardware. The parent gates this on CPU_V6 and later plus MMU;
++	# UGL is unconditionally v7 with MMU, so the capability is on.
++	select HAVE_EFFICIENT_UNALIGNED_ACCESS
++	#
++	# Loadable modules. arm modules are ELF REL (the parent arch/arm
++	# selects MODULES_USE_ELF_REL for exactly this reason), and the
++	# relocation processing is arch/arm/kernel/module.c reused verbatim
++	# -- the same arrangement x86 UML has used for its own module.c for
++	# years (subarch-$(CONFIG_MODULES) in the Makefile). There is no
++	# arm equivalent of arm64's module-plts.c or insn.o: arm relocations
++	# patch fixed 32-bit immediates, which module.c computes in C.
++	#
++	select MODULES_USE_ELF_REL
++	#
++	# Goes with it: arch/arm's struct mod_arch_specific carries the
++	# per-module bookkeeping, so the generic module loader expects it.
++	select HAVE_MOD_ARCH_SPECIFIC
++	#
++	# The guest's off_t is 32 bits, like every real arm32 kernel. That
++	# flips force_o_largefile() in include/linux/fcntl.h: on a 32-bit
++	# off_t architecture sys_open() must *not* force O_LARGEFILE -- the
++	# guest's 32-bit syscalls are the ABI, and O_LARGEFILE is the guest
++	# application's flag, not the kernel's.
++	select ARCH_32BIT_OFF_T
++	#
++	# Frame pointers, as arch/arm64/Kconfig selects them for real
++	# hardware.
++	#
++	# Not a debug preference. UML's stack walker chains through the
++	# frame pointer and falls back to scanning the stack for anything
++	# that looks like a text address; get_frame_pointer() returns 0
++	# outright when CONFIG_FRAME_POINTER is off (arch/um/include/asm/stacktrace.h),
++	# so the chain never advances, every frame is a guess, and
++	# save_stack_trace() -- which keeps only frames marked reliable --
++	# returns nothing at all.
++	#
++	# Without this the behaviour depends on CONFIG_DEBUG_INFO, because
++	# FRAME_POINTER is "default y if (DEBUG_INFO && UML)" and UML selects
++	# nothing. So backtraces work in a development build and silently stop
++	# working in the size-tuned build someone puts on a phone, which is
++	# precisely where a backtrace is the only debugging tool left.
++	select ARCH_WANT_FRAME_POINTERS
++
++config 32BIT
++	def_bool y
++
++# Defined, not selected: these are per-architecture symbols with no central
++# definition, exactly as arch/x86/um/Kconfig defines GENERIC_HWEIGHT.
++config GENERIC_HWEIGHT
++	def_bool y
++
++# arch/arm/lib's checksum routines are kernel-only assembly written against
++# the EL1 uaccess model. The generic C implementations in lib/checksum.c are
++# correct and are not on any hot path for a guest whose network device is a
++# host socket.
++config GENERIC_CSUM
++	def_bool y
++
++#
++# The parent arch/arm/Kconfig is not sourced for ARCH=um, so the two memory-
++# layout values its headers compute from are supplied here. The parent puts
++# PAGE_OFFSET in the "Processor type and features" menu and PHYS_OFFSET in
++# "Processor support"; neither menu exists in a UML build.
++#
++# PAGE_OFFSET: TASK_SIZE -- and therefore the whole user-space map -- is
++# PAGE_OFFSET - SZ_16M in arch/arm/include/asm/memory.h. The classic 1G split
++# is the honest answer for a 32-bit guest: user space gets everything below
++# 0xC0000000, and the module space between TASK_SIZE and PAGE_OFFSET that
++# the parent's module.h lays out stays where the parent's relocator expects
++# it.
++config PAGE_OFFSET
++	hex
++	default 0xC0000000
++
++# PHYS_OFFSET: the guest's physical addresses are its own virtual addresses,
++# so the offset is zero and virt_to_phys()/phys_to_virt() are identity math
++# on top of it.
++config PHYS_OFFSET
++	hex
++	default 0x0
++
++# Deliberately *not* "config ARM". Generic code tests CONFIG_ARM to mean
++# "running on real arm hardware in the kernel" -- it gates things like the
++# arm32 hardware description, cpuidle and cp15 maintenance code, none of
++# which exist for a UML guest, which is an ordinary userspace process. The
++# subarch advertises itself as UML_ARM instead, exactly as x86 UML would
++# if it were written today, and selects the individual capabilities it
++# really has.
++#
++# Also deliberately *not* selected:
++#
++# CLONE_BACKWARDS -- that is the aarch64 psABI, where clone() takes
++# (flags, stack, pid, *tls, tid). arm32's EABI keeps the generic order
++# (flags, stack, pid, tid, *tls), and the guest's glibc was built against
++# exactly that. Selecting it would swap two arguments the guest never
++# asked to be swapped.
++#
++# HAVE_PAGE_SIZE_16KB -- a 16 KB arm32 host is not a real target. The 16
++# KB-page requirement the arm64 port exists for (Android 15+) is an
++# arm64-only Android configuration, and a 4 KB UML guest cannot boot on a
++# 16 KB host anyway, so offering the symbol would be untestable decoration.
+diff --git a/arch/arm/um/Makefile b/arch/arm/um/Makefile
+new file mode 100644
+index 000000000..eef7fb748
+--- /dev/null
++++ b/arch/arm/um/Makefile
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# arch/arm/um -- subarch support for ARCH=um SUBARCH=arm
++#
++
++obj-y = bugs.o cpuinfo.o delay.o fault.o mem.o ptrace.o \
++	setjmp_arm.o signal.o stub_segv.o syscalls.o \
++	sys_call_table.o sysrq.o tls.o \
++	subarch.o os-Linux/
++
++# Module loading is the parent architecture's, reused rather than reimplemented.
++# arm relocations patch fixed 32-bit immediates -- R_ARM_PC24, R_ARM_ABS32 and
++# friends -- and arch/arm/kernel/module.c computes every one of them in C, so
++# there is nothing to build alongside it: no equivalent of arm64's module-plts.o
++# or insn.o. x86 UML has taken exactly this approach to its own module.c for
++# years -- see arch/x86/um/Makefile.
++subarch-$(CONFIG_MODULES) += ../kernel/module.o
++
++# Built with USER_CFLAGS against host headers rather than kernel headers:
++# these speak to the host kernel, not to the guest.
++USER_OBJS := bugs.o fault.o
++
++$(obj)/user-offsets.s: c_flags = -Wp,-MD,$(depfile) $(USER_CFLAGS) \
++	-Iarch/arm/include/generated
++targets += user-offsets.s
++
++include/generated/user_constants.h: $(obj)/user-offsets.s FORCE
++	$(call filechk,offsets,__USER_CONSTANT_H__)
++
++# The SIGSEGV stub handler runs on the guest's stack inside the stub process
++# with no libc and no stack protector available.
++UNPROFILE_OBJS := stub_segv.o
++CFLAGS_stub_segv.o := $(CFLAGS_NO_HARDENING)
++
++include $(srctree)/arch/um/scripts/Makefile.rules
+diff --git a/arch/arm/um/asm/checksum.h b/arch/arm/um/asm/checksum.h
+new file mode 100644
+index 000000000..ea45419d5
+--- /dev/null
++++ b/arch/arm/um/asm/checksum.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_CHECKSUM_H
++#define __UM_ARM_CHECKSUM_H
++
++/*
++ * arm has hand-written checksum helpers in arch/arm/lib (csum_partial,
++ * csum_partial_copy_*, ip_fast_csum), declared in the parent
++ * arch/arm/include/asm/checksum.h. Those are kernel-only assembly written
++ * against the EL1 uaccess model, and arch/arm/lib is not built for ARCH=um,
++ * so their declarations would dangle.
++ *
++ * Fall back to the generic C versions instead: lib/checksum.c (selected by
++ * GENERIC_CSUM in arch/arm/um/Kconfig) supplies csum_partial and friends,
++ * and asm-generic/checksum.h declares them with the matching signatures.
++ * That is the right cost here -- the guest's network path is a host socket
++ * anyway, so this is not on any hot path.
++ */
++#include <asm-generic/checksum.h>
++
++#endif /* __UM_ARM_CHECKSUM_H */
+diff --git a/arch/arm/um/asm/cpuinfo.h b/arch/arm/um/asm/cpuinfo.h
+new file mode 100644
+index 000000000..e63d9059e
+--- /dev/null
++++ b/arch/arm/um/asm/cpuinfo.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_CPUINFO_H
++#define __UM_ARM_CPUINFO_H
++
++#include <linux/types.h>
++
++/*
++ * Subarch half of struct cpuinfo_um.
++ *
++ * arm has no CPUID-style feature bitmap to mirror into boot_cpu_data.
++ * What the guest may rely on is not cached here at all: it is the host's
++ * AT_HWCAP/AT_HWCAP2, published through the um_arm_elf_hwcap/um_arm_elf_hwcap2
++ * globals and the "features" line of /proc/cpuinfo, both generated from
++ * the same mask in arch/arm/um/cpuinfo.c. arch_parse_host_cpu_flags()
++ * therefore answers 1 for every host cpuinfo line rather than parsing one,
++ * and the struct needs no storage of its own.
++ */
++struct arch_cpuinfo {
++};
++
++#endif /* __UM_ARM_CPUINFO_H */
+diff --git a/arch/arm/um/asm/elf.h b/arch/arm/um/asm/elf.h
+new file mode 100644
+index 000000000..2e8b86cd4
+--- /dev/null
++++ b/arch/arm/um/asm/elf.h
+@@ -0,0 +1,108 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_ELF_H
++#define __UM_ARM_ELF_H
++
++/*
++ * UML half of <asm/elf.h> for ARCH=um SUBARCH=arm.
++ *
++ * The parent arch/arm/include/asm/elf.h is static and mostly reusable, but it
++ * declares five functions defined in arch/arm/kernel/ and arch/arm/mm/
++ * (elf_check_arch, elf_platform, arm_elf_read_implies_exec,
++ * elf_set_personality, arch_setup_additional_pages) that are not built for
++ * a UML guest, and it hardwires a 4K page size and a 0x400000 PIE base that
++ * belong to a real arm board rather than to a guest on whatever host the
++ * UML binary runs on. This file keeps the UML-applicable part and drops the
++ * rest; wherever a macro is absent here, the generic fallbacks in
++ * include/linux/elf.h and include/linux/elfcore.h take over, so the dropped
++ * externs simply do not need definitions.
++ */
++#include <linux/elf-em.h>
++#include <asm/ptrace.h>
++#include <asm/user.h>
++#include <skas.h>
++
++#define elf_check_arch(x) ((x)->e_machine == EM_ARM)
++
++#define ELF_CLASS	ELFCLASS32
++#define ELF_DATA	ELFDATA2LSB
++#define ELF_ARCH	EM_ARM
++
++typedef unsigned long elf_greg_t;
++typedef unsigned long elf_freg_t[3];
++
++/*
++ * NT_PRSTATUS carries the 18-word classic register block -- r0-r10, fp, ip,
++ * sp, lr, pc, cpsr, orig_r0 -- which is exactly struct user_regs_struct and,
++ * on a 32-bit host, exactly the first 18 entries of the UML register model.
++ * The slots UML appends past the host ABI (synthesised syscall number,
++ * kernel bookkeeping) are not part of a core file and are not copied.
++ */
++#define ELF_NGREG (sizeof(struct user_regs_struct) / sizeof(elf_greg_t))
++typedef elf_greg_t elf_gregset_t[ELF_NGREG];
++
++typedef struct user_fp elf_fpregset_t;
++
++/*
++ * A fresh arm process starts with r0 holding the SVR4 atexit handler
++ * pointer; 0 means there is none. The rest of the register file is what
++ * execve(2) leaves it, which is the host kernel's business, not the
++ * guest's.
++ */
++#define ELF_PLAT_INIT(regs, load_addr)	(PT_REGS_R0(regs) = 0)
++
++/*
++ * A plain compound statement, not do/while(0): include/linux/elfcore.h
++ * invokes this without a trailing semicolon.
++ */
++#define ELF_CORE_COPY_REGS(pr_reg, _regs)				\
++	{							\
++		int __i;						\
++							\
++		for (__i = 0; __i < ELF_NGREG; __i++)		\
++			(pr_reg)[__i] = (_regs)->regs.gp[__i];	\
++	}
++
++/*
++ * The host's own AT_PLATFORM, captured from the UML process's auxv in
++ * arch/um/os-Linux/elf_aux.c, is the honest answer for the guest: it is
++ * the platform string of the machine actually running. The fallback only
++ * matters on hosts that publish no AT_PLATFORM at all.
++ */
++extern char *elf_aux_platform;
++#define ELF_PLATFORM_FALLBACK "armv7l"
++#define ELF_PLATFORM (elf_aux_platform ?: ELF_PLATFORM_FALLBACK)
++
++/*
++ * Sanitised in arch/arm/um/cpuinfo.c: the guest is told only about
++ * features whose state UML actually preserves. Deliberately not the host's
++ * raw AT_HWCAP -- see the allowlist there. ELF_HWCAP2 feeds the
++ * #ifdef-guarded AT_HWCAP2 entry in fs/binfmt_elf.c.
++ */
++extern unsigned long um_arm_elf_hwcap;
++extern unsigned long um_arm_elf_hwcap2;
++#define ELF_HWCAP	(um_arm_elf_hwcap)
++#define ELF_HWCAP2	(um_arm_elf_hwcap2)
++
++/*
++ * PAGE_SIZE, not 4096: an arm host may run a 4K or a 64K page kernel, and
++ * a UML guest's page size always equals its host's.
++ */
++#define ELF_EXEC_PAGESIZE PAGE_SIZE
++
++/*
++ * Two thirds of the guest address space up, matching x86 UML and the arm64
++ * port: the UML kernel binary and its guest physical memory mappings live
++ * elsewhere, and glibc's loader is happiest with a top-down region of its
++ * own.
++ */
++#define ELF_ET_DYN_BASE (2 * TASK_SIZE / 3)
++
++#define SET_PERSONALITY(ex) do {} while (0)
++
++/*
++ * Core dumps walk the regset view (arch/arm/um/ptrace.c) rather than the
++ * legacy register dump, so no struct user plumbing is needed for coredumps.
++ */
++#define CORE_DUMP_USE_REGSET
++
++#endif /* __UM_ARM_ELF_H */
+diff --git a/arch/arm/um/asm/hwcap.h b/arch/arm/um/asm/hwcap.h
+new file mode 100644
+index 000000000..40af7dd58
+--- /dev/null
++++ b/arch/arm/um/asm/hwcap.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_HWCAP_H
++#define __UM_ARM_HWCAP_H
++
++/*
++ * arch/arm/include/uapi/asm/ptrace.h includes <asm/hwcap.h>, which in a real
++ * arm build lands on the kernel-side header: KERNEL_HWCAP_* ordinals and,
++ * through <asm/cpufeature.h>, the whole cpucaps and alternatives machinery.
++ *
++ * A UML guest has no cpucaps -- it never probes ID registers, and its notion
++ * of "what this CPU can do" is the AT_HWCAP/AT_HWCAP2 the host handed the
++ * UML process (see arch/arm/um/cpuinfo.c). Only the uapi HWCAP_* bit
++ * definitions are meaningful here, and those are what guest userspace sees
++ * anyway.
++ */
++#include <uapi/asm/hwcap.h>
++
++#endif /* __UM_ARM_HWCAP_H */
+diff --git a/arch/arm/um/asm/mman.h b/arch/arm/um/asm/mman.h
+new file mode 100644
+index 000000000..48d50a87c
+--- /dev/null
++++ b/arch/arm/um/asm/mman.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_MMAN_H
++#define __UM_ARM_MMAN_H
++
++/*
++ * arch/arm/include/asm/mman.h adds arch_memory_deny_write_exec_supported()
++ * built on cpu_architecture() from <asm/system_info.h> -- cpufeature state
++ * a UML host does not have (there is no CPU architecture to read; the
++ * host kernel is whatever it is, and the only mapping discipline in play is
++ * the host's own mprotect()).
++ *
++ * UML guests report the generic default: include/linux/mman.h falls back to
++ * "unsupported" when the hook is absent, and prctl(PR_SET_MDWE) then answers
++ * -EINVAL, which is the honest answer on any host.
++ */
++#include <uapi/asm/mman.h>
++
++#endif /* __UM_ARM_MMAN_H */
+diff --git a/arch/arm/um/asm/processor.h b/arch/arm/um/asm/processor.h
+new file mode 100644
+index 000000000..e1f7461be
+--- /dev/null
++++ b/arch/arm/um/asm/processor.h
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_PROCESSOR_H
++#define __UM_ARM_PROCESSOR_H
++
++#include <linux/time-internal.h>
++
++/* include faultinfo structure */
++#include <sysdep/faultinfo.h>
++
++struct arch_thread {
++	/*
++	 * Guest TLS (R8). arm userspace owns this register outright -- the
++	 * compiler writes it with an ordinary "mov r8, ...", never a syscall
++	 * -- so UML only has to remember it across a switch between guest
++	 * threads sharing one stub process.
++	 */
++	unsigned long tp_value;
++	struct faultinfo faultinfo;
++};
++
++#define INIT_ARCH_THREAD {			\
++	.tp_value	= 0,			\
++	.faultinfo	= { 0, 0 }		\
++}
++
++#define STACKSLOTS_PER_LINE 4
++
++static inline void arch_flush_thread(struct arch_thread *thread)
++{
++	thread->tp_value = 0;
++}
++
++static inline void arch_copy_thread(struct arch_thread *from,
++				    struct arch_thread *to)
++{
++	to->tp_value = from->tp_value;
++}
++
++#define current_sp()						\
++	({ void *sp; __asm__("mov %0, sp" : "=r" (sp)); sp; })
++#define current_bp()						\
++	({ unsigned long bp; __asm__("mov %0, fp" : "=r" (bp)); bp; })
++
++#define KSTK_EIP(tsk) KSTK_REG(tsk, HOST_PC)
++#define KSTK_ESP(tsk) KSTK_REG(tsk, HOST_SP)
++#define KSTK_EBP(tsk) KSTK_REG(tsk, HOST_FP)
++
++#define ARCH_IS_STACKGROW(address) \
++	(address + 65536 + 32 * sizeof(unsigned long) >= UPT_SP(&current->thread.regs.regs))
++
++/*
++ * x86 emits PAUSE here. The arm equivalent is the YIELD hint: a no-op on
++ * cores that ignore it, and on a shared or virtualised core it asks the
++ * scheduler to offer the slot to a sibling.
++ */
++static __always_inline void native_pause(void)
++{
++	__asm__ __volatile__("yield" ::: "memory");
++}
++
++static __always_inline void cpu_relax(void)
++{
++	if (time_travel_mode == TT_MODE_INFCPU ||
++	    time_travel_mode == TT_MODE_EXTERNAL)
++		time_travel_ndelay(1);
++	else
++		native_pause();
++}
++
++#define task_pt_regs(t) (&(t)->thread.regs)
++
++#include <asm/processor-generic.h>
++
++#endif /* __UM_ARM_PROCESSOR_H */
+diff --git a/arch/arm/um/asm/ptrace.h b/arch/arm/um/asm/ptrace.h
+new file mode 100644
+index 000000000..1e01e752e
+--- /dev/null
++++ b/arch/arm/um/asm/ptrace.h
+@@ -0,0 +1,115 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_PTRACE_H
++#define __UM_ARM_PTRACE_H
++
++/*
++ * Regsets the UML core dump / ptrace glue knows about. arm's real regset
++ * list is longer (VFP, IWMMXT, FPU, TLS...), but a UML guest has none of
++ * the optional ones: it is a userspace process whose FP state is whatever
++ * the host gave the stub. Only the core regset and, on hosts that have it,
++ * the VFP one are exposed.
++ */
++enum {
++	REGSET_GENERAL,
++	REGSET_FP,
++};
++
++#include <linux/compiler.h>
++#include <uapi/asm/ptrace.h>
++#include <asm/ptrace-generic.h>
++
++/*
++ * The 72-byte core-dump / user-area register block. arm32 has no host type
++ * of that name -- the kernel spells the PTRACE payload as a sigcontext, and
++ * the classic ptrace() regset as struct pt_regs -- so UGL carries a local
++ * mirror here: 18 words, r0-r10, fp, ip, sp, lr, pc, cpsr, orig_r0.
++ */
++struct user_regs_struct {
++	unsigned int ureg[18];
++};
++
++#define user_mode(r) UPT_IS_USER(&(r)->regs)
++
++#define PT_REGS_X(r, n)	UPT_X(&(r)->regs, n)
++#define PT_REGS_SP_REG(r) UPT_SP(&(r)->regs)
++
++#define PT_REGS_R0(r)	PT_REGS_X(r, HOST_R0)
++#define PT_REGS_R1(r)	PT_REGS_X(r, HOST_R1)
++#define PT_REGS_R2(r)	PT_REGS_X(r, HOST_R2)
++#define PT_REGS_R3(r)	PT_REGS_X(r, HOST_R3)
++#define PT_REGS_R4(r)	PT_REGS_X(r, HOST_R4)
++#define PT_REGS_R5(r)	PT_REGS_X(r, HOST_R5)
++#define PT_REGS_R6(r)	PT_REGS_X(r, HOST_R6)
++#define PT_REGS_R7(r)	PT_REGS_X(r, HOST_R7)
++#define PT_REGS_R8(r)	PT_REGS_X(r, HOST_R8)
++#define PT_REGS_R9(r)	PT_REGS_X(r, HOST_R9)
++#define PT_REGS_R10(r)	PT_REGS_X(r, HOST_R10)
++
++/* Frame pointer, for the generic KSTK_EBP/backtrace glue. */
++#define PT_REGS_BP(r)	PT_REGS_X(r, HOST_FP)
++#define PT_REGS_LR(r)	PT_REGS_X(r, HOST_LR)
++#define PT_REGS_CPSR(r)	PT_REGS_X(r, HOST_CPSR)
++
++/*
++ * The syscall return value is r0.
++ *
++ * PT_REGS_ORIG_SYSCALL is NOT r0. On x86 the two alias because EAX carries
++ * both the syscall number in and the result out, so arch/um/kernel/signal.c
++ * can write "PT_REGS_ORIG_SYSCALL(regs) = __NR_restart_syscall" and mean
++ * it. On arm the number went in r7 and the result comes out r0, so
++ * aliasing them would make that assignment clobber the return value instead
++ * of redirecting the syscall. It maps to the synthesised HOST_SYSCALL_NR
++ * slot, which is also what the ptrace and seccomp resume paths write back
++ * to the host.
++ */
++#define PT_REGS_SYSCALL_RET(r)	PT_REGS_X(r, HOST_R0)
++#define PT_REGS_ORIG_SYSCALL(r)	PT_REGS_X(r, HOST_SYSCALL_NR)
++
++#define PT_REGS_SET_SYSCALL_RETURN(r, res) (PT_REGS_X(r, HOST_R0) = (res))
++
++/*
++ * Bits of CPSR that a debugger (or a sigreturn frame) may set, mirroring
++ * the sanitisation in the parent arm kernel's valid_user_regs(): the flags,
++ * status and extension groups plus the T bit. Anything outside that either
++ * names a mode the guest cannot be in or masks interrupts it does not own,
++ * so the host would drop it on ptrace anyway; filtering here keeps the
++ * guest's own view consistent with what actually gets installed.
++ */
++#define UM_CPSR_WRITABLE						\
++	(PSR_f | PSR_s | PSR_x | PSR_T_BIT)
++
++#define PT_FIX_EXEC_STACK(sp) do ; while (0)
++
++#define profile_pc(regs) PT_REGS_IP(regs)
++
++static inline long regs_return_value(struct pt_regs *regs)
++{
++	return PT_REGS_R0(regs);
++}
++
++#define user_stack_pointer(regs) PT_REGS_SP(regs)
++
++/*
++ * arm has no LDT and no set_thread_area(2); TLS is R8, handled through
++ * arch_set_tls(). These exist only because arch/um/kernel/ptrace.c
++ * references them unconditionally.
++ */
++struct user_desc;
++
++#include <asm/errno.h>
++
++static inline int ptrace_get_thread_area(struct task_struct *child, int idx,
++					 struct user_desc __user *user_desc)
++{
++	return -ENOSYS;
++}
++
++static inline int ptrace_set_thread_area(struct task_struct *child, int idx,
++					 struct user_desc __user *user_desc)
++{
++	return -ENOSYS;
++}
++
++extern void arch_switch_to(struct task_struct *to);
++
++#endif /* __UM_ARM_PTRACE_H */
+diff --git a/arch/arm/um/asm/string.h b/arch/arm/um/asm/string.h
+new file mode 100644
+index 000000000..628e48718
+--- /dev/null
++++ b/arch/arm/um/asm/string.h
+@@ -0,0 +1,73 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_STRING_H
++#define __UM_ARM_STRING_H
++
++/*
++ * arch/arm/include/asm/string.h declares the arch's own memcpy, memset,
++ * memmove, and the __-prefixed KASan instrumentation variants, all backed
++ * by arch/arm/lib, which is not built for ARCH=um. Declaring the
++ * __HAVE_ARCH_* macros here would suppress lib/string.c's generic
++ * implementations and leave the symbols undefined at link time; the
++ * KASan-underscore forms are plain name collisions with the glibc the UML
++ * binary links against.
++ *
++ * Declaring no __HAVE_ARCH_* at all lets lib/string.c supply everything.
++ * That also keeps UML's -Dstrrchr=kernel_strrchr renaming (see
++ * arch/um/Makefile) working, which is what stops the kernel's string
++ * functions from colliding with the libc that the UML binary is linked
++ * against.
++ */
++
++/*
++ * Against bionic, let libc supply these.
++ *
++ * The comment above explains why no __HAVE_ARCH_* is declared for a glibc
++ * build: arch/arm/lib is not compiled for ARCH=um, so claiming the arch
++ * has its own would leave the symbols undefined. Against bionic the
++ * situation is the opposite -- libc.a certainly has them, and its objects
++ * get pulled in regardless because bionic's libc is coarser-grained than
++ * glibc's, so the kernel's copies in lib/string.c collide with libc's at
++ * static link time.
++ *
++ * Declaring them here stops lib/string.c compiling its own, which removes
++ * the collision at the source rather than renaming one side of it.
++ * Renaming is the wrong tool for this family in particular:
++ * CONFIG_FORTIFY_SOURCE redefines these names as macros, so a
++ * -Dstrchr=kernel_strchr fights the fortify wrappers and produces "call to
++ * undeclared library function 'strchr'".
++ */
++#ifdef __ANDROID__
++#define __HAVE_ARCH_MEMCPY
++#define __HAVE_ARCH_MEMSET
++#define __HAVE_ARCH_MEMMOVE
++#define __HAVE_ARCH_MEMCMP
++#define __HAVE_ARCH_MEMCHR
++#define __HAVE_ARCH_STRCMP
++#define __HAVE_ARCH_STRCPY
++#define __HAVE_ARCH_STRCHR
++#define __HAVE_ARCH_STRCHRNUL
++#define __HAVE_ARCH_STRLEN
++#define __HAVE_ARCH_STRNCMP
++#define __HAVE_ARCH_STRNLEN
++
++/*
++ * __HAVE_ARCH_* tells <linux/string.h> that the architecture declares
++ * these, so it stops declaring them itself. Here "the architecture" is
++ * libc, so declare them with the signatures libc uses and let the link
++ * resolve them there.
++ */
++void *memcpy(void *, const void *, __kernel_size_t);
++void *memset(void *, int, __kernel_size_t);
++void *memmove(void *, const void *, __kernel_size_t);
++int memcmp(const void *, const void *, __kernel_size_t);
++void *memchr(const void *, int, __kernel_size_t);
++int strcmp(const char *, const char *);
++char *strcpy(char *, const char *);
++char *strchr(const char *, int);
++char *strchrnul(const char *, int);
++__kernel_size_t strlen(const char *);
++int strncmp(const char *, const char *, __kernel_size_t);
++__kernel_size_t strnlen(const char *, __kernel_size_t);
++#endif
++
++#endif /* __UM_ARM_STRING_H */
+diff --git a/arch/arm/um/asm/syscall.h b/arch/arm/um/asm/syscall.h
+new file mode 100644
+index 000000000..b9a873d82
+--- /dev/null
++++ b/arch/arm/um/asm/syscall.h
+@@ -0,0 +1,27 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_SYSCALL_H
++#define __UM_ARM_SYSCALL_H
++
++/*
++ * The parent arch/arm/include/asm/syscall.h is the kernel's own: it tracks
++ * OABI versus EABI calls in the task's abi_syscall slot and masks numbers
++ * against __NR_SYSCALL_BASE -- machinery for a kernel running on arm
++ * hardware. None of it exists in UML, where there is a single EABI
++ * syscall table and the original first argument is an ordinary regset word.
++ */
++
++#include <asm/syscall-generic.h>
++#include <uapi/linux/audit.h>
++
++typedef asmlinkage long (*sys_call_ptr_t)(unsigned long, unsigned long,
++					  unsigned long, unsigned long,
++					  unsigned long, unsigned long);
++
++extern const sys_call_ptr_t sys_call_table[];
++
++static inline int syscall_get_arch(struct task_struct *task)
++{
++	return AUDIT_ARCH_ARM;
++}
++
++#endif /* __UM_ARM_SYSCALL_H */
+diff --git a/arch/arm/um/asm/syscall_table_eabi.h b/arch/arm/um/asm/syscall_table_eabi.h
+new file mode 100644
+index 000000000..132bce02c
+--- /dev/null
++++ b/arch/arm/um/asm/syscall_table_eabi.h
+@@ -0,0 +1,489 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * EABI syscall table body for UML/arm, generated from arch/arm/tools/
++ * syscall.tbl with
++ *
++ *   scripts/syscalltbl.sh --abis common,eabi arch/arm/tools/syscall.tbl
++ *
++ * One __SYSCALL(nr, native) line per entry, and
++ * __SYSCALL_WITH_COMPAT(nr, native, oabi_compat) for the entries that carry
++ * an OABI twin. The including file (arch/arm/um/sys_call_table.c) defines
++ * both macros before the include.
++ *
++ * It is committed rather than generated by kbuild: the UML flow never runs
++ * arch/arm's archprepare kapi step, and UML cannot modify the parent's
++ * arch/arm/include/asm/Kbuild to plug in. Regenerate this file whenever
++ * arch/arm/tools/syscall.tbl changes.
++ */
++__SYSCALL(0, sys_restart_syscall)
++__SYSCALL(1, sys_exit)
++__SYSCALL(2, sys_fork)
++__SYSCALL(3, sys_read)
++__SYSCALL(4, sys_write)
++__SYSCALL(5, sys_open)
++__SYSCALL(6, sys_close)
++__SYSCALL(7, sys_ni_syscall)
++__SYSCALL(8, sys_creat)
++__SYSCALL(9, sys_link)
++__SYSCALL(10, sys_unlink)
++__SYSCALL(11, sys_execve)
++__SYSCALL(12, sys_chdir)
++__SYSCALL(13, sys_ni_syscall)
++__SYSCALL(14, sys_mknod)
++__SYSCALL(15, sys_chmod)
++__SYSCALL(16, sys_lchown16)
++__SYSCALL(17, sys_ni_syscall)
++__SYSCALL(18, sys_ni_syscall)
++__SYSCALL(19, sys_lseek)
++__SYSCALL(20, sys_getpid)
++__SYSCALL(21, sys_mount)
++__SYSCALL(22, sys_ni_syscall)
++__SYSCALL(23, sys_setuid16)
++__SYSCALL(24, sys_getuid16)
++__SYSCALL(25, sys_ni_syscall)
++__SYSCALL(26, sys_ptrace)
++__SYSCALL(27, sys_ni_syscall)
++__SYSCALL(28, sys_ni_syscall)
++__SYSCALL(29, sys_pause)
++__SYSCALL(30, sys_ni_syscall)
++__SYSCALL(31, sys_ni_syscall)
++__SYSCALL(32, sys_ni_syscall)
++__SYSCALL(33, sys_access)
++__SYSCALL(34, sys_nice)
++__SYSCALL(35, sys_ni_syscall)
++__SYSCALL(36, sys_sync)
++__SYSCALL(37, sys_kill)
++__SYSCALL(38, sys_rename)
++__SYSCALL(39, sys_mkdir)
++__SYSCALL(40, sys_rmdir)
++__SYSCALL(41, sys_dup)
++__SYSCALL(42, sys_pipe)
++__SYSCALL(43, sys_times)
++__SYSCALL(44, sys_ni_syscall)
++__SYSCALL(45, sys_brk)
++__SYSCALL(46, sys_setgid16)
++__SYSCALL(47, sys_getgid16)
++__SYSCALL(48, sys_ni_syscall)
++__SYSCALL(49, sys_geteuid16)
++__SYSCALL(50, sys_getegid16)
++__SYSCALL(51, sys_acct)
++__SYSCALL(52, sys_umount)
++__SYSCALL(53, sys_ni_syscall)
++__SYSCALL(54, sys_ioctl)
++__SYSCALL(55, sys_fcntl)
++__SYSCALL(56, sys_ni_syscall)
++__SYSCALL(57, sys_setpgid)
++__SYSCALL(58, sys_ni_syscall)
++__SYSCALL(59, sys_ni_syscall)
++__SYSCALL(60, sys_umask)
++__SYSCALL(61, sys_chroot)
++__SYSCALL(62, sys_ustat)
++__SYSCALL(63, sys_dup2)
++__SYSCALL(64, sys_getppid)
++__SYSCALL(65, sys_getpgrp)
++__SYSCALL(66, sys_setsid)
++__SYSCALL(67, sys_sigaction)
++__SYSCALL(68, sys_ni_syscall)
++__SYSCALL(69, sys_ni_syscall)
++__SYSCALL(70, sys_setreuid16)
++__SYSCALL(71, sys_setregid16)
++__SYSCALL(72, sys_sigsuspend)
++__SYSCALL(73, sys_sigpending)
++__SYSCALL(74, sys_sethostname)
++__SYSCALL(75, sys_setrlimit)
++__SYSCALL(76, sys_ni_syscall)
++__SYSCALL(77, sys_getrusage)
++__SYSCALL(78, sys_gettimeofday)
++__SYSCALL(79, sys_settimeofday)
++__SYSCALL(80, sys_getgroups16)
++__SYSCALL(81, sys_setgroups16)
++__SYSCALL(82, sys_ni_syscall)
++__SYSCALL(83, sys_symlink)
++__SYSCALL(84, sys_ni_syscall)
++__SYSCALL(85, sys_readlink)
++__SYSCALL(86, sys_uselib)
++__SYSCALL(87, sys_swapon)
++__SYSCALL(88, sys_reboot)
++__SYSCALL(89, sys_ni_syscall)
++__SYSCALL(90, sys_ni_syscall)
++__SYSCALL(91, sys_munmap)
++__SYSCALL(92, sys_truncate)
++__SYSCALL(93, sys_ftruncate)
++__SYSCALL(94, sys_fchmod)
++__SYSCALL(95, sys_fchown16)
++__SYSCALL(96, sys_getpriority)
++__SYSCALL(97, sys_setpriority)
++__SYSCALL(98, sys_ni_syscall)
++__SYSCALL(99, sys_statfs)
++__SYSCALL(100, sys_fstatfs)
++__SYSCALL(101, sys_ni_syscall)
++__SYSCALL(102, sys_ni_syscall)
++__SYSCALL(103, sys_syslog)
++__SYSCALL(104, sys_setitimer)
++__SYSCALL(105, sys_getitimer)
++__SYSCALL(106, sys_newstat)
++__SYSCALL(107, sys_newlstat)
++__SYSCALL(108, sys_newfstat)
++__SYSCALL(109, sys_ni_syscall)
++__SYSCALL(110, sys_ni_syscall)
++__SYSCALL(111, sys_vhangup)
++__SYSCALL(112, sys_ni_syscall)
++__SYSCALL(113, sys_ni_syscall)
++__SYSCALL(114, sys_wait4)
++__SYSCALL(115, sys_swapoff)
++__SYSCALL(116, sys_sysinfo)
++__SYSCALL(117, sys_ni_syscall)
++__SYSCALL(118, sys_fsync)
++__SYSCALL(119, sys_sigreturn_wrapper)
++__SYSCALL(120, sys_clone)
++__SYSCALL(121, sys_setdomainname)
++__SYSCALL(122, sys_newuname)
++__SYSCALL(123, sys_ni_syscall)
++__SYSCALL(124, sys_adjtimex_time32)
++__SYSCALL(125, sys_mprotect)
++__SYSCALL(126, sys_sigprocmask)
++__SYSCALL(127, sys_ni_syscall)
++__SYSCALL(128, sys_init_module)
++__SYSCALL(129, sys_delete_module)
++__SYSCALL(130, sys_ni_syscall)
++__SYSCALL(131, sys_quotactl)
++__SYSCALL(132, sys_getpgid)
++__SYSCALL(133, sys_fchdir)
++__SYSCALL(134, sys_ni_syscall)
++__SYSCALL(135, sys_sysfs)
++__SYSCALL(136, sys_personality)
++__SYSCALL(137, sys_ni_syscall)
++__SYSCALL(138, sys_setfsuid16)
++__SYSCALL(139, sys_setfsgid16)
++__SYSCALL(140, sys_llseek)
++__SYSCALL(141, sys_getdents)
++__SYSCALL(142, sys_select)
++__SYSCALL(143, sys_flock)
++__SYSCALL(144, sys_msync)
++__SYSCALL(145, sys_readv)
++__SYSCALL(146, sys_writev)
++__SYSCALL(147, sys_getsid)
++__SYSCALL(148, sys_fdatasync)
++__SYSCALL(149, sys_ni_syscall)
++__SYSCALL(150, sys_mlock)
++__SYSCALL(151, sys_munlock)
++__SYSCALL(152, sys_mlockall)
++__SYSCALL(153, sys_munlockall)
++__SYSCALL(154, sys_sched_setparam)
++__SYSCALL(155, sys_sched_getparam)
++__SYSCALL(156, sys_sched_setscheduler)
++__SYSCALL(157, sys_sched_getscheduler)
++__SYSCALL(158, sys_sched_yield)
++__SYSCALL(159, sys_sched_get_priority_max)
++__SYSCALL(160, sys_sched_get_priority_min)
++__SYSCALL(161, sys_sched_rr_get_interval_time32)
++__SYSCALL(162, sys_nanosleep_time32)
++__SYSCALL(163, sys_mremap)
++__SYSCALL(164, sys_setresuid16)
++__SYSCALL(165, sys_getresuid16)
++__SYSCALL(166, sys_ni_syscall)
++__SYSCALL(167, sys_ni_syscall)
++__SYSCALL(168, sys_poll)
++__SYSCALL(169, sys_ni_syscall)
++__SYSCALL(170, sys_setresgid16)
++__SYSCALL(171, sys_getresgid16)
++__SYSCALL(172, sys_prctl)
++__SYSCALL(173, sys_rt_sigreturn_wrapper)
++__SYSCALL(174, sys_rt_sigaction)
++__SYSCALL(175, sys_rt_sigprocmask)
++__SYSCALL(176, sys_rt_sigpending)
++__SYSCALL(177, sys_rt_sigtimedwait_time32)
++__SYSCALL(178, sys_rt_sigqueueinfo)
++__SYSCALL(179, sys_rt_sigsuspend)
++__SYSCALL_WITH_COMPAT(180, sys_pread64, sys_oabi_pread64)
++__SYSCALL_WITH_COMPAT(181, sys_pwrite64, sys_oabi_pwrite64)
++__SYSCALL(182, sys_chown16)
++__SYSCALL(183, sys_getcwd)
++__SYSCALL(184, sys_capget)
++__SYSCALL(185, sys_capset)
++__SYSCALL(186, sys_sigaltstack)
++__SYSCALL(187, sys_sendfile)
++__SYSCALL(188, sys_ni_syscall)
++__SYSCALL(189, sys_ni_syscall)
++__SYSCALL(190, sys_vfork)
++__SYSCALL(191, sys_getrlimit)
++__SYSCALL(192, sys_mmap2)
++__SYSCALL_WITH_COMPAT(193, sys_truncate64, sys_oabi_truncate64)
++__SYSCALL_WITH_COMPAT(194, sys_ftruncate64, sys_oabi_ftruncate64)
++__SYSCALL_WITH_COMPAT(195, sys_stat64, sys_oabi_stat64)
++__SYSCALL_WITH_COMPAT(196, sys_lstat64, sys_oabi_lstat64)
++__SYSCALL_WITH_COMPAT(197, sys_fstat64, sys_oabi_fstat64)
++__SYSCALL(198, sys_lchown)
++__SYSCALL(199, sys_getuid)
++__SYSCALL(200, sys_getgid)
++__SYSCALL(201, sys_geteuid)
++__SYSCALL(202, sys_getegid)
++__SYSCALL(203, sys_setreuid)
++__SYSCALL(204, sys_setregid)
++__SYSCALL(205, sys_getgroups)
++__SYSCALL(206, sys_setgroups)
++__SYSCALL(207, sys_fchown)
++__SYSCALL(208, sys_setresuid)
++__SYSCALL(209, sys_getresuid)
++__SYSCALL(210, sys_setresgid)
++__SYSCALL(211, sys_getresgid)
++__SYSCALL(212, sys_chown)
++__SYSCALL(213, sys_setuid)
++__SYSCALL(214, sys_setgid)
++__SYSCALL(215, sys_setfsuid)
++__SYSCALL(216, sys_setfsgid)
++__SYSCALL(217, sys_getdents64)
++__SYSCALL(218, sys_pivot_root)
++__SYSCALL(219, sys_mincore)
++__SYSCALL(220, sys_madvise)
++__SYSCALL_WITH_COMPAT(221, sys_fcntl64, sys_oabi_fcntl64)
++__SYSCALL(222, sys_ni_syscall)
++__SYSCALL(223, sys_ni_syscall)
++__SYSCALL(224, sys_gettid)
++__SYSCALL_WITH_COMPAT(225, sys_readahead, sys_oabi_readahead)
++__SYSCALL(226, sys_setxattr)
++__SYSCALL(227, sys_lsetxattr)
++__SYSCALL(228, sys_fsetxattr)
++__SYSCALL(229, sys_getxattr)
++__SYSCALL(230, sys_lgetxattr)
++__SYSCALL(231, sys_fgetxattr)
++__SYSCALL(232, sys_listxattr)
++__SYSCALL(233, sys_llistxattr)
++__SYSCALL(234, sys_flistxattr)
++__SYSCALL(235, sys_removexattr)
++__SYSCALL(236, sys_lremovexattr)
++__SYSCALL(237, sys_fremovexattr)
++__SYSCALL(238, sys_tkill)
++__SYSCALL(239, sys_sendfile64)
++__SYSCALL(240, sys_futex_time32)
++__SYSCALL(241, sys_sched_setaffinity)
++__SYSCALL(242, sys_sched_getaffinity)
++__SYSCALL(243, sys_io_setup)
++__SYSCALL(244, sys_io_destroy)
++__SYSCALL(245, sys_io_getevents_time32)
++__SYSCALL(246, sys_io_submit)
++__SYSCALL(247, sys_io_cancel)
++__SYSCALL(248, sys_exit_group)
++__SYSCALL(249, sys_ni_syscall)
++__SYSCALL(250, sys_epoll_create)
++__SYSCALL_WITH_COMPAT(251, sys_epoll_ctl, sys_oabi_epoll_ctl)
++__SYSCALL(252, sys_epoll_wait)
++__SYSCALL(253, sys_remap_file_pages)
++__SYSCALL(254, sys_ni_syscall)
++__SYSCALL(255, sys_ni_syscall)
++__SYSCALL(256, sys_set_tid_address)
++__SYSCALL(257, sys_timer_create)
++__SYSCALL(258, sys_timer_settime32)
++__SYSCALL(259, sys_timer_gettime32)
++__SYSCALL(260, sys_timer_getoverrun)
++__SYSCALL(261, sys_timer_delete)
++__SYSCALL(262, sys_clock_settime32)
++__SYSCALL(263, sys_clock_gettime32)
++__SYSCALL(264, sys_clock_getres_time32)
++__SYSCALL(265, sys_clock_nanosleep_time32)
++__SYSCALL(266, sys_statfs64_wrapper)
++__SYSCALL(267, sys_fstatfs64_wrapper)
++__SYSCALL(268, sys_tgkill)
++__SYSCALL(269, sys_utimes_time32)
++__SYSCALL(270, sys_arm_fadvise64_64)
++__SYSCALL(271, sys_pciconfig_iobase)
++__SYSCALL(272, sys_pciconfig_read)
++__SYSCALL(273, sys_pciconfig_write)
++__SYSCALL(274, sys_mq_open)
++__SYSCALL(275, sys_mq_unlink)
++__SYSCALL(276, sys_mq_timedsend_time32)
++__SYSCALL(277, sys_mq_timedreceive_time32)
++__SYSCALL(278, sys_mq_notify)
++__SYSCALL(279, sys_mq_getsetattr)
++__SYSCALL(280, sys_waitid)
++__SYSCALL(281, sys_socket)
++__SYSCALL_WITH_COMPAT(282, sys_bind, sys_oabi_bind)
++__SYSCALL_WITH_COMPAT(283, sys_connect, sys_oabi_connect)
++__SYSCALL(284, sys_listen)
++__SYSCALL(285, sys_accept)
++__SYSCALL(286, sys_getsockname)
++__SYSCALL(287, sys_getpeername)
++__SYSCALL(288, sys_socketpair)
++__SYSCALL(289, sys_send)
++__SYSCALL_WITH_COMPAT(290, sys_sendto, sys_oabi_sendto)
++__SYSCALL(291, sys_recv)
++__SYSCALL(292, sys_recvfrom)
++__SYSCALL(293, sys_shutdown)
++__SYSCALL(294, sys_setsockopt)
++__SYSCALL(295, sys_getsockopt)
++__SYSCALL_WITH_COMPAT(296, sys_sendmsg, sys_oabi_sendmsg)
++__SYSCALL(297, sys_recvmsg)
++__SYSCALL_WITH_COMPAT(298, sys_semop, sys_oabi_semop)
++__SYSCALL(299, sys_semget)
++__SYSCALL(300, sys_old_semctl)
++__SYSCALL(301, sys_msgsnd)
++__SYSCALL(302, sys_msgrcv)
++__SYSCALL(303, sys_msgget)
++__SYSCALL(304, sys_old_msgctl)
++__SYSCALL(305, sys_shmat)
++__SYSCALL(306, sys_shmdt)
++__SYSCALL(307, sys_shmget)
++__SYSCALL(308, sys_old_shmctl)
++__SYSCALL(309, sys_add_key)
++__SYSCALL(310, sys_request_key)
++__SYSCALL(311, sys_keyctl)
++__SYSCALL_WITH_COMPAT(312, sys_semtimedop_time32, sys_oabi_semtimedop)
++__SYSCALL(313, sys_ni_syscall)
++__SYSCALL(314, sys_ioprio_set)
++__SYSCALL(315, sys_ioprio_get)
++__SYSCALL(316, sys_inotify_init)
++__SYSCALL(317, sys_inotify_add_watch)
++__SYSCALL(318, sys_inotify_rm_watch)
++__SYSCALL(319, sys_mbind)
++__SYSCALL(320, sys_get_mempolicy)
++__SYSCALL(321, sys_set_mempolicy)
++__SYSCALL(322, sys_openat)
++__SYSCALL(323, sys_mkdirat)
++__SYSCALL(324, sys_mknodat)
++__SYSCALL(325, sys_fchownat)
++__SYSCALL(326, sys_futimesat_time32)
++__SYSCALL_WITH_COMPAT(327, sys_fstatat64, sys_oabi_fstatat64)
++__SYSCALL(328, sys_unlinkat)
++__SYSCALL(329, sys_renameat)
++__SYSCALL(330, sys_linkat)
++__SYSCALL(331, sys_symlinkat)
++__SYSCALL(332, sys_readlinkat)
++__SYSCALL(333, sys_fchmodat)
++__SYSCALL(334, sys_faccessat)
++__SYSCALL(335, sys_pselect6_time32)
++__SYSCALL(336, sys_ppoll_time32)
++__SYSCALL(337, sys_unshare)
++__SYSCALL(338, sys_set_robust_list)
++__SYSCALL(339, sys_get_robust_list)
++__SYSCALL(340, sys_splice)
++__SYSCALL(341, sys_sync_file_range2)
++__SYSCALL(342, sys_tee)
++__SYSCALL(343, sys_vmsplice)
++__SYSCALL(344, sys_move_pages)
++__SYSCALL(345, sys_getcpu)
++__SYSCALL(346, sys_epoll_pwait)
++__SYSCALL(347, sys_kexec_load)
++__SYSCALL(348, sys_utimensat_time32)
++__SYSCALL(349, sys_signalfd)
++__SYSCALL(350, sys_timerfd_create)
++__SYSCALL(351, sys_eventfd)
++__SYSCALL(352, sys_fallocate)
++__SYSCALL(353, sys_timerfd_settime32)
++__SYSCALL(354, sys_timerfd_gettime32)
++__SYSCALL(355, sys_signalfd4)
++__SYSCALL(356, sys_eventfd2)
++__SYSCALL(357, sys_epoll_create1)
++__SYSCALL(358, sys_dup3)
++__SYSCALL(359, sys_pipe2)
++__SYSCALL(360, sys_inotify_init1)
++__SYSCALL(361, sys_preadv)
++__SYSCALL(362, sys_pwritev)
++__SYSCALL(363, sys_rt_tgsigqueueinfo)
++__SYSCALL(364, sys_perf_event_open)
++__SYSCALL(365, sys_recvmmsg_time32)
++__SYSCALL(366, sys_accept4)
++__SYSCALL(367, sys_fanotify_init)
++__SYSCALL(368, sys_fanotify_mark)
++__SYSCALL(369, sys_prlimit64)
++__SYSCALL(370, sys_name_to_handle_at)
++__SYSCALL(371, sys_open_by_handle_at)
++__SYSCALL(372, sys_clock_adjtime32)
++__SYSCALL(373, sys_syncfs)
++__SYSCALL(374, sys_sendmmsg)
++__SYSCALL(375, sys_setns)
++__SYSCALL(376, sys_process_vm_readv)
++__SYSCALL(377, sys_process_vm_writev)
++__SYSCALL(378, sys_kcmp)
++__SYSCALL(379, sys_finit_module)
++__SYSCALL(380, sys_sched_setattr)
++__SYSCALL(381, sys_sched_getattr)
++__SYSCALL(382, sys_renameat2)
++__SYSCALL(383, sys_seccomp)
++__SYSCALL(384, sys_getrandom)
++__SYSCALL(385, sys_memfd_create)
++__SYSCALL(386, sys_bpf)
++__SYSCALL(387, sys_execveat)
++__SYSCALL(388, sys_userfaultfd)
++__SYSCALL(389, sys_membarrier)
++__SYSCALL(390, sys_mlock2)
++__SYSCALL(391, sys_copy_file_range)
++__SYSCALL(392, sys_preadv2)
++__SYSCALL(393, sys_pwritev2)
++__SYSCALL(394, sys_pkey_mprotect)
++__SYSCALL(395, sys_pkey_alloc)
++__SYSCALL(396, sys_pkey_free)
++__SYSCALL(397, sys_statx)
++__SYSCALL(398, sys_rseq)
++__SYSCALL(399, sys_io_pgetevents_time32)
++__SYSCALL(400, sys_migrate_pages)
++__SYSCALL(401, sys_kexec_file_load)
++__SYSCALL(402, sys_ni_syscall)
++__SYSCALL(403, sys_clock_gettime)
++__SYSCALL(404, sys_clock_settime)
++__SYSCALL(405, sys_clock_adjtime)
++__SYSCALL(406, sys_clock_getres)
++__SYSCALL(407, sys_clock_nanosleep)
++__SYSCALL(408, sys_timer_gettime)
++__SYSCALL(409, sys_timer_settime)
++__SYSCALL(410, sys_timerfd_gettime)
++__SYSCALL(411, sys_timerfd_settime)
++__SYSCALL(412, sys_utimensat)
++__SYSCALL(413, sys_pselect6)
++__SYSCALL(414, sys_ppoll)
++__SYSCALL(415, sys_ni_syscall)
++__SYSCALL(416, sys_io_pgetevents)
++__SYSCALL(417, sys_recvmmsg)
++__SYSCALL(418, sys_mq_timedsend)
++__SYSCALL(419, sys_mq_timedreceive)
++__SYSCALL(420, sys_semtimedop)
++__SYSCALL(421, sys_rt_sigtimedwait)
++__SYSCALL(422, sys_futex)
++__SYSCALL(423, sys_sched_rr_get_interval)
++__SYSCALL(424, sys_pidfd_send_signal)
++__SYSCALL(425, sys_io_uring_setup)
++__SYSCALL(426, sys_io_uring_enter)
++__SYSCALL(427, sys_io_uring_register)
++__SYSCALL(428, sys_open_tree)
++__SYSCALL(429, sys_move_mount)
++__SYSCALL(430, sys_fsopen)
++__SYSCALL(431, sys_fsconfig)
++__SYSCALL(432, sys_fsmount)
++__SYSCALL(433, sys_fspick)
++__SYSCALL(434, sys_pidfd_open)
++__SYSCALL(435, sys_clone3)
++__SYSCALL(436, sys_close_range)
++__SYSCALL(437, sys_openat2)
++__SYSCALL(438, sys_pidfd_getfd)
++__SYSCALL(439, sys_faccessat2)
++__SYSCALL(440, sys_process_madvise)
++__SYSCALL(441, sys_epoll_pwait2)
++__SYSCALL(442, sys_mount_setattr)
++__SYSCALL(443, sys_quotactl_fd)
++__SYSCALL(444, sys_landlock_create_ruleset)
++__SYSCALL(445, sys_landlock_add_rule)
++__SYSCALL(446, sys_landlock_restrict_self)
++__SYSCALL(447, sys_ni_syscall)
++__SYSCALL(448, sys_process_mrelease)
++__SYSCALL(449, sys_futex_waitv)
++__SYSCALL(450, sys_set_mempolicy_home_node)
++__SYSCALL(451, sys_cachestat)
++__SYSCALL(452, sys_fchmodat2)
++__SYSCALL(453, sys_map_shadow_stack)
++__SYSCALL(454, sys_futex_wake)
++__SYSCALL(455, sys_futex_wait)
++__SYSCALL(456, sys_futex_requeue)
++__SYSCALL(457, sys_statmount)
++__SYSCALL(458, sys_listmount)
++__SYSCALL(459, sys_lsm_get_self_attr)
++__SYSCALL(460, sys_lsm_set_self_attr)
++__SYSCALL(461, sys_lsm_list_modules)
++__SYSCALL(462, sys_mseal)
++__SYSCALL(463, sys_setxattrat)
++__SYSCALL(464, sys_getxattrat)
++__SYSCALL(465, sys_listxattrat)
++__SYSCALL(466, sys_removexattrat)
++__SYSCALL(467, sys_open_tree_attr)
++__SYSCALL(468, sys_file_getattr)
++__SYSCALL(469, sys_file_setattr)
++__SYSCALL(470, sys_listns)
++__SYSCALL(471, sys_rseq_slice_yield)
+diff --git a/arch/arm/um/asm/unistd-nr.h b/arch/arm/um/asm/unistd-nr.h
+new file mode 100644
+index 000000000..1a298d2de
+--- /dev/null
++++ b/arch/arm/um/asm/unistd-nr.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Committed UML copy of arch/arm/include/generated/asm/unistd-nr.h.
++ *
++ * It is generated by arch/arm/tools/syscallnr.sh from arch/arm/tools/syscall.tbl
++ * and committed here because the UML flow never runs arch/arm's archprepare
++ * kapi step (arch/um overrides it to build user_constants.h only), and UML
++ * cannot modify the parent's arch/arm/include/asm/Kbuild to plug one in.
++ *
++ * Regenerate with:
++ * 	sh arch/arm/tools/syscallnr.sh arch/arm/tools/syscall.tbl unistd-nr.h
++ * whenever the parent's syscall table changes.
++ */
++#ifndef _ASM_ARM_UNISTD_NR_H
++#define _ASM_ARM_UNISTD_NR_H 1
++
++/*
++ * This needs to be greater than __NR_last_syscall+1 in order to account
++ * for the padding in the syscall table.
++ */
++
++/* aligned to 4 */
++#define __NR_syscalls 472
++
++#endif /* _ASM_ARM_UNISTD_NR_H */
+diff --git a/arch/arm/um/asm/vm-flags.h b/arch/arm/um/asm/vm-flags.h
+new file mode 100644
+index 000000000..c0056a9fe
+--- /dev/null
++++ b/arch/arm/um/asm/vm-flags.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __VM_FLAGS_ARM_H
++#define __VM_FLAGS_ARM_H
++
++/*
++ * The parent arch/arm has no asm/vm-flags.h, so without this the generic
++ * default at include/linux/mm.h stands: VMA_DATA_DEFAULT_FLAGS is
++ * VMA_DATA_FLAGS_EXEC -- data mappings are unconditionally executable.
++ *
++ * Every UML subarch overrides it to VMA_DATA_FLAGS_TSK_EXEC (the x86 and
++ * arm64 UGL ports both do): an executable mapping then comes from the
++ * task's personality rather than from the data flag itself, which matches
++ * what the guest's own mprotect() and personality calls promise. Leaving
++ * the generic default would hand every data mapping -- every guest stack in
++ * particular -- an executable bit that no UML subarch deliberately grants.
++ */
++#define VMA_DATA_DEFAULT_FLAGS	VMA_DATA_FLAGS_TSK_EXEC
++
++#endif /* __VM_FLAGS_ARM_H */
+diff --git a/arch/arm/um/bionic-syms.redef b/arch/arm/um/bionic-syms.redef
+new file mode 100644
+index 000000000..c4a0aeec9
+--- /dev/null
++++ b/arch/arm/um/bionic-syms.redef
+@@ -0,0 +1,68 @@
++# Kernel symbols renamed when linking against bionic.
++#
++# These are names the kernel defines and bionic's libc also references. In a
++# static link the linker is happy to satisfy libc's reference with the kernel's
++# definition, and the result is libc calling into the kernel: sched_getaffinity
++# was the one that showed the shape of the problem, with bionic's start-up
++# reaching the kernel's implementation and dereferencing a task_struct that does
++# not exist yet. Nothing warns -- libc only references these, so there is no
++# duplicate-definition error to notice.
++#
++# Renaming happens on the object files rather than with -D. The preprocessor
++# does not know the difference between a function name and a token being pasted
++# into an identifier: -Dsnprintf=kernel_snprintf also rewrites the bare
++# "snprintf" inside __BPF_FUNC_MAPPER, so kernel/bpf/disasm.c ends up asking for
++# BPF_FUNC_kernel_snprintf and CONFIG_BPF_SYSCALL will not build. objcopy
++# renames definitions and references together and cannot make that mistake.
++#
++# This file is no longer the whole answer. scripts/link-vmlinux.sh computes the
++# same intersection against the libc actually being linked and adds whatever it
++# finds that is not already here, because the set depends on the libc and not on
++# this tree: NDK r27c's bionic has no sched_setattr, newer ones do, and a list
++# fixed at the version I happened to build with shipped
++#
++#	ld.lld: error: duplicate symbol: sched_setattr
++#	ld.lld: error: duplicate symbol: sync_file_range
++#
++# to anyone using a different NDK. What remains here is the explanation, and the
++# fallback for a build where nm or libc.a cannot be found.
++#
++# Derived, not guessed:
++#   llvm-nm --undefined-only libc.a                > A
++#   llvm-nm --defined-only --extern-only vmlinux.a > B
++#   comm -12 A B
++#
++# and the same again with --defined-only on both sides, which is the set that
++# fails loudly as a duplicate symbol rather than quietly as a bad binding.
++snprintf kernel_snprintf
++vsnprintf kernel_vsnprintf
++sprintf kernel_sprintf
++vsprintf kernel_vsprintf
++sscanf kernel_sscanf
++vsscanf kernel_vsscanf
++stpcpy kernel_stpcpy
++getrusage kernel_getrusage
++sem_init kernel_sem_init
++timer_delete kernel_timer_delete
++sched_setaffinity kernel_sched_setaffinity
++sched_getaffinity kernel_sched_getaffinity
++sched_setscheduler kernel_sched_setscheduler
++abort kernel_abort
++strcasecmp kernel_strcasecmp
++strncasecmp kernel_strncasecmp
++strcspn kernel_strcspn
++strlcat kernel_strlcat
++strpbrk kernel_strpbrk
++strsep kernel_strsep
++strstr kernel_strstr
++
++# Defined by both sides, so these are the ones that stop the link outright.
++# A rename for a name the kernel does not define is a no-op, so listing one
++# that a given config leaves out costs nothing.
++bsearch kernel_bsearch
++strcat kernel_strcat
++strncat kernel_strncat
++strspn kernel_strspn
++sync_file_range kernel_sync_file_range
++sched_setattr kernel_sched_setattr
++sched_getattr kernel_sched_getattr
+diff --git a/arch/arm/um/bugs.c b/arch/arm/um/bugs.c
+new file mode 100644
+index 000000000..87112876b
+--- /dev/null
++++ b/arch/arm/um/bugs.c
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Host-side sanity checks for ARCH=um SUBARCH=arm.
++ */
++#include <arch.h>
++#include <sysdep/ptrace.h>
++
++void arch_check_bugs(void)
++{
++	/*
++	 * Nothing to check. x86 historically probed for a broken SEP/sysenter
++	 * host; arm has a single svc #0 path and no equivalent to detect.
++	 * The absence of PTRACE_SYSEMU on arm hosts is handled, not a bug:
++	 * start_up.c falls back to PTRACE_SYSCALL with syscall cancellation
++	 * via r7, which is what an arm32 host actually offers.
++	 */
++}
++
++void arch_examine_signal(int sig, struct uml_pt_regs *regs)
++{
++	/*
++	 * x86 uses this to recognise a SIGTRAP that is really a hardware
++	 * breakpoint. UML/arm does not implement hardware breakpoints or
++	 * watchpoints for the guest, so every signal reaching here is what it
++	 * appears to be.
++	 */
++}
+diff --git a/arch/arm/um/cpuinfo.c b/arch/arm/um/cpuinfo.c
+new file mode 100644
+index 000000000..20dd791c3
+--- /dev/null
++++ b/arch/arm/um/cpuinfo.c
+@@ -0,0 +1,174 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * arm32 subarch half of UML's /proc/cpuinfo.
++ *
++ * There is no CPUID bitmap to mirror here. What a UML/arm guest can honestly
++ * claim is what the host actually granted the UML process:
++ *
++ *   - AT_HWCAP / AT_HWCAP2 from the auxiliary vector, which is what guest
++ *     userspace (glibc's ifunc resolvers, OpenSSL, ...) really consults;
++ *
++ * unlike x86, arm keeps one 32-bit hwcap word and a small hwcap2 word. The
++ * host kernel fills them from its own hardware probing, so forwarding them
++ * is an honest statement about the CPU the guest actually runs on.
++ *
++ * The names emitted on the "features" line are arm32's own spellings, in the
++ * order /proc/cpuinfo convention gives them. Some guest tools (OpenSSL) parse
++ * that line instead of reading auxv, so the two must say the same thing: the
++ * list is derived from the same mask as the auxv values below.
++ */
++#include <linux/array_size.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/seq_file.h>
++#include <linux/string.h>
++
++#include <arch.h>
++#include <uapi/asm/hwcap.h>
++
++extern long elf_aux_hwcap;
++extern long elf_aux_hwcap2;
++extern unsigned long host_fp_size;
++
++/*
++ * What the guest is told it can do.
++ *
++ * UML must not simply forward the host's AT_HWCAP bit for bit. glibc's ifunc
++ * resolvers and OpenSSL pick implementation code from these bits, so
++ * advertising a feature obliges UML to preserve whatever architectural state
++ * that feature uses -- across syscalls, task switches and, above all, signal
++ * delivery.
++ *
++ * The integer-only ISA extensions (swp, half, edsp, idiv, ...) carry no
++ * register state, and the FP/Neon family is saved and restored by UML:
++ * host fp state lives in the task's regs->fp payload, and a vfp_sigframe is
++ * written into ucontext.uc_regspace on every signal (see signal.c). So the
++ * default here is to forward the host's claim, and what gets masked out is:
++ *
++ *   HWCAP_FPA      Dead coprocessor. UML never saves FPA state; a host that
++ *                  still claims it is pre-2000 silicon nothing here targets.
++ *   HWCAP_IWMMXT   UML does not write an iwmmxt record into uc_regspace, so
++ *                  iwmmxt-using guest code would lose state at signals.
++ *                  Mask it out; a library is no better off without it.
++ *   HWCAP_CRUNCH   Dead coprocessor, same reasoning as FPA.
++ *
++ * The VFP/Neon family is additionally gated on host_fp_size: that is the
++ * result of the PTRACE_GETVFPREGS probe in arch_init_registers(), and it is
++ * the authoritative statement that UML can actually see and save the host's
++ * fp state. A host whose VFP UML cannot reach must not be advertised to the
++ * guest as having FP, no matter what its hwcap word says.
++ *
++ * HWCAP2 is forwarded whole: every one of its bits (aes, pmull, sha1, sha2,
++ * crc32, sb, ssbs) is a new instruction stream over registers UML already
++ * saves, or a PSTATE hint.
++ */
++#define UM_ARM_FP_HWCAP_BITS		\
++	(HWCAP_VFP | HWCAP_VFPv3 | HWCAP_VFPv3D16 | HWCAP_NEON |	\
++	 HWCAP_VFPv4 | HWCAP_VFPD32 | HWCAP_FPHP | HWCAP_ASIMDHP |	\
++	 HWCAP_ASIMDDP | HWCAP_ASIMDFHM | HWCAP_ASIMDBF16 | HWCAP_I8MM)
++
++#define UM_ARM_HWCAP_MASK	(~(HWCAP_FPA | HWCAP_IWMMXT | HWCAP_CRUNCH))
++
++unsigned long um_arm_elf_hwcap;
++unsigned long um_arm_elf_hwcap2;
++
++static int __init um_arm_init_hwcap(void)
++{
++	unsigned long host = (unsigned long)elf_aux_hwcap;
++	unsigned long host2 = (unsigned long)elf_aux_hwcap2;
++	unsigned long fp = host_fp_size ? UM_ARM_FP_HWCAP_BITS : 0;
++
++	um_arm_elf_hwcap = (host & UM_ARM_HWCAP_MASK) | fp;
++	um_arm_elf_hwcap2 = host2;
++
++	pr_info("arm: hwcap host 0x%lx/0x%lx -> guest 0x%lx/0x%lx\n",
++		host, host2, um_arm_elf_hwcap, um_arm_elf_hwcap2);
++
++	return 0;
++}
++/*
++ * early_initcall: ELF_HWCAP is read while building the auxv of the first user
++ * process, so this has to have run before init is exec'd. host_fp_size is set
++ * even earlier, by arch_init_registers() from start_up.c.
++ */
++early_initcall(um_arm_init_hwcap);
++
++/*
++ * Names for the bits we may advertise, in the spelling arm32's own
++ * /proc/cpuinfo uses.
++ */
++static const struct {
++	unsigned long bit;
++	const char *name;
++} um_arm_hwcap_names[] = {
++	{ HWCAP_SWP,		"swp" },
++	{ HWCAP_HALF,		"half" },
++	{ HWCAP_THUMB,		"thumb" },
++	{ HWCAP_FAST_MULT,	"fastmult" },
++	{ HWCAP_EDSP,		"edsp" },
++	{ HWCAP_JAVA,		"java" },
++	{ HWCAP_THUMBEE,	"thumbee" },
++	{ HWCAP_NEON,		"neon" },
++	{ HWCAP_VFPv3,		"vfpv3" },
++	{ HWCAP_VFPv3D16,	"vfpv3-d16" },
++	{ HWCAP_TLS,		"tls" },
++	{ HWCAP_VFP,		"vfp" },
++	{ HWCAP_VFPv4,		"vfpv4" },
++	{ HWCAP_IDIVA,		"idiva" },
++	{ HWCAP_IDIVT,		"idivt" },
++	{ HWCAP_VFPD32,		"vfpd32" },
++	{ HWCAP_LPAE,		"lpae" },
++	{ HWCAP_EVTSTRM,	"evtstrm" },
++	{ HWCAP_FPHP,		"fphp" },
++	{ HWCAP_ASIMDHP,	"asimdhp" },
++	{ HWCAP_ASIMDDP,	"asimddp" },
++	{ HWCAP_ASIMDFHM,	"asimdfhm" },
++	{ HWCAP_ASIMDBF16,	"asimdbf16" },
++	{ HWCAP_I8MM,		"i8mm" },
++};
++
++static const struct {
++	unsigned long bit;
++	const char *name;
++} um_arm_hwcap2_names[] = {
++	{ HWCAP2_AES,		"aes" },
++	{ HWCAP2_PMULL,		"pmull" },
++	{ HWCAP2_SHA1,		"sha1" },
++	{ HWCAP2_SHA2,		"sha2" },
++	{ HWCAP2_CRC32,		"crc32" },
++	{ HWCAP2_SB,		"sb" },
++	{ HWCAP2_SSBS,		"ssbs" },
++};
++
++void arch_show_cpuinfo(struct seq_file *m)
++{
++	unsigned int i;
++
++	/*
++	 * "features" is the arm32 spelling; guest userspace and OpenSSL look
++	 * for that key, not for x86's "flags" or arm64's "Features".
++	 */
++	seq_puts(m, "features\t: ");
++	for (i = 0; i < ARRAY_SIZE(um_arm_hwcap_names); i++)
++		if (um_arm_elf_hwcap & um_arm_hwcap_names[i].bit)
++			seq_printf(m, "%s ", um_arm_hwcap_names[i].name);
++	seq_puts(m, "\n");
++
++	seq_printf(m, "hwcap\t\t: 0x%lx\n", um_arm_elf_hwcap);
++	seq_printf(m, "hwcap2\t\t: 0x%lx\n", um_arm_elf_hwcap2);
++	seq_printf(m, "host hwcap\t: 0x%lx/0x%lx\n",
++		   (unsigned long)elf_aux_hwcap,
++		   (unsigned long)elf_aux_hwcap2);
++}
++
++int arch_parse_host_cpu_flags(char *line)
++{
++	/*
++	 * Record the auxv values on the first call; they come from the host
++	 * kernel directly and are the authoritative answer, independent of how
++	 * /proc/cpuinfo happens to be formatted. arm32's struct cpuinfo_arm
++	 * has no hwcap storage of its own, so there is nothing to cache in
++	 * boot_cpu_data the way the arm64 version does.
++	 */
++	return 1;
++}
+diff --git a/arch/arm/um/delay.c b/arch/arm/um/delay.c
+new file mode 100644
+index 000000000..b5d562c37
+--- /dev/null
++++ b/arch/arm/um/delay.c
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Busy-wait loops for ARCH=um SUBARCH=arm.
++ */
++#include <linux/export.h>
++#include <linux/kernel.h>
++#include <linux/delay.h>
++#include <asm/param.h>
++
++/*
++ * A calibrated spin. "yield" is a hint the core may ignore, so the loop is a
++ * real dependent-subtract chain rather than relying on the hint for timing --
++ * exactly like the aligned jump chain x86 uses. ARM state (the UML binary is
++ * compiled with -march=armv7, no thumb) means fixed-width 32-bit instructions,
++ * so no alignment tricks are needed.
++ */
++void __delay(unsigned long loops)
++{
++	unsigned long tmp = loops;
++
++	if (!tmp)
++		return;
++
++	__asm__ __volatile__(
++		"1:	subs	%0, %0, #1\n"
++		"	bne	1b\n"
++		: "+r" (tmp)
++		:
++		: "cc");
++}
++EXPORT_SYMBOL(__delay);
++
++/*
++ * xloops is a 32.32 fixed-point count of jiffies-worth of loops. The kernel's
++ * loops_per_jiffy is a plain unsigned long here, so a 64-bit intermediate does
++ * the multiply the way x86 UML does with a 32x32->64 mull.
++ */
++inline void __const_udelay(unsigned long xloops)
++{
++	unsigned long loops;
++
++	loops = ((unsigned long long)xloops * loops_per_jiffy * HZ) >> 32;
++
++	__delay(++loops);
++}
++EXPORT_SYMBOL(__const_udelay);
++
++void __udelay(unsigned long usecs)
++{
++	__const_udelay(usecs * 0x000010c7); /* 2**32 / 1000000 (rounded up) */
++}
++EXPORT_SYMBOL(__udelay);
++
++void __ndelay(unsigned long nsecs)
++{
++	__const_udelay(nsecs * 0x00005); /* 2**32 / 1000000000 (rounded up) */
++}
++EXPORT_SYMBOL(__ndelay);
+diff --git a/arch/arm/um/fault.c b/arch/arm/um/fault.c
+new file mode 100644
+index 000000000..e16bf0605
+--- /dev/null
++++ b/arch/arm/um/fault.c
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Exception-table fixup for ARCH=um SUBARCH=arm.
++ */
++#include <arch.h>
++#include <sysdep/ptrace.h>
++
++/*
++ * Declared here rather than included, because this file is built with
++ * USER_CFLAGS against host headers and cannot see the kernel's definitions.
++ * Mirrors arch/x86/um/fault.c.
++ */
++struct exception_table_entry {
++	unsigned long insn;
++	unsigned long fixup;
++};
++
++const struct exception_table_entry *search_exception_tables(unsigned long add);
++
++int arch_fixup(unsigned long address, struct uml_pt_regs *regs)
++{
++	const struct exception_table_entry *fixup;
++
++	fixup = search_exception_tables(address);
++	if (fixup) {
++		UPT_IP(regs) = fixup->fixup;
++		return 1;
++	}
++	return 0;
++}
+diff --git a/arch/arm/um/mem.c b/arch/arm/um/mem.c
+new file mode 100644
+index 000000000..d6af78cdb
+--- /dev/null
++++ b/arch/arm/um/mem.c
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/mm.h>
++#include <asm/elf.h>
++
++/*
++ * The x86 and arm64 subarchitectures have a vDSO mapping to name; the arm
++ * UGL binary has no vDSO at all, so there is nothing for /proc/<pid>/maps to
++ * show and the hook reports no name.
++ */
++const char *arch_vma_name(struct vm_area_struct *vma)
++{
++	return NULL;
++}
+diff --git a/arch/arm/um/os-Linux/Makefile b/arch/arm/um/os-Linux/Makefile
+new file mode 100644
+index 000000000..611e7b6c5
+--- /dev/null
++++ b/arch/arm/um/os-Linux/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0
++
++obj-y = registers.o mcontext.o
++
++USER_OBJS := $(obj-y)
++
++include $(srctree)/arch/um/scripts/Makefile.rules
+diff --git a/arch/arm/um/os-Linux/mcontext.c b/arch/arm/um/os-Linux/mcontext.c
+new file mode 100644
+index 000000000..925634950
+--- /dev/null
++++ b/arch/arm/um/os-Linux/mcontext.c
+@@ -0,0 +1,218 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * mcontext <-> uml_pt_regs conversion for ARCH=um SUBARCH=arm.
++ *
++ * This is host-side code: it manipulates the signal frame the *host* built for
++ * a stub process. On an arm host the mcontext is the named-field sigcontext --
++ * plain named members, no gregs[] array to index -- and the VFP state, where
++ * the host kernel has any, does not live in the mcontext at all: it is a
++ * magic-record chain in the ucontext's uc_regspace[] extension area, after
++ * the sigmask, so reaching it means stepping back to the parent ucontext
++ * first.
++ */
++#include <stddef.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <sys/ucontext.h>
++#include <sysdep/ptrace.h>
++#include <sysdep/mcontext.h>
++#include <sysdep/stub-data.h>
++#include <stub-data.h>
++#include <arch.h>
++
++void get_regs_from_mc(struct uml_pt_regs *regs, mcontext_t *mc)
++{
++	regs->gp[HOST_R0]  = mc->arm_r0;
++	regs->gp[HOST_R1]  = mc->arm_r1;
++	regs->gp[HOST_R2]  = mc->arm_r2;
++	regs->gp[HOST_R3]  = mc->arm_r3;
++	regs->gp[HOST_R4]  = mc->arm_r4;
++	regs->gp[HOST_R5]  = mc->arm_r5;
++	regs->gp[HOST_R6]  = mc->arm_r6;
++	regs->gp[HOST_R7]  = mc->arm_r7;
++	regs->gp[HOST_R8]  = mc->arm_r8;
++	regs->gp[HOST_R9]  = mc->arm_r9;
++	regs->gp[HOST_R10] = mc->arm_r10;
++	regs->gp[HOST_FP]  = mc->arm_fp;
++	regs->gp[HOST_IP]  = mc->arm_ip;
++	regs->gp[HOST_SP]  = mc->arm_sp;
++	regs->gp[HOST_LR]  = mc->arm_lr;
++	regs->gp[HOST_PC]  = mc->arm_pc;
++	regs->gp[HOST_CPSR] = mc->arm_cpsr;
++
++	/*
++	 * r7 holds the syscall number at the SVC that trapped into the
++	 * seccomp filter. Unlike the ptrace path there is no NT-style regset
++	 * to consult here -- the stub is stopped in its own SIGSYS handler,
++	 * not in a syscall-entry stop -- and at that point r7 is
++	 * authoritative. The original first argument is already a member of
++	 * the sigcontext, so it comes along with the copy above.
++	 */
++	regs->gp[HOST_SYSCALL_NR] = mc->arm_r7;
++	regs->gp[HOST_ORIG_R0] = mc->arm_r0;
++}
++
++void get_mc_from_regs(struct uml_pt_regs *regs, mcontext_t *mc,
++		      int single_stepping)
++{
++	mc->arm_r0  = regs->gp[HOST_R0];
++	mc->arm_r1  = regs->gp[HOST_R1];
++	mc->arm_r2  = regs->gp[HOST_R2];
++	mc->arm_r3  = regs->gp[HOST_R3];
++	mc->arm_r4  = regs->gp[HOST_R4];
++	mc->arm_r5  = regs->gp[HOST_R5];
++	mc->arm_r6  = regs->gp[HOST_R6];
++	mc->arm_r7  = regs->gp[HOST_R7];
++	mc->arm_r8  = regs->gp[HOST_R8];
++	mc->arm_r9  = regs->gp[HOST_R9];
++	mc->arm_r10 = regs->gp[HOST_R10];
++	mc->arm_fp  = regs->gp[HOST_FP];
++	mc->arm_ip  = regs->gp[HOST_IP];
++	mc->arm_sp  = regs->gp[HOST_SP];
++	mc->arm_lr  = regs->gp[HOST_LR];
++	mc->arm_pc  = regs->gp[HOST_PC];
++	mc->arm_cpsr = regs->gp[HOST_CPSR];
++
++	/*
++	 * single_stepping is ignored, and must be.
++	 *
++	 * x86 implements it here by setting EFLAGS.TF in the frame the stub
++	 * is about to sigreturn to. arm32's CPSR has no user-writable
++	 * single-step bit at all: the host does single-stepping through the
++	 * PTRACE_SINGLESTEP resume path, and the instruction state bits that
++	 * are writable (T) are not it. There is no way to arm a single step
++	 * from inside the stub.
++	 *
++	 * Single-stepping a guest therefore requires the ptrace path, where
++	 * PTRACE_SINGLESTEP asks the host kernel to do it. arch/um/kernel/ptrace.c
++	 * puts a task that wants single-stepping onto that path; nothing is
++	 * silently dropped here.
++	 */
++}
++
++void mc_set_rip(void *_mc, void *target)
++{
++	mcontext_t *mc = _mc;
++
++	mc->arm_pc = (unsigned long)target;
++}
++
++struct um_user_vfp {
++	unsigned long long fpregs[32];
++	unsigned long fpscr;
++};
++
++/*
++ * The VFP record, spelled out rather than taken from the host's
++ * <asm/sigcontext.h> so this file does not depend on which host headers
++ * happen to be installed. It matches struct vfp_sigframe in the arm kernel:
++ * the signal-frame ufp is the 264-byte form -- the 260-byte PTRACE
++ * GETVFPREGS/SETVFPREGS payload plus 4 bytes of trailing pad -- followed by
++ * the 12-byte user_vfp_exc, all padded out to a multiple of 8.
++ */
++struct um_vfp_sigframe {
++	unsigned long magic;
++	unsigned long size;
++	struct um_user_vfp ufp;
++	unsigned long fpexc;
++	unsigned long fpinst;
++	unsigned long fpinst2;
++} __attribute__((__aligned__(8)));
++
++/*
++ * Locate the VFP record in the ucontext's uc_regspace[] chain.
++ *
++ * The host kernel lays out one record per coprocessor it preserves, in a
++ * config-dependent order (an IWMMXT block may come first when the host has
++ * it), terminated by a zero. Bounded on both the individual record sizes
++ * and the buffer length: this walks a structure the guest process could have
++ * scribbled on.
++ */
++static struct um_vfp_sigframe *find_vfp(ucontext_t *uc)
++{
++	unsigned char *p = (unsigned char *)uc->uc_regspace;
++	unsigned long left = sizeof(uc->uc_regspace);
++
++	while (left >= sizeof(struct um_vfp_sigframe)) {
++		struct um_vfp_sigframe *h =
++			(struct um_vfp_sigframe *)p;
++
++		if (h->magic == 0 || h->size == 0)
++			return NULL;
++		if (h->size > left)
++			return NULL;
++		if (h->magic == UM_VFP_MAGIC && h->size >= sizeof(*h))
++			return h;
++		p += h->size;
++		left -= h->size;
++	}
++	return NULL;
++}
++
++int get_stub_state(struct uml_pt_regs *regs, struct stub_data *data,
++		   unsigned long *fp_size_out)
++{
++	struct um_vfp_sigframe *vfp;
++	mcontext_t *mcontext;
++	ucontext_t *uc;
++
++	/* mctx_offset is verified by wait_stub_done_seccomp */
++	mcontext = (void *)&data->sigstack[data->mctx_offset];
++
++	get_regs_from_mc(regs, mcontext);
++
++	/*
++	 * Guest TLS needs nothing here at all: R8 is a member of the
++	 * sigcontext, so the host put it in the frame and the copy above
++	 * picked it up. That is the difference from arm64, where TPIDR_EL0
++	 * is not in the mcontext and the stub had to capture it on the way in.
++	 */
++
++	if (host_fp_size) {
++		uc = (ucontext_t *)((char *)mcontext -
++				    offsetof(ucontext_t, uc_mcontext));
++		vfp = find_vfp(uc);
++		if (vfp)
++			memcpy(regs->fp, &vfp->ufp, host_fp_size);
++	}
++
++	if (fp_size_out)
++		*fp_size_out = host_fp_size;
++
++	return 0;
++}
++
++int set_stub_state(struct uml_pt_regs *regs, struct stub_data *data,
++		   int single_stepping)
++{
++	struct um_vfp_sigframe *vfp;
++	mcontext_t *mcontext;
++	ucontext_t *uc;
++
++	/* mctx_offset is verified by wait_stub_done_seccomp */
++	mcontext = (void *)&data->sigstack[data->mctx_offset];
++
++	if ((unsigned long)mcontext < (unsigned long)data->sigstack ||
++	    (unsigned long)mcontext >
++			(unsigned long)data->sigstack +
++			sizeof(data->sigstack) - sizeof(*mcontext))
++		return -EINVAL;
++
++	get_mc_from_regs(regs, mcontext, single_stepping);
++
++	if (host_fp_size) {
++		uc = (ucontext_t *)((char *)mcontext -
++				    offsetof(ucontext_t, uc_mcontext));
++		vfp = find_vfp(uc);
++		/*
++		 * The host built the frame, so the record is there when host
++		 * FP state exists at all. If it is not -- a malformed or a
++		 * host that dropped it -- the stub comes back with whatever
++		 * FP state it already had rather than being zeroed.
++		 */
++		if (vfp)
++			memcpy(&vfp->ufp, regs->fp, host_fp_size);
++	}
++
++	return 0;
++}
+diff --git a/arch/arm/um/os-Linux/registers.c b/arch/arm/um/os-Linux/registers.c
+new file mode 100644
+index 000000000..407fc49c6
+--- /dev/null
++++ b/arch/arm/um/os-Linux/registers.c
+@@ -0,0 +1,221 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Host register access for ARCH=um SUBARCH=arm.
++ *
++ * arm uses the classic PTRACE_GETREGS/PTRACE_SETREGS pair: one 72-byte
++ * struct user_regs_struct, read and written whole. Unlike arm64 there is no
++ * regset dance at all -- the register block is all the host ever exposes --
++ * and the VFP block, where the host has any, comes as a fixed 260-byte
++ * PTRACE_GETVFPREGS/SETVFPREGS payload.
++ */
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ptrace.h>
++#include <sys/mman.h>
++#include <linux/elf.h>
++#include <sysdep/archsetjmp.h>
++#include <sysdep/ptrace.h>
++#include <sysdep/ptrace_user.h>
++#include <registers.h>
++
++#ifndef ARM_VFPREGS_SIZE
++#define ARM_VFPREGS_SIZE	(32 * 8 + 4)
++#endif
++
++unsigned long host_fp_size;
++
++int get_fp_registers(int pid, unsigned long *regs)
++{
++	/*
++	 * The payload is ARM_VFPREGS_SIZE bytes, which is 65 x unsigned int
++	 * on this target and therefore packs exactly into the 65-word
++	 * unsigned long array UGL keeps in uml_pt_regs.fp.
++	 */
++	if (ptrace(PTRACE_GETVFPREGS, pid, NULL, regs) < 0)
++		return -errno;
++	return 0;
++}
++
++int put_fp_registers(int pid, unsigned long *regs)
++{
++	if (ptrace(PTRACE_SETVFPREGS, pid, NULL, regs) < 0)
++		return -errno;
++	return 0;
++}
++
++/*
++ * Read the guest's general-purpose registers.
++ *
++ * The whole 72-byte host regset fills slots 0..17 of gp[] one-to-one. The
++ * one slot above it is synthesised here:
++ *
++ *   HOST_SYSCALL_NR  the in-flight syscall number, copied from r7 while the
++ *                    stub is stopped for a syscall. UGL only inspects the
++ *                    registers on the syscall-stop paths, so r7 is the
++ *                    number there; at any other stop it would just be a
++ *                    scratch register, which is exactly why the value has to
++ *                    be captured into its own slot rather than read from r7
++ *                    later.
++ *
++ *   HOST_ORIG_R0     already in the buffer: the host kernel keeps the
++ *                    original first argument at ureg[17], unlike arm64
++ *                    where x0 had to be copied in from its current value.
++ */
++int get_host_regs(int pid, unsigned long *regs)
++{
++	if (ptrace(PTRACE_GETREGS, pid, NULL, regs) < 0)
++		return -errno;
++
++	regs[HOST_SYSCALL_NR] = regs[HOST_R7];
++
++	return 0;
++}
++
++/*
++ * Write the guest's general-purpose registers back.
++ *
++ * PTRACE_SETREGS takes the 72-byte regset only, so the synthesised slot
++ * above it is never pushed to the host, and that is deliberate: writing r7
++ * is how UML redirects the next svc, and UPT_RESTART_SYSCALL() already puts
++ * the number there through the ordinary slot.
++ *
++ * TLS needs no separate transfer unlike arm64: R8 is a member of the regset,
++ * so restoring the whole block restores it.
++ */
++int put_host_regs(int pid, unsigned long *regs)
++{
++	if (ptrace(PTRACE_SETREGS, pid, NULL, regs) < 0)
++		return -errno;
++	return 0;
++}
++
++/*
++ * Inspect and rewrite the syscall a stopped tracee is about to make.
++ */
++long ptrace_get_syscall_nr(int pid)
++{
++	/*
++	 * The number is r7, and at a syscall stop r7 is authoritative, so it
++	 * can be read out of the ordinary user area. Offsets are in bytes
++	 * into the 72-byte regset; ureg[7] is at 28.
++	 */
++	unsigned int nr;
++
++	if (ptrace(PTRACE_PEEKUSER, pid, 7 * sizeof(unsigned int), &nr) < 0) {
++		errno = EIO;
++		return -1;
++	}
++	return nr;
++}
++
++int ptrace_set_syscall_nr(int pid, long nr)
++{
++	unsigned long regs[UM_MAX_REG_NR];
++
++	/*
++	 * arm has no "run no syscall" number, but it has something better for
++	 * this purpose: the kernel's svc dispatcher returns -ENOSYS for a
++	 * number outside the table, so writing -1 into r7 cancels the call.
++	 */
++	if (nr < 0)
++		nr = -1;
++
++	if (get_host_regs(pid, regs) < 0)
++		return -errno;
++
++	regs[HOST_R7] = (unsigned long)nr;
++
++	if (put_host_regs(pid, regs) < 0)
++		return -errno;
++
++	return 0;
++}
++
++int ptrace_set_syscall_ret(int pid, long val)
++{
++	/*
++	 * The return value is just r0, but the host's PTRACE_PEEKUSER/POKEUSER
++	 * are word-granular, so read the block, patch the word and write it
++	 * back.
++	 */
++	unsigned long regs[UM_MAX_REG_NR];
++	int err;
++
++	err = get_host_regs(pid, regs);
++	if (err)
++		return err;
++
++	regs[HOST_R0] = (unsigned long)val;
++
++	err = put_host_regs(pid, regs);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++const char *ptrace_reg_name(int idx)
++{
++	static const char * const name[] = {
++		"R0",  "R1",  "R2",  "R3",  "R4",  "R5",  "R6",  "R7",
++		"R8",  "R9",  "R10", "FP",  "IP",  "SP",  "LR",  "PC",
++		"CPSR", "ORIG_R0",
++	};
++
++	if (idx >= HOST_R0 && idx <= HOST_ORIG_R0)
++		return name[idx - HOST_R0];
++	if (idx == HOST_SYSCALL_NR)
++		return "SYSCALL_NR";
++	return "";
++}
++
++/*
++ * Size the FP block once, against a live stub process.
++ *
++ * PTRACE_GETVFPREGS, deliberately. It yields a fixed ARM_VFPREGS_SIZE-byte
++ * payload -- struct user_vfp -- and every consumer of uml_pt_regs.fp in this
++ * port reads it as exactly that: the ptrace regset view in
++ * arch/arm/um/ptrace.c, the signal-frame marshalling in arch/arm/um/signal.c,
++ * and the stub-state copies in os-Linux/mcontext.c.
++ *
++ * Unlike arm64 there is no buffer to size: the payload is a constant 260
++ * bytes on every arm host that has VFP at all, and there is no SVE-style
++ * header whose layout depends on vector length. The probe only answers
++ * "does this host have VFP", in which case the guest is told it does; on a
++ * host without VFP the request fails and the guest is told it does not have
++ * floating point, which is what it will actually get.
++ */
++int arch_init_registers(int pid)
++{
++	unsigned long regs[ARM_VFPREGS_SIZE / sizeof(unsigned long)];
++
++	if (get_fp_registers(pid, regs) < 0)
++		host_fp_size = 0;
++	else
++		host_fp_size = ARM_VFPREGS_SIZE;
++
++	return 0;
++}
++
++unsigned long get_thread_reg(int reg, jmp_buf *buf)
++{
++	switch (reg) {
++	case HOST_PC:
++		/*
++		 * A longjmp resumes at the saved return address, so for a
++		 * jmp_buf the link register *is* the instruction pointer.
++		 */
++		return buf[0]->__lr;
++	case HOST_SP:
++		return buf[0]->__sp;
++	case HOST_LR:
++		return buf[0]->__lr;
++	case HOST_FP:
++		return buf[0]->__r11;
++	default:
++		printk(UM_KERN_ERR "get_thread_reg - unknown register %d\n",
++		       reg);
++		return 0;
++	}
++}
+diff --git a/arch/arm/um/ptrace.c b/arch/arm/um/ptrace.c
+new file mode 100644
+index 000000000..548afb835
+--- /dev/null
++++ b/arch/arm/um/ptrace.c
+@@ -0,0 +1,250 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ptrace support for ARCH=um SUBARCH=arm.
++ *
++ * The "user area" a debugger sees through PTRACE_PEEKUSER/POKEUSER is simply
++ * the 72-byte struct user_regs_struct: ureg[0..17] -- r0-r10, fp, ip, sp,
++ * lr, pc, cpsr, orig_r0. That makes register lookup a plain division by
++ * the word size rather than the offset table x86 needs, because arm32 has
++ * no segment registers, no debug-register block in the user area, and the
++ * original first argument is an ordinary member of the block.
++ */
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/errno.h>
++#include <linux/elf.h>
++#include <linux/regset.h>
++#include <linux/uaccess.h>
++#include <asm/ptrace.h>
++#include <registers.h>
++
++static inline int reg_index(int regno)
++{
++	return regno / sizeof(unsigned long);
++}
++
++int putreg(struct task_struct *child, int regno, unsigned long value)
++{
++	int idx;
++
++	if (regno < 0 || regno >= MAX_REG_OFFSET ||
++	    (regno % sizeof(unsigned long)))
++		return -EIO;
++
++	idx = reg_index(regno);
++
++	if (idx == HOST_CPSR) {
++		unsigned long old = child->thread.regs.regs.gp[HOST_CPSR];
++
++		child->thread.regs.regs.gp[HOST_CPSR] =
++			(old & ~UM_CPSR_WRITABLE) | (value & UM_CPSR_WRITABLE);
++		return 0;
++	}
++
++	child->thread.regs.regs.gp[idx] = value;
++	return 0;
++}
++
++unsigned long getreg(struct task_struct *child, int regno)
++{
++	if (regno < 0 || regno >= MAX_REG_OFFSET ||
++	    (regno % sizeof(unsigned long)))
++		return 0;
++
++	return child->thread.regs.regs.gp[reg_index(regno)];
++}
++
++int poke_user(struct task_struct *child, long addr, long data)
++{
++	if ((addr & (sizeof(unsigned long) - 1)) || addr < 0)
++		return -EIO;
++
++	if (addr < MAX_REG_OFFSET)
++		return putreg(child, addr, data);
++
++	/*
++	 * arm32 exposes no debug registers through the user area -- hardware
++	 * breakpoints and watchpoints are separate regsets (NT_ARM_HW_BREAK,
++	 * NT_ARM_HW_WATCH), which UML does not implement. The synthesised
++	 * syscall-number slot at MAX_REG_OFFSET is UML's own bookkeeping; the
++	 * host kernel will never install it, so it is not visible either.
++	 */
++	return -EIO;
++}
++
++int peek_user(struct task_struct *child, long addr, long data)
++{
++	unsigned long tmp = 0;
++
++	if ((addr & (sizeof(unsigned long) - 1)) || addr < 0)
++		return -EIO;
++
++	if (addr < MAX_REG_OFFSET)
++		tmp = getreg(child, addr);
++
++	return put_user(tmp, (unsigned long __user *) data);
++}
++
++static int genregs_get(struct task_struct *target,
++		       const struct user_regset *regset,
++		       struct membuf to)
++{
++	int reg;
++
++	for (reg = 0; to.left; reg++)
++		membuf_store(&to, getreg(target, reg * sizeof(unsigned long)));
++	return 0;
++}
++
++static int genregs_set(struct task_struct *target,
++		       const struct user_regset *regset,
++		       unsigned int pos, unsigned int count,
++		       const void *kbuf, const void __user *ubuf)
++{
++	int ret = 0;
++
++	if (kbuf) {
++		const unsigned long *k = kbuf;
++
++		while (count >= sizeof(*k) && !ret) {
++			ret = putreg(target, pos, *k++);
++			count -= sizeof(*k);
++			pos += sizeof(*k);
++		}
++	} else {
++		const unsigned long __user *u = ubuf;
++
++		while (count >= sizeof(*u) && !ret) {
++			unsigned long word;
++
++			ret = __get_user(word, u++);
++			if (ret)
++				break;
++			ret = putreg(target, pos, word);
++			count -= sizeof(*u);
++			pos += sizeof(*u);
++		}
++	}
++	return ret;
++}
++
++static int fpregs_active(struct task_struct *target,
++			 const struct user_regset *regset)
++{
++	return regset->n;
++}
++
++static int fpregs_get(struct task_struct *target,
++		      const struct user_regset *regset,
++		      struct membuf to)
++{
++	void *fpregs = task_pt_regs(target)->regs.fp;
++
++	membuf_write(&to, fpregs, regset->size * regset->n);
++	return 0;
++}
++
++static int fpregs_set(struct task_struct *target,
++		      const struct user_regset *regset,
++		      unsigned int pos, unsigned int count,
++		      const void *kbuf, const void __user *ubuf)
++{
++	void *fpregs = task_pt_regs(target)->regs.fp;
++
++	return user_regset_copyin(&pos, &count, &kbuf, &ubuf,
++				  fpregs, 0, regset->size * regset->n);
++}
++
++static struct user_regset uml_regsets[] __ro_after_init = {
++	[REGSET_GENERAL] = {
++		USER_REGSET_NOTE_TYPE(PRSTATUS),
++		.n		= sizeof(struct user_regs_struct) / sizeof(long),
++		.size		= sizeof(long),
++		.align		= sizeof(long),
++		.regset_get	= genregs_get,
++		.set		= genregs_set,
++	},
++	[REGSET_FP] = {
++		USER_REGSET_NOTE_TYPE(ARM_VFP),
++		/*
++		 * .n is fixed up at boot from host_fp_size. arm32's VFP
++		 * state is a fixed-size payload, so this only ever comes
++		 * out as ARM_VFPREGS_SIZE / 4 or zero.
++		 */
++		.size		= sizeof(long),
++		.align		= sizeof(long),
++		.active		= fpregs_active,
++		.regset_get	= fpregs_get,
++		.set		= fpregs_set,
++	},
++};
++
++static const struct user_regset_view user_uml_view = {
++	.name = "arm", .e_machine = EM_ARM,
++	.regsets = uml_regsets, .n = ARRAY_SIZE(uml_regsets)
++};
++
++const struct user_regset_view *
++task_user_regset_view(struct task_struct *tsk)
++{
++	return &user_uml_view;
++}
++
++/*
++ * arm32 defines legacy ptrace requests that UML can serve for the ones that
++ * name the state UML preserves, and refuses for the rest.
++ *
++ * PTRACE_GETVFPREGS / PTRACE_SETVFPREGS move the VFP block in place, the way
++ * old arm glibc and gdb still move it. The payload is the ARM_VFPREGS_SIZE
++ * bytes UGL keeps in uml_pt_regs.fp -- the same 260 bytes the host's own
++ * ptrace(2) would hand out.
++ *
++ * Not served, and deliberately so:
++ *   PTRACE_GETFPREGS/SETFPREGS   FPA state; armv7 has no FPA and UML does
++ *                               not preserve any such thing.
++ *   PTRACE_GETWMMXREGS/...      WMMX, same story.
++ *   PTRACE_GETCRUNCHREGS/...    obsolete crunch, same story.
++ *   PTRACE_GETHBPREGS/SETHBPREGS hardware breakpoints; UML does not
++ *                                implement them for the guest.
++ *   PTRACE_SET_SYSCALL          an old OABI-style way to redirect a syscall
++ *                               that UML has no use for: the redirect and
++ *                               the cancel happen through the register view.
++ */
++long subarch_ptrace(struct task_struct *child, long request,
++		    unsigned long addr, unsigned long data)
++{
++	void __user *ptr = (void __user *)data;
++
++	if (host_fp_size) {
++		void *fp = task_pt_regs(child)->regs.fp;
++		unsigned long count = host_fp_size;
++
++		switch (request) {
++		case PTRACE_GETVFPREGS:
++			return copy_to_user(ptr, fp, count) ? -EFAULT : 0;
++		case PTRACE_SETVFPREGS:
++			return copy_from_user(fp, ptr, count) ? -EFAULT : 0;
++		}
++	} else {
++		/*
++		 * The host has no VFP state at all, so a request for it is
++		 * not supported rather than failing on a copy.
++		 */
++		switch (request) {
++		case PTRACE_GETVFPREGS:
++		case PTRACE_SETVFPREGS:
++			return -ENODEV;
++		}
++	}
++
++	return -EIO;
++}
++
++static int __init init_regset_fp_info(void)
++{
++	uml_regsets[REGSET_FP].n =
++		host_fp_size / uml_regsets[REGSET_FP].size;
++
++	return 0;
++}
++arch_initcall(init_regset_fp_info);
+diff --git a/arch/arm/um/setjmp_arm.S b/arch/arm/um/setjmp_arm.S
+new file mode 100644
+index 000000000..c917d3af4
+--- /dev/null
++++ b/arch/arm/um/setjmp_arm.S
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * setjmp/longjmp for ARCH=um SUBARCH=arm.
++ *
++ * UML uses its own setjmp/longjmp for kernel-side context switching rather
++ * than libc's -- arch/um/Makefile renames the symbols to kernel_setjmp /
++ * kernel_longjmp to keep libc's out of the way. libc's versions are
++ * unsuitable because they may mangle the saved SP and PC with a
++ * per-process pointer guard, and glibc's siglongjmp variant touches the
++ * signal mask; UML needs a plain, predictable register save.
++ *
++ * The buffer layout matches struct __jmp_buf in
++ * arch/arm/um/shared/sysdep/archsetjmp.h:
++ *
++ *	 0	r4
++ *	 4	r5
++ *	 8	r6
++ *	12	r7
++ *	16	r8
++ *	20	r9
++ *	24	r10
++ *	28	r11
++ *	32	sp
++ *	36	lr (return address)
++ *
++ * That is exactly the AAPCS callee-saved set for the soft-float ABI: r4-r11,
++ * the link register and SP. No VFP registers are in it on purpose: UML is
++ * built with -mfloat-abi=soft, so the ABI these functions follow promises no
++ * callee saves any vector register, and the guest's VFP state never passes
++ * through here in any case -- it lives in the stub's mcontext and in
++ * uml_pt_regs.fp.
++ *
++ * The stub and this file are plain 32-bit ARM (no Thumb, no position
++ * independence tricks needed): the binary's svc #0 system calls and the
++ * host-resume code both require it.
++ */
++
++	.text
++	.align 2
++	.globl kernel_setjmp
++	.type kernel_setjmp, %function
++kernel_setjmp:
++	stmia	r0, {r4-r11}
++
++	/*
++	 * SP cannot be an operand of stmia, so route it through a scratch
++	 * register. r2 is caller-saved, so clobbering it is free.
++	 */
++	mov	r2, sp
++	str	r2, [r0, #32]
++
++	mov	r2, lr
++	str	r2, [r0, #36]
++
++	mov	r0, #0
++	bx	lr
++
++	.size kernel_setjmp, .-kernel_setjmp
++
++	.text
++	.align 2
++	.globl kernel_longjmp
++	.type kernel_longjmp, %function
++kernel_longjmp:
++	ldmia	r0, {r4-r11}
++
++	ldr	sp, [r0, #32]
++	ldr	lr, [r0, #36]
++
++	/*
++	 * longjmp(buf, 0) must appear to setjmp as a return of 1, otherwise
++	 * the caller cannot distinguish it from the original setjmp.
++	 */
++	cmp	r1, #0
++	movne	r0, r1
++	moveq	r0, #1
++
++	bx	lr
++
++	.size kernel_longjmp, .-kernel_longjmp
++
++/* UML's binary is an ordinary ELF executable; keep the stack non-executable. */
++	.section .note.GNU-stack,"",%progbits
+diff --git a/arch/arm/um/shared/sysdep/archsetjmp.h b/arch/arm/um/shared/sysdep/archsetjmp.h
+new file mode 100644
+index 000000000..b7ce76850
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/archsetjmp.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * UML's private jmp_buf for arm32.
++ *
++ * UML cannot use libc setjmp()/longjmp() for kernel-side context switching --
++ * arch/um/Makefile renames them to kernel_setjmp/kernel_longjmp precisely to
++ * keep libc's versions (which may touch the signal mask or a stack guard) out
++ * of the way. This is the matching buffer layout; see setjmp_arm.S.
++ *
++ * AAPCS soft-float callee-saved state: r4-r11, LR and SP. The hard-float
++ * variant of the ABI saves d8-d15 as well, but UML is built with
++ * -mfloat-abi=soft, so no vector register is ever callee-saved and none is
++ * kept here.
++ */
++#ifndef _KLIBC_ARCHSETJMP_H
++#define _KLIBC_ARCHSETJMP_H
++
++struct __jmp_buf {
++	unsigned long __r4;
++	unsigned long __r5;
++	unsigned long __r6;
++	unsigned long __r7;
++	unsigned long __r8;
++	unsigned long __r9;
++	unsigned long __r10;
++	unsigned long __r11;
++	unsigned long __sp;
++	unsigned long __lr;	/* link register -- resume address */
++};
++
++typedef struct __jmp_buf jmp_buf[1];
++
++unsigned long get_thread_reg(int reg, jmp_buf *buf);
++
++/*
++ * get_thread_reg() asks for HOST_PC/HOST_SP of a saved context. There is no
++ * separate saved PC: a longjmp resumes at the return address in LR, so that
++ * is what "IP" means for a jmp_buf.
++ */
++#define JB_IP __lr
++#define JB_SP __sp
++
++/*
++ * Bytes to leave below the top of a fresh kernel stack: none.
++ *
++ * x86 reserves one word to emulate the return address `call` pushes, so the
++ * callee sees the alignment its ABI expects. arm has no pushed return
++ * address -- the link register carries it -- and AAPCS only requires SP to be
++ * 8-byte aligned when returning from a function prologue, so there is
++ * nothing to reserve.
++ */
++#define ARCH_INIT_SP_RESERVE	0
++
++#endif /* _KLIBC_ARCHSETJMP_H */
+diff --git a/arch/arm/um/shared/sysdep/faultinfo.h b/arch/arm/um/shared/sysdep/faultinfo.h
+new file mode 100644
+index 000000000..127212d68
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/faultinfo.h
+@@ -0,0 +1,98 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Fault information for ARCH=um SUBARCH=arm.
++ */
++#ifndef __FAULTINFO_ARM_H
++#define __FAULTINFO_ARM_H
++
++/*
++ * The sigcontext delivers the fault status register in error_code. The
++ * host's fault path stores the FSR of the fault in thread_struct right
++ * before it raises the signal (arch/arm/mm/fault.c, tsk->thread.error_code),
++ * and the signal code copies that field into the frame, so error_code is
++ * the FSR of the fault just delivered, not a stale value. For a data
++ * abort, bit 11 (FSR_WRITE) says the access was a write, and bit 13
++ * (FSR_CM) takes it back when the abort came from cache maintenance
++ * instead of a real store. That pair is the arm equivalent of x86's
++ * page-fault error code bit 1, and it is what makes copy-on-write
++ * distinguishable from a plain read fault.
++ */
++#define UM_FSR_WRITE	0x0800
++#define UM_FSR_CM	0x2000
++
++struct faultinfo {
++	unsigned int ec;
++	unsigned long addr;
++};
++
++#define FAULT_WRITE(fi)						\
++	(((fi).ec & UM_FSR_WRITE) && !((fi).ec & UM_FSR_CM))
++#define FAULT_ADDRESS(fi) ((fi).addr)
++/*
++ * The architecture's own description of why the fault happened: the FSR,
++ * which an arm developer reading a segfault report will expect to see.
++ */
++#define FAULT_ERROR_CODE(fi) ((fi).ec)
++
++/*
++ * "Fixable" means the fault is a translation/permission problem UML can
++ * resolve by populating the guest page tables, rather than something
++ * structural. On arm both translation and permission faults look the
++ * same in the FSR, and either is just an ordinary not-yet-faulted-in
++ * guest page.
++ */
++#define SEGV_IS_FIXABLE(fi) 1
++
++#define PTRACE_FULL_FAULTINFO 1
++
++/*
++ * Pull the two fault fields out of the host's signal frame.
++ *
++ * Unlike aarch64's, arm's sigcontext carries no fault address at all: the
++ * kernel's SEGV delivery hands the address to the handler only in the
++ * siginfo that accompanies the frame. Every caller of this macro holds
++ * that siginfo under the name `si` -- the two generic ones are
++ * sig_handler_common() in arch/um/os-Linux/signal.c (a parameter) and the
++ * SKAS stub-signal path in arch/um/os-Linux/skas/process.c (a local,
++ * populated from the stub's sigstack just above the call) -- and the
++ * subarch's own is stub_segv_handler() in arch/arm/um/stub_segv.c, whose
++ * parameter is named accordingly. The macro therefore expands a reference
++ * to `si`; a caller that does not have one fails to compile rather than
++ * fill in a wrong address.
++ */
++#define GET_FAULTINFO_FROM_MC(fi, mc)					\
++	do {								\
++		(fi).ec = (unsigned int)(mc)->error_code;		\
++		(fi).addr = (unsigned long)(void *)(si)->si_addr;	\
++	} while (0)
++
++/*
++ * Record a landing pad for a fault taken inside __get_kernel_nofault /
++ * __put_kernel_nofault. The SIGSEGV handler in arch/um/kernel/trap.c
++ * redirects the mcontext PC to thread.segv_continue, so control resumes
++ * at label 1 with _faulted set.
++ *
++ * Local numeric labels are used rather than x86's "%=" name mangling: the
++ * arm assembler resolves 1f/1b per-instance, so nothing has to be
++ * uniquified and the macro stays safe when inlined more than once in a
++ * function.
++ */
++#define ___backtrack_faulted(_faulted)					\
++	do {								\
++		unsigned long __tmp;					\
++									\
++		asm volatile (						\
++			"adr %2, 1f\n"					\
++			"str %2, %1\n"					\
++			"mov %0, #0\n"					\
++			"b 2f\n"						\
++			"1:\n"						\
++			"mov %0, #1\n"					\
++			"2:"						\
++			: "=&r" (_faulted),				\
++			  "=m" (current->thread.segv_continue),		\
++			  "=&r" (__tmp) ::				\
++		);							\
++	} while (0)
++
++#endif /* __FAULTINFO_ARM_H */
+diff --git a/arch/arm/um/shared/sysdep/kernel-offsets.h b/arch/arm/um/shared/sysdep/kernel-offsets.h
+new file mode 100644
+index 000000000..67cbbfc64
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/kernel-offsets.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __SYSDEP_ARM_KERNEL_OFFSETS_H
++#define __SYSDEP_ARM_KERNEL_OFFSETS_H
++
++/*
++ * Subarch contribution to arch/um/kernel/asm-offsets.c.
++ *
++ * arm needs nothing here. Guest TLS is R8, an ordinary regset word the
++ * guest writes itself, so there is no descriptor table geometry the stub
++ * must know.
++ */
++#define ARCH_ASM_OFFSETS() do { } while (0)
++
++#endif
+diff --git a/arch/arm/um/shared/sysdep/mcontext.h b/arch/arm/um/shared/sysdep/mcontext.h
+new file mode 100644
+index 000000000..5537f7a64
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/mcontext.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __SYS_SIGCONTEXT_ARM_H
++#define __SYS_SIGCONTEXT_ARM_H
++
++/*
++ * On 32-bit arm, glibc's mcontext_t is defined only in <sys/ucontext.h> --
++ * unlike x86_64 and aarch64, where <signal.h> has already pulled it in by
++ * the time this header is parsed. Take it here rather than in every
++ * consumer. Host ABIs that ship an mcontext_t of some other shape are not
++ * supported; the one named type the UML host code knows is the glibc/musl
++ * sigcontext.
++ */
++#include <sys/ucontext.h>
++
++extern void get_regs_from_mc(struct uml_pt_regs *regs, mcontext_t *mc);
++extern void get_mc_from_regs(struct uml_pt_regs *regs, mcontext_t *mc,
++			     int single_stepping);
++extern void mc_set_rip(void *_mc, void *target);
++
++extern int get_stub_state(struct uml_pt_regs *regs, struct stub_data *data,
++			  unsigned long *fp_size_out);
++extern int set_stub_state(struct uml_pt_regs *regs, struct stub_data *data,
++			  int single_stepping);
++
++/*
++ * Magic of the VFP record in the ucontext's uc_regspace[] extension area.
++ * Spelled out rather than pulled from the host's <asm/sigcontext.h>
++ * because this header is included by stub_segv.c, which is compiled
++ * freestanding for the stub and must not acquire new dependencies; the
++ * value is a stable uapi constant (VFP_MAGIC in arch/arm's kernel
++ * ucontext.h) and the record shape is spelled out in os-Linux/mcontext.c.
++ */
++#define UM_VFP_MAGIC	0x56465001UL
++
++#endif /* __SYS_SIGCONTEXT_ARM_H */
+diff --git a/arch/arm/um/shared/sysdep/ptrace.h b/arch/arm/um/shared/sysdep/ptrace.h
+new file mode 100644
+index 000000000..2c0b7d4d9
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/ptrace.h
+@@ -0,0 +1,124 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __SYSDEP_ARM_PTRACE_H
++#define __SYSDEP_ARM_PTRACE_H
++
++#include <generated/user_constants.h>
++#include <sysdep/faultinfo.h>
++
++/*
++ * gp[] mirrors the 72-byte PTRACE_GETREGS block (the kernel's
++ * struct pt_regs.uregs[18]: r0-r10, fp, ip, sp, lr, pc, cpsr, orig_r0)
++ * followed by one slot UML synthesises itself. Only the first
++ * UM_FRAME_SIZE bytes are ever handed to the host; see user-offsets.c.
++ */
++#define MAX_REG_OFFSET (UM_FRAME_SIZE)
++#define MAX_REG_NR (UM_MAX_REG_NR)
++
++#define REGS_X(r, n)	((r)[(n)])
++#define REGS_SP(r)	((r)[HOST_SP])
++#define REGS_IP(r)	((r)[HOST_PC])
++#define REGS_LR(r)	((r)[HOST_LR])
++#define REGS_CPSR(r)	((r)[HOST_CPSR])
++#define REGS_ORIG_R0(r)	((r)[HOST_ORIG_R0])
++#define REGS_SYSCALL_NR(r) ((r)[HOST_SYSCALL_NR])
++#define REGS_TLS(r)	((r)[HOST_TLS])
++
++#define UPT_X(r, n)	REGS_X((r)->gp, n)
++#define UPT_SP(r)	REGS_SP((r)->gp)
++#define UPT_IP(r)	REGS_IP((r)->gp)
++#define UPT_LR(r)	REGS_LR((r)->gp)
++#define UPT_CPSR(r)	REGS_CPSR((r)->gp)
++#define UPT_ORIG_R0(r)	REGS_ORIG_R0((r)->gp)
++#define UPT_TLS(r)	REGS_TLS((r)->gp)
++
++/*
++ * EABI syscall ABI: arguments in r0..r5, the number in r7, the result in
++ * r0. Unlike arm64, argument 1 and the return value are both r0, and UML
++ * does not capture r0 into a separate original-argument slot: the host
++ * kernel already publishes the original first argument inside the regset
++ * at ureg[17], which is an ordinary member of every stop, so ARG1 reads
++ * r0 directly and is correct -- the -ENOSYS seed hazard is handled below.
++ */
++#define UPT_SYSCALL_ARG1(r) UPT_X(r, HOST_R0)
++#define UPT_SYSCALL_ARG2(r) UPT_X(r, HOST_R1)
++#define UPT_SYSCALL_ARG3(r) UPT_X(r, HOST_R2)
++#define UPT_SYSCALL_ARG4(r) UPT_X(r, HOST_R3)
++#define UPT_SYSCALL_ARG5(r) UPT_X(r, HOST_R4)
++#define UPT_SYSCALL_ARG6(r) UPT_X(r, HOST_R5)
++
++/*
++ * When to seed the return register with -ENOSYS.
++ *
++ * x86 does it unconditionally before the syscall-entry stop, and that is
++ * faithful there: native x86 really does leave -ENOSYS in RAX at an entry
++ * stop, and RAX is not an argument register.
++ *
++ * On arm32 the return value and the first argument are both r0, so seeding
++ * early overwrites the argument -- and a guest tracer reading the classic
++ * register view then sees -38 as argument 1 of every syscall. The arm host
++ * kernel seeds r0 with -ENOSYS in exactly one case: when the incoming
++ * number is already NO_SYSCALL (arch/arm/kernel/ptrace.c), so match that.
++ */
++#define UM_SEED_ENOSYS_BEFORE_TRACE(r)	((long)UPT_SYSCALL_NR(r) < 0)
++
++/*
++ * A syscall is restarted by rewinding over the "svc #0" that issued it.
++ * UGL is compiled in the ARM state, so this is exact: every guest
++ * instruction is 4 bytes wide (the thumb halfword is the guest's own
++ * business; the svc that stopped is always ARM-encoded).
++ *
++ * Three registers have to be put back, and two of them differ from x86:
++ *
++ *   r0  by the time we decide to restart, it holds -ERESTARTSYS rather than
++ *       the first argument. Unlike arm64's x0, the original first argument
++ *       is a real member of the host regset (ureg[17]), so restoring it is
++ *       a plain slot copy.
++ *
++ *   r7  because the guest is about to *re-execute* the svc, and it is r7
++ *       that selects the syscall at that point -- not the synthesised
++ *       UML slot, which only records the number for UML's own bookkeeping.
++ *       Without this, "PT_REGS_ORIG_SYSCALL(regs) = __NR_restart_syscall"
++ *       in arch/um/kernel/signal.c silently has no effect: the guest
++ *       re-runs the original syscall instead of restart_syscall, so a
++ *       signal-interrupted nanosleep restarts its full duration rather
++ *       than its remainder.
++ *
++ * The two call sites in arch/um/kernel/signal.c assign ORIG_SYSCALL before
++ * and after this macro respectively; taking the number from the slot rather
++ * than from a parameter is what makes both orderings come out right.
++ */
++#define UPT_RESTART_SYSCALL(r)						\
++	do {								\
++		long __nr = (long)REGS_SYSCALL_NR((r)->gp);		\
++									\
++		UPT_IP(r) -= 4;						\
++		UPT_X(r, HOST_R0) = UPT_ORIG_R0(r);			\
++		if (__nr >= 0)						\
++			UPT_X(r, HOST_R7) = (unsigned long)__nr;	\
++	} while (0)
++
++extern unsigned long host_fp_size;
++
++struct uml_pt_regs {
++	unsigned long gp[MAX_REG_NR];
++	struct faultinfo faultinfo;
++	long syscall;
++	int is_user;
++
++	/*
++	 * Dynamically sized FP registers. This is the host's VFP state:
++	 * ARM_VFPREGS_SIZE bytes of it, probed at boot (host_fp_size), or
++	 * zero on a host without VFP.
++	 */
++	unsigned long fp[];
++};
++
++#define EMPTY_UML_PT_REGS { }
++
++#define UPT_SYSCALL_NR(r) ((r)->syscall)
++#define UPT_FAULTINFO(r) (&(r)->faultinfo)
++#define UPT_IS_USER(r) ((r)->is_user)
++
++extern int arch_init_registers(int pid);
++
++#endif /* __SYSDEP_ARM_PTRACE_H */
+diff --git a/arch/arm/um/shared/sysdep/ptrace_user.h b/arch/arm/um/shared/sysdep/ptrace_user.h
+new file mode 100644
+index 000000000..2c86be7ba
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/ptrace_user.h
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __SYSDEP_ARM_PTRACE_USER_H
++#define __SYSDEP_ARM_PTRACE_USER_H
++
++#include <generated/user_constants.h>
++
++#define PT_OFFSET(r) ((r) * sizeof(long))
++
++/*
++ * The synthesised syscall-number slot. Like x86, the host's word-granular
++ * user area does not expose it: it lives one word past the 72-byte regset
++ * block, and UML serves PEEKUSER/POKEUSER there from its own copy. The
++ * original first argument is different -- it is a real regset word at
++ * ureg[17] -- so both directions read from the slot here and only the
++ * number is synthesised.
++ */
++#define PT_SYSCALL_NR(regs) ((regs)[HOST_SYSCALL_NR])
++#define PT_SYSCALL_NR_OFFSET PT_OFFSET(HOST_SYSCALL_NR)
++
++#define PT_SYSCALL_RET_OFFSET PT_OFFSET(HOST_R0)
++
++#define REGS_IP_INDEX HOST_PC
++#define REGS_SP_INDEX HOST_SP
++
++/*
++ * The instruction that enters the kernel, for hosts without PTRACE_SYSEMU.
++ *
++ * arm has had PTRACE_SYSEMU nowhere in its uapi, so the guest syscall is
++ * intercepted on every host by cancelling it at a PTRACE_SYSCALL stop
++ * instead -- exactly the pre-5.3 arm64 situation, which this header copies.
++ * That covers every case but one: while the guest is being single-stepped,
++ * a PTRACE_SINGLESTEP over the entry instruction would execute the guest's
++ * syscall on the host before any stop could cancel it. UML therefore looks
++ * at the instruction it is about to step and takes a syscall stop for that
++ * one. UGL is built in the ARM state (see arch/arm/Makefile.um), so the
++ * svc is always the 32-bit ARM encoding.
++ */
++#define UM_SYSCALL_TRAP_INSN	0xea000000U	/* svc #0 */
++
++/*
++ * No register is hidden at a ptrace syscall stop on arm32. The host kernel
++ * publishes the original first argument inside the regset at ureg[17], and
++ * every other word -- including r7, the live syscall number, which is
++ * readable and writable at the stop -- is ordinary. Writing r7 is not a
++ * hazard but the very mechanism UML uses to redirect the next svc, and
++ * UPT_RESTART_SYSCALL() already puts the number there through the ordinary
++ * slot. x86 and arm64 each define UM_SYSCALL_STOP_HIDES_REG for a register
++ * the host refuses; arm32 defines none, so the generic step-off code in
++ * arch/um/os-Linux/skas/process.c is compiled out here.
++ */
++
++#ifndef PTRACE_SYSEMU
++/* arm takes 31 for PTRACE_GETFDPIC; the unused numbers are free. */
++#define PTRACE_SYSEMU 32
++#endif
++#ifndef PTRACE_SYSEMU_SINGLESTEP
++#define PTRACE_SYSEMU_SINGLESTEP 33
++#endif
++
++/*
++ * NT_ARM_VFP is a stable uapi value, but old host headers predate it, and
++ * the regset path needs it to spell the FP note type.
++ */
++#ifndef NT_ARM_VFP
++#define NT_ARM_VFP 0x400
++#endif
++
++#endif /* __SYSDEP_ARM_PTRACE_USER_H */
+diff --git a/arch/arm/um/shared/sysdep/stub-data.h b/arch/arm/um/shared/sysdep/stub-data.h
+new file mode 100644
+index 000000000..f05d52f17
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/stub-data.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __ARCH_STUB_DATA_H
++#define __ARCH_STUB_DATA_H
++
++/*
++ * Guest TLS on arm is R8, a member of the core regset: the guest writes
++ * it with an ordinary store and the host's sigcontext carries it in every
++ * signal frame. There is no set_thread_area(2) to intercept and no
++ * dedicated TLS register to chase, so the only thing UML has to do is
++ * reinstate the register when it resumes a different guest thread in the
++ * same stub process.
++ */
++#define STUB_SYNC_TLS (1 << 0)
++
++struct stub_data_arch {
++	int sync;
++	unsigned long tls;
++};
++
++#endif /* __ARCH_STUB_DATA_H */
+diff --git a/arch/arm/um/shared/sysdep/stub.h b/arch/arm/um/shared/sysdep/stub.h
+new file mode 100644
+index 000000000..c2147a7d2
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/stub.h
+@@ -0,0 +1,352 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __SYSDEP_ARM_STUB_H
++#define __SYSDEP_ARM_STUB_H
++
++#include <stddef.h>
++#include <asm/unistd.h>
++#include <sys/mman.h>
++#include <signal.h>
++#include <as-layout.h>
++#include <stub-data.h>
++#include <sysdep/ptrace_user.h>
++#include <generated/asm-offsets.h>
++
++/*
++ * The stub is position-independent code mapped into every guest address space.
++ * It runs with no libc, no stack guard and no TLS of its own, so every host
++ * syscall it makes has to be raw inline asm.
++ *
++ * arm EABI: r7 = syscall number, r0..r5 = arguments, "svc #0", result in r0.
++ * The kernel preserves r1..r11 across the trap and replaces only r0, so
++ * unlike x86 -- where "syscall" destroys rcx and r11 -- there is nothing to
++ * add to the clobber list beyond memory.
++ */
++
++#define STUB_MMAP_NR __NR_mmap
++/*
++ * arm needs no syscall to restore guest TLS: R8 is an ordinary register the
++ * guest writes itself, so stub_seccomp_restore_state() below is a single
++ * "mov" instruction. -1 keeps the seccomp filter's shape identical across
++ * subarchs without permitting anything, since no syscall number is -1.
++ */
++#define STUB_SECCOMP_TLS_SYSCALL (-1)
++#define MMAP_OFFSET(o) (o)
++
++static __always_inline long stub_syscall0(long syscall)
++{
++	register long r7 __asm__("r7") = syscall;
++	register long r0 __asm__("r0");
++
++	__asm__ volatile ("svc #0"
++		: "=r" (r0)
++		: "r" (r7)
++		: "memory");
++
++	return r0;
++}
++
++static __always_inline long stub_syscall1(long syscall, long arg1)
++{
++	register long r7 __asm__("r7") = syscall;
++	register long r0 __asm__("r0") = arg1;
++
++	__asm__ volatile ("svc #0"
++		: "+r" (r0)
++		: "r" (r7)
++		: "memory");
++
++	return r0;
++}
++
++static __always_inline long stub_syscall2(long syscall, long arg1, long arg2)
++{
++	register long r7 __asm__("r7") = syscall;
++	register long r0 __asm__("r0") = arg1;
++	register long r1 __asm__("r1") = arg2;
++
++	__asm__ volatile ("svc #0"
++		: "+r" (r0)
++		: "r" (r7), "r" (r1)
++		: "memory");
++
++	return r0;
++}
++
++static __always_inline long stub_syscall3(long syscall, long arg1, long arg2,
++					  long arg3)
++{
++	register long r7 __asm__("r7") = syscall;
++	register long r0 __asm__("r0") = arg1;
++	register long r1 __asm__("r1") = arg2;
++	register long r2 __asm__("r2") = arg3;
++
++	__asm__ volatile ("svc #0"
++		: "+r" (r0)
++		: "r" (r7), "r" (r1), "r" (r2)
++		: "memory");
++
++	return r0;
++}
++
++static __always_inline long stub_syscall4(long syscall, long arg1, long arg2,
++					  long arg3, long arg4)
++{
++	register long r7 __asm__("r7") = syscall;
++	register long r0 __asm__("r0") = arg1;
++	register long r1 __asm__("r1") = arg2;
++	register long r2 __asm__("r2") = arg3;
++	register long r3 __asm__("r3") = arg4;
++
++	__asm__ volatile ("svc #0"
++		: "+r" (r0)
++		: "r" (r7), "r" (r1), "r" (r2), "r" (r3)
++		: "memory");
++
++	return r0;
++}
++
++static __always_inline long stub_syscall5(long syscall, long arg1, long arg2,
++					  long arg3, long arg4, long arg5)
++{
++	register long r7 __asm__("r7") = syscall;
++	register long r0 __asm__("r0") = arg1;
++	register long r1 __asm__("r1") = arg2;
++	register long r2 __asm__("r2") = arg3;
++	register long r3 __asm__("r3") = arg4;
++	register long r4 __asm__("r4") = arg5;
++
++	__asm__ volatile ("svc #0"
++		: "+r" (r0)
++		: "r" (r7), "r" (r1), "r" (r2), "r" (r3), "r" (r4)
++		: "memory");
++
++	return r0;
++}
++
++static __always_inline long stub_syscall6(long syscall, long arg1, long arg2,
++					  long arg3, long arg4, long arg5,
++					  long arg6)
++{
++	register long r7 __asm__("r7") = syscall;
++	register long r0 __asm__("r0") = arg1;
++	register long r1 __asm__("r1") = arg2;
++	register long r2 __asm__("r2") = arg3;
++	register long r3 __asm__("r3") = arg4;
++	register long r4 __asm__("r4") = arg5;
++	register long r5 __asm__("r5") = arg6;
++
++	__asm__ volatile ("svc #0"
++		: "+r" (r0)
++		: "r" (r7), "r" (r1), "r" (r2), "r" (r3), "r" (r4), "r" (r5)
++		: "memory");
++
++	return r0;
++}
++
++/*
++ * Deliberate SIGTRAP, so the UML kernel can catch the stub at a known point.
++ *
++ * "swi #1" with r7 = __ARM_NR_breakpoint is the arm kernel's special-syscall
++ * breakpoint: the swi routes through the same syscall path, arm_syscall()
++ * recognises the number, backsteps the PC over the instruction and raises
++ * SIGTRAP/TRAP_BRKPT. A plain "svc #0" with a bogus number would instead be
++ * -ENOSYS, and a hardware bkpt instruction would give SIGILL.
++ */
++#ifndef __ARM_NR_breakpoint
++#define __ARM_NR_breakpoint 0x900001
++#endif
++
++static __always_inline void trap_myself(void)
++{
++	register long r7 __asm__("r7") = (long)__ARM_NR_breakpoint;
++
++	__asm__ volatile ("swi #1"
++		:
++		: "r" (r7)
++		: "memory");
++}
++
++/*
++ * Handoff-word atomics for <stub-futex.h>.
++ *
++ * These carry the ordering the elided futex syscalls used to provide. On
++ * this architecture that is a real obligation, not a formality: without the
++ * acquire on the load, a spinner that observes the ownership flip may still
++ * read stale syscall_data or signal fields. Hence the "dmb ish" after the
++ * load, and the LDEX/STEX pairs for the read-modify-writes, which give
++ * acquire+release semantics by construction.
++ */
++static __always_inline unsigned int
++stub_futex_load_acquire(volatile unsigned int *addr)
++{
++	unsigned int val;
++
++	__asm__ volatile("ldr	%0, [%1]\n"
++			"dmb	ish"
++		: "=r" (val)
++		: "r" (addr)
++		: "memory");
++
++	return val;
++}
++
++static __always_inline unsigned int
++stub_futex_xchg(volatile unsigned int *addr, unsigned int val)
++{
++	unsigned int old, fail;
++
++	__asm__ volatile(
++		"1:	ldrex	%0, [%2]\n"
++		"	strex	%1, %3, [%2]\n"
++		"	cbnz	%1, 1b\n"
++		: "=&r" (old), "=&r" (fail)
++		: "r" (addr), "r" (val)
++		: "cc", "memory");
++
++	return old;
++}
++
++static __always_inline unsigned int
++stub_futex_fetch_or(volatile unsigned int *addr, unsigned int bits)
++{
++	unsigned int old, newval, fail;
++
++	__asm__ volatile(
++		"1:	ldrex	%0, [%3]\n"
++		"	orr	%1, %0, %4\n"
++		"	strex	%2, %1, [%3]\n"
++		"	cbnz	%2, 1b\n"
++		: "=&r" (old), "=&r" (newval), "=&r" (fail)
++		: "r" (addr), "r" (bits)
++		: "cc", "memory");
++
++	return old;
++}
++
++/* Be polite to a shared or virtualized host; on bare cores it is a hint. */
++static __always_inline void stub_relax(void)
++{
++	__asm__ volatile("yield");
++}
++
++/*
++ * The generic timer's virtual counter: constant-rate, synchronized across
++ * cores, and readable from user space on every Linux arm host because the
++ * vDSO clock needs it too (CNTKCTL.EL0VCTEN). The CPU clock is none of
++ * those things -- it scales under the governor, which is exactly why the
++ * spin bound is expressed in these ticks.
++ *
++ * No "isb" before the read: the barrier would cost more than the few cycles
++ * of speculation slack it removes, and a microsecond-scale budget does not
++ * care.
++ */
++static __always_inline unsigned long stub_cycles(void)
++{
++	unsigned long val;
++
++	__asm__ volatile("mrc p15, 0, %0, c0, c0, 0" : "=r" (val));
++
++	return val;
++}
++
++/*
++ * CNTFRQ is readable wherever CNTVCT is. Firmware that leaves it
++ * unprogrammed reads as 0, which flows through the budget arithmetic as
++ * "never spin" -- a safe degradation, not a crash.
++ */
++static __always_inline unsigned long stub_cycles_per_us(void)
++{
++	unsigned long freq;
++
++	__asm__ volatile("mrc p15, 0, %0, c2, c0, 0" : "=r" (freq));
++
++	return freq / 1000000;
++}
++
++/*
++ * The stub's data page immediately follows its code page. "adr" gives a
++ * PC-relative address in a single instruction, so this is one instruction
++ * cheaper than x86's "lea 0(%rip)".
++ *
++ * The mask is a register operand, not an immediate: UM_KERN_PAGE_SIZE is
++ * not a compile-time constant this code may assume, and the mask has to
++ * come from the generated offsets.
++ */
++static __always_inline void *get_stub_data(void)
++{
++	unsigned long ret;
++
++	__asm__ volatile (
++		"adr %0, .\n"
++		"and %0, %0, %1\n"
++		"add %0, %0, %2\n"
++		: "=&r" (ret)
++		: "r" (~(unsigned long)(UM_KERN_PAGE_SIZE - 1)),
++		  "r" ((unsigned long)UM_KERN_PAGE_SIZE)
++		: "cc");
++
++	return (void *)ret;
++}
++
++/*
++ * Drop the stack below the stub mapping and call fn. STUB_SIZE is passed in a
++ * register rather than as an immediate for the same reason as above. The
++ * call is a "blx" to a register (the kernel's own register-call spelling,
++ * see arch/arm/probes/kprobes): UGL is -marm, so the target's low bit is
++ * clear and the branch lands in ARM state.
++ */
++#define stub_start(fn)							\
++	__asm__ volatile (						\
++		"sub sp, sp, %0\n"					\
++		"blx %1\n"						\
++		:: "r" ((unsigned long)STUB_SIZE),			\
++		   "r" (&fn)						\
++		: "lr", "memory")
++
++/*
++ * Report the guest's current TLS back to the kernel.
++ *
++ * R8 is guest-owned: the guest's compiler writes it with an ordinary
++ * "mov r8, ..." (that is what the EABI local-exec TLS model is), and no
++ * host syscall ever sees the write. So when the stub resumes a different
++ * guest thread, whatever R8 the host is currently holding is stale, and
++ * the real value must come from the thread's saved registers.
++ */
++static __always_inline void
++stub_seccomp_save_state(struct stub_data_arch *arch)
++{
++	__asm__ volatile ("mov %0, r8" : "=r" (arch->tls));
++}
++
++/*
++ * Reinstate guest TLS after the stub is resumed for a different guest
++ * thread. R8 is writable from user space, so this costs a single
++ * instruction and no host syscall at all.
++ */
++static __always_inline void
++stub_seccomp_restore_state(struct stub_data_arch *arch)
++{
++	if (arch->sync & STUB_SYNC_TLS)
++		__asm__ volatile ("mov r8, %0" :: "r" (arch->tls) : "cc");
++
++	arch->sync = 0;
++}
++
++/*
++ * stub_arch_init() - what this architecture must do inside a fresh stub
++ *
++ * Nothing. arm has no per-stub architectural state to reset: no pointer
++ * authentication, no TBI keys, no MTE state. The guest's VFP/NEON state is
++ * the guest's own to keep, and a fresh stub simply arrives with whatever
++ * the host exec produced, which for the FPU is the default-off state.
++ */
++static __always_inline void stub_arch_init(void)
++{
++}
++
++extern void stub_segv_handler(int, siginfo_t *, void *);
++extern void stub_syscall_handler(void);
++extern void stub_signal_interrupt(int, siginfo_t *, void *);
++extern void stub_signal_restorer(void);
++
++#endif /* __SYSDEP_ARM_STUB_H */
+diff --git a/arch/arm/um/shared/sysdep/tls.h b/arch/arm/um/shared/sysdep/tls.h
+new file mode 100644
+index 000000000..20d2923f6
+--- /dev/null
++++ b/arch/arm/um/shared/sysdep/tls.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _SYSDEP_TLS_H
++#define _SYSDEP_TLS_H
++
++/*
++ * arm has no segment descriptors and no set_thread_area(2): thread-local
++ * storage is just R8, which the guest writes like any other register. This
++ * header exists only because arch/um/include/shared/skas/stub-data.h
++ * includes <sysdep/tls.h> unconditionally, and because x86 needs a
++ * user_desc-shaped type there.
++ *
++ * user_desc_t is defined as a one-word placeholder rather than omitted so
++ * that generic code which merely mentions the type still compiles; nothing
++ * on arm ever populates one.
++ */
++
++typedef struct um_arm_tls_desc {
++	unsigned long tp_value;		/* R8 */
++} user_desc_t;
++
++#endif /* _SYSDEP_TLS_H */
+diff --git a/arch/arm/um/signal.c b/arch/arm/um/signal.c
+new file mode 100644
+index 000000000..08f3731d1
+--- /dev/null
++++ b/arch/arm/um/signal.c
+@@ -0,0 +1,401 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Guest signal delivery for ARCH=um SUBARCH=arm.
++ *
++ * The frame built here is consumed by guest userspace, so it must match the
++ * arm32 signal ABI exactly -- glibc, musl and bionic all parse it. It is
++ * laid out the same way arch/arm/kernel/signal.c lays it out:
++ *
++ *	 sp ->	struct rt_sigframe { siginfo info; struct sigframe sig; }
++ *		struct sigframe { struct ucontext uc; unsigned long retcode[4]; }
++ *
++ * and on entry to the handler:
++ *
++ *	r0 = signo, r1 = &info, r2 = &sig.uc
++ *	sp = frame, lr = restorer, pc = handler
++ *
++ * uc.uc_regspace carries a chain of coprocessor records, each headed by a
++ * 32-bit magic and size. UML writes a vfp_sigframe when the host's VFP state
++ * is reachable (host_fp_size, set by the PTRACE_GETVFPREGS probe in
++ * arch_init_registers()), and a zero terminator otherwise. It deliberately
++ * does not write an iwmmxt record: no iwmmxt host state exists to copy, and
++ * emitting one whose storage came from nowhere would tell guest userspace it
++ * may use state the guest kernel never saves.
++ *
++ * Unlike x86-32, the 32-bit arm ABI hands the handler its return address in
++ * the *link* register, and the return address is a restorer trampoline that
++ * issues the sigreturn syscall on the guest's behalf. The real kernel writes
++ * the two-instruction trampoline into the frame's retcode[] slot (or an
++ * executable sigpage), which is out of the question here: UGL does not give
++ * the guest stack executable pages. Every mainstream arm32 libc sets
++ * SA_RESTORER with its own trampoline, which is used when present; the
++ * fallback is a plain function of the UML binary itself, because that
++ * binary *is* the guest's executable text.
++ */
++#include <linux/kernel.h>
++#include <linux/signal.h>
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <asm/unistd.h>
++#include <asm/ucontext.h>
++#include <asm/sigcontext.h>
++#include <frame_kern.h>
++#include <registers.h>
++#include <skas.h>
++
++/* Defined in os-Linux/registers.c, probed at boot; zero when the host
++ * kernel has no VFP state to hand over. */
++extern unsigned long host_fp_size;
++
++struct sigframe {
++	struct ucontext uc;
++	unsigned long retcode[4];
++};
++
++struct rt_sigframe {
++	struct siginfo info;
++	struct sigframe sig;
++};
++
++/*
++ * The bytes moved between the host's fp payload (regs->fp, sized at boot by
++ * host_fp_size) and the ufp member of a vfp_sigframe: 32 x 8 bytes of
++ * fpregs plus the 4-byte fpscr, in both orders. Not sizeof(uvp), which
++ * carries 4 padding bytes neither the host nor a valid record ever fills.
++ */
++#define UM_VFP_PAYLOAD_SIZE (32 * 8 + 4)
++
++/*
++ * Where the handler returns to when the guest did not supply SA_RESTORER.
++ * Plain ARM state, not thumb: the UML binary is built -march=armv7 with no
++ * thumb mix, and this function is executed in whatever state the handler
++ * leaves, which is ARM.
++ *
++ * Only the rt form exists: setup_signal_stack_sc forwards to the rt layout,
++ * so the restorer that every UGL-built frame installs is the rt one.
++ */
++static noinline void um_rt_sigreturn_restorer(void)
++{
++	__asm__ __volatile__(
++		"mov\tr7, %0\n"
++		"svc\t#0\n"
++		: : "i"(__NR_rt_sigreturn));
++}
++
++#ifdef CONFIG_VFP
++static void vfp_to_sigctx(struct vfp_sigframe *vfp, struct pt_regs *regs)
++{
++	if (!host_fp_size)
++		return;
++
++	vfp->magic = VFP_MAGIC;
++	vfp->size = VFP_STORAGE_SIZE;
++	memset(&vfp->ufp_exc, 0, sizeof(vfp->ufp_exc));
++	memcpy(&vfp->ufp, regs->regs.fp, host_fp_size);
++}
++#endif
++
++/*
++ * Walk uc_regspace for the VFP record. DUMMY and IWMMXT blocks are skipped
++ * using their documented sizes, as the real kernel's restore_*_context()
++ * does; a malformed record simply ends the walk, and the guest keeps the fp
++ * state it had, which is what the hardware does when the record is absent.
++ * The walk is bounded by the record sizes and the buffer length, so a
++ * corrupted sigframe cannot read past it.
++ */
++static void sigctx_to_vfp(struct pt_regs *regs, const unsigned long *regspace)
++{
++#ifdef CONFIG_VFP
++	const unsigned long *p = regspace;
++	unsigned long left = sizeof(uc.uc_regspace);
++
++	while (left >= sizeof(vfp_sigframe)) {
++		unsigned long magic = p[0];
++		unsigned long size = p[1];
++
++		if (!magic || !size || size > left || (size & 7))
++			break;
++
++		if (magic == VFP_MAGIC && size >= sizeof(vfp_sigframe)) {
++			struct vfp_sigframe vfp;
++
++			memcpy(&vfp, p, sizeof(vfp));
++			if (host_fp_size >= UM_VFP_PAYLOAD_SIZE)
++				memcpy(regs->regs.fp, &vfp.ufp, host_fp_size);
++			break;
++		}
++
++		/*
++		 * DUMMY blocks are padding, IWMMXT blocks the iWMMXt state;
++		 * both are skipped over with their recorded size. UML never
++		 * writes an IWMMXT record, so on a build without
++		 * CONFIG_IWMMXT only the DUMMY case remains.
++		 */
++		if (magic == DUMMY_MAGIC
++#ifdef CONFIG_IWMMXT
++		    || magic == IWMMXT_MAGIC
++#endif
++		) {
++			p += size / sizeof(unsigned long);
++			left -= size;
++			continue;
++		}
++
++		break;
++	}
++#endif
++}
++
++static int copy_sc_from_user(struct pt_regs *regs,
++			     struct ucontext __user *from)
++{
++	struct ucontext uc;
++
++	/* Any restarted syscall interrupted by this signal now returns -EINTR. */
++	current->restart_block.fn = do_no_restart_syscall;
++
++	if (copy_from_user(&uc, from, sizeof(uc)))
++		return 1;
++
++	regs->regs.gp[HOST_R0] = uc.uc_mcontext.arm_r0;
++	regs->regs.gp[HOST_R1] = uc.uc_mcontext.arm_r1;
++	regs->regs.gp[HOST_R2] = uc.uc_mcontext.arm_r2;
++	regs->regs.gp[HOST_R3] = uc.uc_mcontext.arm_r3;
++	regs->regs.gp[HOST_R4] = uc.uc_mcontext.arm_r4;
++	regs->regs.gp[HOST_R5] = uc.uc_mcontext.arm_r5;
++	regs->regs.gp[HOST_R6] = uc.uc_mcontext.arm_r6;
++	regs->regs.gp[HOST_R7] = uc.uc_mcontext.arm_r7;
++	regs->regs.gp[HOST_R8] = uc.uc_mcontext.arm_r8;
++	regs->regs.gp[HOST_R9] = uc.uc_mcontext.arm_r9;
++	regs->regs.gp[HOST_R10] = uc.uc_mcontext.arm_r10;
++	regs->regs.gp[HOST_FP] = uc.uc_mcontext.arm_fp;
++	regs->regs.gp[HOST_IP] = uc.uc_mcontext.arm_ip;
++	regs->regs.gp[HOST_SP] = uc.uc_mcontext.arm_sp;
++	regs->regs.gp[HOST_LR] = uc.uc_mcontext.arm_lr;
++	regs->regs.gp[HOST_PC] = uc.uc_mcontext.arm_pc;
++
++	/*
++	 * CPSR is filtered the same way arch/arm/kernel/ptrace.c filters it
++	 * for a debugger (valid_user_regs): only the F, S, X and T bits plus
++	 * the 32-bit mode bit are writable. Restoring the field verbatim from
++	 * a user-writable buffer would let the guest hand itself kernel mode
++	 * or 26-bit state.
++	 */
++	regs->regs.gp[HOST_CPSR] =
++		(regs->regs.gp[HOST_CPSR] & ~UM_CPSR_WRITABLE) |
++		(uc.uc_mcontext.arm_cpsr & UM_CPSR_WRITABLE);
++
++	/* Synthetic slot, kept honest for the syscall restart machinery. */
++	regs->regs.gp[HOST_SYSCALL_NR] = uc.uc_mcontext.arm_r7;
++
++	sigctx_to_vfp(regs, uc.uc_regspace);
++
++	return 0;
++}
++
++static int copy_sc_to_user(struct ucontext __user *to, struct pt_regs *regs,
++			   sigset_t *mask)
++{
++	struct ucontext uc;
++
++	memset(&uc, 0, sizeof(uc));
++
++	uc.uc_mcontext.arm_r0 = regs->regs.gp[HOST_R0];
++	uc.uc_mcontext.arm_r1 = regs->regs.gp[HOST_R1];
++	uc.uc_mcontext.arm_r2 = regs->regs.gp[HOST_R2];
++	uc.uc_mcontext.arm_r3 = regs->regs.gp[HOST_R3];
++	uc.uc_mcontext.arm_r4 = regs->regs.gp[HOST_R4];
++	uc.uc_mcontext.arm_r5 = regs->regs.gp[HOST_R5];
++	uc.uc_mcontext.arm_r6 = regs->regs.gp[HOST_R6];
++	uc.uc_mcontext.arm_r7 = regs->regs.gp[HOST_R7];
++	uc.uc_mcontext.arm_r8 = regs->regs.gp[HOST_R8];
++	uc.uc_mcontext.arm_r9 = regs->regs.gp[HOST_R9];
++	uc.uc_mcontext.arm_r10 = regs->regs.gp[HOST_R10];
++	uc.uc_mcontext.arm_fp = regs->regs.gp[HOST_FP];
++	uc.uc_mcontext.arm_ip = regs->regs.gp[HOST_IP];
++	uc.uc_mcontext.arm_sp = regs->regs.gp[HOST_SP];
++	uc.uc_mcontext.arm_lr = regs->regs.gp[HOST_LR];
++	uc.uc_mcontext.arm_pc = regs->regs.gp[HOST_PC];
++	uc.uc_mcontext.arm_cpsr = regs->regs.gp[HOST_CPSR];
++
++	/*
++	 * error_code carries the FSR of the fault that started this frame,
++	 * from the stub's faultinfo; oldmask is the first word of the old
++	 * mask, as the real kernel writes it. The arm sigcontext has no
++	 * fault-address member at all -- real arm32 hardware does not
++	 * deliver one either; the guest's handler gets the address from
++	 * siginfo's si_addr, which copy_siginfo_to_user() has already
++	 * placed in the frame.
++	 */
++	uc.uc_mcontext.error_code = current->thread.arch.faultinfo.ec;
++	uc.uc_mcontext.oldmask = mask->sig[0];
++
++#ifdef CONFIG_VFP
++	/*
++	 * The coprocessor chain runs out of the head of uc_regspace, so the
++	 * VFP record must fit in it. With host FP state, vfp_to_sigctx()
++	 * writes one self-delimiting record there; without, the region stays
++	 * zeroed from the memset above, which is already the "no records"
++	 * terminator a parser looks for. Nothing may be zeroed afterwards:
++	 * the record's magic and size fields sit exactly at [0] and [1].
++	 */
++	BUILD_BUG_ON(sizeof(struct vfp_sigframe) > sizeof(uc.uc_regspace));
++
++	vfp_to_sigctx((struct vfp_sigframe *)uc.uc_regspace, regs);
++#endif
++
++	uc.uc_sigmask = *mask;
++
++	return copy_to_user(to, &uc, sizeof(uc));
++}
++
++int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
++			  struct pt_regs *regs, sigset_t *mask)
++{
++	struct rt_sigframe __user *frame;
++	unsigned long sp;
++	int err = 0;
++
++	/* AAPCS arm32 requires an 8-byte aligned stack pointer at all times. */
++	sp = round_down(stack_top, 8);
++	sp = round_down(sp - sizeof(*frame), 8);
++	frame = (struct rt_sigframe __user *)sp;
++
++	if (!access_ok(frame, sizeof(*frame)))
++		return 1;
++
++	err |= copy_siginfo_to_user(&frame->info, &ksig->info);
++
++	err |= __put_user(0, &frame->sig.uc.uc_flags);
++	err |= __put_user(NULL, &frame->sig.uc.uc_link);
++	err |= __save_altstack(&frame->sig.uc.uc_stack, PT_REGS_SP(regs));
++	err |= copy_sc_to_user(&frame->sig.uc, regs, mask);
++
++	/*
++	 * The retcode[] slot holds the real kernel's in-frame restorer. UGL
++	 * never writes guest stack as executable, so the slot stays zero and
++	 * the return address comes from below instead.
++	 */
++
++	if (err)
++		return err;
++
++	PT_REGS_SP(regs) = (unsigned long) frame;
++	PT_REGS_IP(regs) = (unsigned long) ksig->ka.sa.sa_handler;
++	PT_REGS_R0(regs) = ksig->sig;
++	PT_REGS_R1(regs) = (unsigned long) &frame->info;
++	PT_REGS_R2(regs) = (unsigned long) &frame->sig.uc;
++
++	/*
++	 * Where the handler returns to.
++	 *
++	 * arm32 hands it to the guest through lr. glibc, musl and bionic
++	 * all install a restorer of their own (SA_RESTORER); anything that
++	 * does not gets UGL's, which is executable text of the UML binary
++	 * and therefore present in every stub's address space.
++	 */
++	if (ksig->ka.sa.sa_flags & SA_RESTORER)
++		PT_REGS_LR(regs) = (unsigned long) ksig->ka.sa.sa_restorer;
++	else
++		PT_REGS_LR(regs) = (unsigned long) um_rt_sigreturn_restorer;
++
++	return 0;
++}
++
++/*
++ * arm32 still has a non-realtime frame, but every mainstream libc delivers
++ * through rt_sigaction, and a non-SA_SIGINFO handler that expected a plain
++ * sigframe is a 1990s binary. Forward to the rt layout, as arch/um/kernel/
++ * signal.c's sc variant is only ever called when !SA_SIGINFO.
++ */
++int setup_signal_stack_sc(unsigned long stack_top, struct ksignal *ksig,
++			  struct pt_regs *regs, sigset_t *mask)
++{
++	return setup_signal_stack_si(stack_top, ksig, regs, mask);
++}
++
++/*
++ * The EABI table (arch/arm/tools/syscall.tbl) names its entry points
++ * sys_sigreturn_wrapper and sys_rt_sigreturn_wrapper; the real kernel
++ * implements them in entry-common.S, which is not built for ARCH=um, so
++ * they are repeated here. They take no arguments -- the frame is on the
++ * stack -- but every entry in the UML table has the six-argument shape,
++ * so the wrappers simply ignore what is in r0-r5.
++ */
++asmlinkage long sys_sigreturn_wrapper(unsigned long, unsigned long,
++				      unsigned long, unsigned long,
++				      unsigned long, unsigned long)
++{
++	unsigned long sp = PT_REGS_SP(&current->thread.regs);
++	struct sigframe __user *frame = (struct sigframe __user *)sp;
++	sigset_t set;
++
++	/*
++	 * The frame was placed at an 8-byte boundary, so a misaligned sp
++	 * means the guest corrupted its stack rather than returning from
++	 * a signal.
++	 */
++	if (sp & 7)
++		goto segfault;
++
++	if (copy_from_user(&set, &frame->uc.uc_sigmask, sizeof(set)))
++		goto segfault;
++
++	set_current_blocked(&set);
++
++	if (copy_sc_from_user(&current->thread.regs, &frame->uc))
++		goto segfault;
++
++	/*
++	 * Do not let the syscall restart machinery act on this return value.
++	 *
++	 * It is PT_REGS_SYSCALL_NR that has to be cleared, not
++	 * PT_REGS_ORIG_SYSCALL: arch/um/kernel/signal.c tests
++	 * "PT_REGS_SYSCALL_NR(regs) >= 0" to decide whether a syscall is in
++	 * flight, and on arm32 that maps to the synthetic register slot
++	 * which sigreturn never restores.
++	 *
++	 * The consequence of skipping this is silent: a handler returning
++	 * into a context whose r0 happens to hold one of the four
++	 * -ERESTART* values, with another signal deliverable, gets its
++	 * context rewritten -- the program counter rewound four bytes and
++	 * r0 replaced from a slot sigreturn never restored.
++	 */
++	PT_REGS_SYSCALL_NR(&current->thread.regs) = -1;
++	return PT_REGS_SYSCALL_RET(&current->thread.regs);
++
++ segfault:
++	force_sig(SIGSEGV);
++	return 0;
++}
++
++asmlinkage long sys_rt_sigreturn_wrapper(unsigned long, unsigned long,
++					  unsigned long, unsigned long,
++					  unsigned long, unsigned long)
++{
++	unsigned long sp = PT_REGS_SP(&current->thread.regs);
++	struct rt_sigframe __user *frame = (struct rt_sigframe __user *)sp;
++	struct ucontext __user *uc = &frame->sig.uc;
++	sigset_t set;
++
++	if (sp & 7)
++		goto segfault;
++
++	if (copy_from_user(&set, &uc->uc_sigmask, sizeof(set)))
++		goto segfault;
++
++	set_current_blocked(&set);
++
++	if (copy_sc_from_user(&current->thread.regs, uc))
++		goto segfault;
++
++	if (restore_altstack(&uc->uc_stack))
++		goto segfault;
++
++	PT_REGS_SYSCALL_NR(&current->thread.regs) = -1;
++	return PT_REGS_SYSCALL_RET(&current->thread.regs);
++
++ segfault:
++	force_sig(SIGSEGV);
++	return 0;
++}
+diff --git a/arch/arm/um/stub_segv.c b/arch/arm/um/stub_segv.c
+new file mode 100644
+index 000000000..3f9d93199
+--- /dev/null
++++ b/arch/arm/um/stub_segv.c
+@@ -0,0 +1,20 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SIGSEGV handler that runs *inside* the stub process, with no libc and no
++ * stack protector. It records where and why the fault happened into the stub's
++ * data page and then traps, handing control back to the UML kernel.
++ */
++#include <sysdep/stub.h>
++#include <sysdep/faultinfo.h>
++#include <sysdep/mcontext.h>
++#include <sys/ucontext.h>
++
++void __attribute__ ((__section__ (".__syscall_stub")))
++stub_segv_handler(int sig, siginfo_t *si, void *p)
++{
++	struct faultinfo *f = get_stub_data();
++	ucontext_t *uc = p;
++
++	GET_FAULTINFO_FROM_MC(*f, &uc->uc_mcontext);
++	trap_myself();
++}
+diff --git a/arch/arm/um/sys_call_table.c b/arch/arm/um/sys_call_table.c
+new file mode 100644
+index 000000000..985ab603c
+--- /dev/null
++++ b/arch/arm/um/sys_call_table.c
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * System call table for UML/arm.
++ *
++ * arm uses the classic register ABI: the number in r7, arguments r0-r5,
++ * result in r0. The table body and its size are committed under
++ * arch/arm/um/asm/ as syscall_table_eabi.h and unistd-nr.h, generated from
++ * arch/arm/tools/syscall.tbl by the parent's own scripts; each header says
++ * how to regenerate it. They cannot come out of the kbuild flow: the UML
++ * build takes the parent through archheaders (the uapi step) only, and
++ * arch/arm's archprepare kapi step that would emit them into
++ * arch/arm/include/generated/asm/ is never run.
++ *
++ * The parent arch/arm kernel implements six of these entry points as
++ * wrappers in arch/arm/kernel/ (sys_mmap2, the two sigreturn variants,
++ * the two statfs64 variants, sys_arm_fadvise64_64), which are not built
++ * for ARCH=um; this subarch provides them in syscalls.c and signal.c.
++ *
++ * handle_syscall() in arch/um/kernel/skas/syscall.c unpacks the six
++ * arguments itself and calls the syscall with them directly, exactly as x86
++ * UML does, so the table holds the plain sys_* functions and the pt_regs
++ * wrappers are neither built nor needed. The calls pass six words through
++ * sys_call_ptr_t; entries that use fewer simply do not read the rest.
++ */
++#include <linux/linkage.h>
++#include <linux/sys.h>
++#include <linux/cache.h>
++#include <asm/syscall.h>
++#include <asm/unistd.h>
++
++extern asmlinkage long sys_ni_syscall(unsigned long, unsigned long,
++				      unsigned long, unsigned long,
++				      unsigned long, unsigned long);
++
++/*
++ * A UML guest only enters its own 32-bit EABI system calls, so every dual
++ * entry resolves to the native side. The macro chain is what makes the same
++ * header work for both the externs and the initializer: WITH_COMPAT expands
++ * to __SYSCALL at the use, which is whatever form is defined at that point.
++ */
++#define __SYSCALL_WITH_COMPAT(nr, native, compat)	__SYSCALL(nr, native)
++
++#define __SYSCALL(nr, sym) extern asmlinkage long sym(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long);
++#include <asm/syscall_table_eabi.h>
++#undef  __SYSCALL
++
++#include <asm/unistd-nr.h>
++
++#define __SYSCALL(nr, sym) [nr] = sym,
++const sys_call_ptr_t sys_call_table[__NR_syscalls] ____cacheline_aligned = {
++	[0 ... __NR_syscalls - 1] = sys_ni_syscall,
++#include <asm/syscall_table_eabi.h>
++};
++#undef  __SYSCALL
++#undef  __SYSCALL_WITH_COMPAT
++
++int syscall_table_size = sizeof(sys_call_table);
+diff --git a/arch/arm/um/syscalls.c b/arch/arm/um/syscalls.c
+new file mode 100644
+index 000000000..be9c7f5cf
+--- /dev/null
++++ b/arch/arm/um/syscalls.c
+@@ -0,0 +1,114 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Architecture-specific syscalls for UML/arm.
++ *
++ * The arm EABI table (arch/arm/tools/syscall.tbl) names six entry points
++ * that do not exist in the generic kernel:
++ *
++ *	119  sigreturn          sys_sigreturn_wrapper
++ *	173  rt_sigreturn      sys_rt_sigreturn_wrapper
++ *	192  mmap2             sys_mmap2
++ *	266  statfs64          sys_statfs64_wrapper
++ *	267  fstatfs64         sys_fstatfs64_wrapper
++ *	270  arm_fadvise64_64  sys_arm_fadvise64_64
++ *
++ * The first, fourth, fifth and sixth are implemented in
++ * arch/arm/kernel/entry-common.S and arch/arm/kernel/sys_arm.c; the two
++ * sigreturn wrappers are likewise asm. None of that is built for ARCH=um, so
++ * they are repeated here, as x86 UML repeats its own entry wrappers and the
++ * arm64 port repeats its sys_mmap.
++ *
++ * Every table entry is called through sys_call_ptr_t with six unsigned long
++ * arguments, so each definition below is written with the entry's native
++ * prototype: the extra words simply land in registers the callee does not
++ * read. The two sigreturn wrappers are no-argument calls, but the table
++ * shape still applies, so they ignore whatever is in r0-r5.
++ */
++#include <linux/sched.h>
++#include <linux/sched/mm.h>
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <linux/stat.h>
++#include <asm/ptrace.h>
++#include <registers.h>
++#include <os.h>
++
++/*
++ * arm32 sys_mmap takes a byte offset; mmap2 takes a page offset, which is
++ * what distinguishes it. The parent implements sys_mmap2 in entry-common.S
++ * as "str r5, [sp, #4]; b sys_mmap_pgoff", i.e. the page unit is passed
++ * through unchanged -- no offset_in_page check, because a fractional page
++ * is not a meaningful value in page units and the guest cannot ask for one.
++ */
++SYSCALL_DEFINE6(mmap2, unsigned long, addr, unsigned long, len,
++		unsigned long, prot, unsigned long, flags,
++		unsigned long, fd, unsigned long, pgoff)
++{
++	return ksys_mmap_pgoff(addr, len, prot, flags, fd, pgoff);
++}
++
++/*
++ * 32-bit userspace passes sizeof(struct statfs) in the size argument, but
++ * the kernel wants the size of its own struct statfs64. The parent fixes
++ * this up in registers before branching to the generic implementation:
++ * teq r1, #88; moveq r1, #84. Same fix, in C.
++ */
++asmlinkage long sys_statfs64_wrapper(const char __user *path, size_t sz,
++				     struct statfs64 __user *buf)
++{
++	if (sz == 88)
++		sz = 84;
++
++	return sys_statfs64(path, sz, buf);
++}
++
++asmlinkage long sys_fstatfs64_wrapper(unsigned int fd, size_t sz,
++				      struct statfs64 __user *buf)
++{
++	if (sz == 88)
++		sz = 84;
++
++	return sys_fstatfs64(fd, sz, buf);
++}
++
++/*
++ * EABI fadvise64_64 carries its two 64-bit arguments in register pairs --
++ * offset in r2:r3, len in r4:r5 -- with the advice argument in r1, which
++ * differs from the generic fadvise64_64 order (advice last). The table's
++ * six-word call delivers the guest's r0-r5 straight into the callee's
++ * arguments, so the reordering happens exactly as the parent does it in
++ * sys_arm.c.
++ */
++asmlinkage long sys_arm_fadvise64_64(int fd, int advice,
++				     loff_t offset, loff_t len)
++{
++	return ksys_fadvise64_64(fd, offset, len, advice);
++}
++
++/*
++ * The sigreturn wrappers are defined in signal.c, where the frame code
++ * they share lives; this file exists for the table's remaining entries.
++ */
++
++void arch_switch_to(struct task_struct *to)
++{
++	/*
++	 * Nothing to do, and it is important that nothing is done.
++	 *
++	 * arm32 userspace owns R8 outright: the EABI psABI puts the thread
++	 * pointer in R8, which guest code sets with a plain store -- arm32
++	 * has no set_thread_area or any other syscall for it. UML captures
++	 * whatever value the guest left in get_host_regs() or
++	 * get_regs_from_mc() -- R8 is an ordinary word of the register
++	 * block -- keeps it in the task's own HOST_TLS register slot, and
++	 * writes it back in put_host_regs(). Since that slot is part of the
++	 * per-task register file, switching tasks already switches the TLS.
++	 *
++	 * Reinstating thread.arch.tp_value here instead would be actively
++	 * wrong: that field is only ever set by CLONE_SETTLS, so for a
++	 * thread that set R8 itself -- which is every normal thread -- it is
++	 * zero, and copying it over the live value wipes the guest's thread
++	 * pointer on the first context switch. Any libc that compares the
++	 * live thread pointer against its own copy notices immediately.
++	 */
++}
+diff --git a/arch/arm/um/sysrq.c b/arch/arm/um/sysrq.c
+new file mode 100644
+index 000000000..99d77ce17
+--- /dev/null
++++ b/arch/arm/um/sysrq.c
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pid.h>
++#include <linux/sched.h>
++#include <linux/sched/debug.h>
++#include <linux/utsname.h>
++#include <asm/current.h>
++#include <asm/ptrace.h>
++
++void show_regs(struct pt_regs *regs)
++{
++	int i;
++
++	printk("\n");
++	print_modules();
++	printk(KERN_INFO "Pid: %d, comm: %.20s %s %s\n", task_pid_nr(current),
++	       current->comm, print_tainted(), init_utsname()->release);
++
++	printk(KERN_INFO "pc : %pS\n", (void *)PT_REGS_IP(regs));
++	printk(KERN_INFO "lr : %pS\n", (void *)PT_REGS_LR(regs));
++	printk(KERN_INFO "sp : %08lx  cpsr : %08lx\n",
++	       PT_REGS_SP(regs), PT_REGS_CPSR(regs));
++	printk(KERN_INFO "fp : %08lx  ip : %08lx\n",
++	       PT_REGS_X(regs, HOST_FP), PT_REGS_X(regs, HOST_IP));
++
++	/*
++	 * Three registers per line, highest first, so an arm developer can
++	 * read a UML oops the same way arch/arm/kernel/traps.c prints them.
++	 */
++	for (i = 10; i >= 0; i -= 3) {
++		if (i >= 3)
++			printk(KERN_INFO "r%-2d: %08lx r%-2d: %08lx r%-2d: %08lx\n",
++			       i, PT_REGS_X(regs, HOST_R0 + i),
++			       i - 1, PT_REGS_X(regs, HOST_R0 + i - 1),
++			       i - 2, PT_REGS_X(regs, HOST_R0 + i - 2));
++		else if (i == 2)
++			printk(KERN_INFO "r2 : %08lx r1 : %08lx r0 : %08lx\n",
++			       PT_REGS_X(regs, HOST_R0 + 2),
++			       PT_REGS_X(regs, HOST_R0 + 1),
++			       PT_REGS_X(regs, HOST_R0));
++		else
++			printk(KERN_INFO "r0 : %08lx\n",
++			       PT_REGS_X(regs, HOST_R0));
++	}
++}
+diff --git a/arch/arm/um/tls.c b/arch/arm/um/tls.c
+new file mode 100644
+index 000000000..2de09b400
+--- /dev/null
++++ b/arch/arm/um/tls.c
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Guest TLS for ARCH=um SUBARCH=arm.
++ *
++ * arm32 thread-local storage is the r8 register: the psABI assigns it to the
++ * thread pointer, and every mainstream arm32 libc (glibc, musl, bionic)
++ * reads TLS from there directly, exactly as arm64 code reads TPIDR_EL0.
++ * There is no set_thread_area(2) and no descriptor table.
++ *
++ * That means UML never has to intercept a TLS *change*; it only has to make
++ * sure the right value is in the register when it resumes a given guest
++ * thread, since several guest threads share one stub process. r8 is an
++ * ordinary general-purpose register in the host's PTRACE_GETREGS and in the
++ * signal frame, so it travels in the per-task register file (gp[HOST_TLS])
++ * and is restored by every put_host_regs() and sigreturn.
++ */
++#include <linux/sched.h>
++#include <asm/ptrace.h>
++
++void clear_flushed_tls(struct task_struct *task)
++{
++}
++
++int arch_set_tls(struct task_struct *t, unsigned long tls)
++{
++	/*
++	 * CLONE_SETTLS: remember the value so the next switch to this task
++	 * installs it. R8 is part of user_regs_struct, so it can be stashed
++	 * straight into the register file; the arch field keeps the same
++	 * record arm64 does, of what CLONE_SETTLS asked for, in case
++	 * something ever has to reinstall it.
++	 */
++	t->thread.arch.tp_value = tls;
++	t->thread.regs.regs.gp[HOST_TLS] = tls;
++
++	return 0;
++}
+diff --git a/arch/arm/um/user-offsets.c b/arch/arm/um/user-offsets.c
+new file mode 100644
+index 000000000..88c5d48b6
+--- /dev/null
++++ b/arch/arm/um/user-offsets.c
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Generates include/generated/user_constants.h for ARCH=um SUBARCH=arm.
++ *
++ * This file is compiled with USER_CFLAGS against the *host* headers, so
++ * everything it sees describes the arm32 process UML runs as.
++ */
++#include <stdio.h>
++#include <stddef.h>
++#include <signal.h>
++#include <poll.h>
++#include <sys/mman.h>
++#include <sys/user.h>
++#include <asm/ptrace.h>
++#include <asm/types.h>
++#include <linux/kbuild.h>
++
++#define DEFINE_LONGS(sym, val)	\
++	COMMENT(#val " / sizeof(unsigned long)");	\
++	DEFINE(sym, val / sizeof(unsigned long))
++
++/* workaround for a warning with -Wmissing-prototypes */
++void foo(void);
++
++void foo(void)
++{
++	/*
++	 * struct user_regs_struct on arm32 is 18 x unsigned int:
++	 *
++	 *	ureg[0..10]   = r0-r10
++	 *	ureg[11]       = fp (r11)
++	 *	ureg[12]       = ip (r12)
++	 *	ureg[13]       = sp
++	 *	ureg[14]       = lr
++	 *	ureg[15]       = pc
++	 *	ureg[16]       = cpsr
++	 *	ureg[17]       = orig_r0
++	 *
++	 * Unlike arm64 there is no separate special-register set at all: SP,
++	 * LR and PC are ordinary members, and the original first argument is
++	 * already exposed by the host kernel at ureg[17]. Every slot is one
++	 * unsigned long on this target, so the indices are simply word
++	 * offsets into the 72-byte PTRACE_GETREGS payload.
++	 */
++	DEFINE_LONGS(HOST_R0,  offsetof(struct user_regs_struct, ureg[0]));
++	DEFINE_LONGS(HOST_R1,  offsetof(struct user_regs_struct, ureg[1]));
++	DEFINE_LONGS(HOST_R2,  offsetof(struct user_regs_struct, ureg[2]));
++	DEFINE_LONGS(HOST_R3,  offsetof(struct user_regs_struct, ureg[3]));
++	DEFINE_LONGS(HOST_R4,  offsetof(struct user_regs_struct, ureg[4]));
++	DEFINE_LONGS(HOST_R5,  offsetof(struct user_regs_struct, ureg[5]));
++	DEFINE_LONGS(HOST_R6,  offsetof(struct user_regs_struct, ureg[6]));
++	DEFINE_LONGS(HOST_R7,  offsetof(struct user_regs_struct, ureg[7]));
++	DEFINE_LONGS(HOST_R8,  offsetof(struct user_regs_struct, ureg[8]));
++	DEFINE_LONGS(HOST_R9,  offsetof(struct user_regs_struct, ureg[9]));
++	DEFINE_LONGS(HOST_R10, offsetof(struct user_regs_struct, ureg[10]));
++
++	DEFINE_LONGS(HOST_FP,   offsetof(struct user_regs_struct, ureg[11]));
++	DEFINE_LONGS(HOST_IP,   offsetof(struct user_regs_struct, ureg[12]));
++	DEFINE_LONGS(HOST_SP,   offsetof(struct user_regs_struct, ureg[13]));
++	DEFINE_LONGS(HOST_LR,   offsetof(struct user_regs_struct, ureg[14]));
++	DEFINE_LONGS(HOST_PC,   offsetof(struct user_regs_struct, ureg[15]));
++	DEFINE_LONGS(HOST_CPSR, offsetof(struct user_regs_struct, ureg[16]));
++	DEFINE_LONGS(HOST_ORIG_R0, offsetof(struct user_regs_struct, ureg[17]));
++
++	/*
++	 * UM_FRAME_SIZE is the size of the register block that is actually
++	 * exchanged with the host via PTRACE_GETREGS/SETREGS. It is the
++	 * bound for peek_user/poke_user and for every ptrace transfer.
++	 */
++	DEFINE(UM_FRAME_SIZE, sizeof(struct user_regs_struct));
++
++	/*
++	 * One slot past the end of the host regset, synthesised by UML:
++	 *
++	 *   HOST_SYSCALL_NR  the in-flight syscall number. The host keeps it
++	 *                    in r7, but UML cannot read it from there: at a
++	 *                    syscall stop r7 is the number, while at every
++	 *                    other stop it is just a scratch register the
++	 *                    stub happened to hold. r7 is only ever
++	 *                    authoritative on the syscall-stop paths, so UML
++	 *                    copies it here where it stays, and x86 gets the
++	 *                    same treatment as orig_ax inside its regset.
++	 *
++	 * HOST_ORIG_R0 needs no synthesised slot: unlike arm64's x0, the host
++	 * exposes the original first argument inside the regset at ureg[17].
++	 */
++	DEFINE(HOST_SYSCALL_NR, sizeof(struct user_regs_struct) / sizeof(unsigned long));
++	DEFINE(UM_MAX_REG_NR,   sizeof(struct user_regs_struct) / sizeof(unsigned long) + 1);
++
++	/*
++	 * Guest TLS. arm32 userland owns R8 outright (userspace sets it with
++	 * "mov r8, #off" style TLS access or the set_tls syscall), so the slot
++	 * is not appended here: it is the ordinary ureg[8] slot, and
++	 * arch_set_tls() writes it there.
++	 */
++	DEFINE(HOST_TLS, offsetof(struct user_regs_struct, ureg[8]) /
++			sizeof(unsigned long));
++
++	DEFINE(UM_POLLIN, POLLIN);
++	DEFINE(UM_POLLPRI, POLLPRI);
++	DEFINE(UM_POLLOUT, POLLOUT);
++
++	DEFINE(UM_PROT_READ, PROT_READ);
++	DEFINE(UM_PROT_WRITE, PROT_WRITE);
++	DEFINE(UM_PROT_EXEC, PROT_EXEC);
++}
+diff --git a/arch/um/configs/arm_defconfig b/arch/um/configs/arm_defconfig
+new file mode 100644
+index 000000000..763f54f01
+--- /dev/null
++++ b/arch/um/configs/arm_defconfig
+@@ -0,0 +1,87 @@
++#
++# 4 KB pages, explicitly: guest pages are host mmap()s, so the guest's page
++# size cannot be smaller than the host's. Every arm32 host kernel runs 4 KB
++# pages, and the arm32 defconfig does not offer any other size to select --
++# arch/um/Kconfig only advertises HAVE_PAGE_SIZE_4KB for this subarch.
++#
++# The bootable-guest filesystem set, same shape as the arm64 defconfig:
++# initramfs for root, then an ELF interpreter and script runner so the guest
++# can exec its own binaries, a tmpfs/devtmpfs pair for /tmp and /dev, and
++# ext4 as the primary on-disk filesystem.
++#
++CONFIG_PAGE_SIZE_4KB=y
++CONFIG_BLK_DEV_INITRD=y
++CONFIG_RD_GZIP=y
++CONFIG_RD_XZ=y
++CONFIG_RD_ZSTD=y
++CONFIG_EXT4_FS=y
++CONFIG_EXT4_USE_FOR_EXT2=y
++CONFIG_TMPFS=y
++CONFIG_TMPFS_POSIX_ACL=y
++CONFIG_DEVTMPFS=y
++CONFIG_DEVTMPFS_MOUNT=y
++CONFIG_BINFMT_ELF=y
++CONFIG_BINFMT_SCRIPT=y
++# CONFIG_COMPACTION is not set
++CONFIG_BINFMT_MISC=m
++CONFIG_HOSTFS=y
++CONFIG_MAGIC_SYSRQ=y
++CONFIG_SYSVIPC=y
++CONFIG_POSIX_MQUEUE=y
++CONFIG_NO_HZ=y
++CONFIG_HIGH_RES_TIMERS=y
++CONFIG_BSD_PROCESS_ACCT=y
++CONFIG_IKCONFIG=y
++CONFIG_IKCONFIG_PROC=y
++CONFIG_LOG_BUF_SHIFT=14
++CONFIG_CGROUPS=y
++CONFIG_CGROUP_FREEZER=y
++CONFIG_CGROUP_DEVICE=y
++CONFIG_CPUSETS=y
++CONFIG_CGROUP_CPUACCT=y
++CONFIG_CGROUP_SCHED=y
++CONFIG_BLK_CGROUP=y
++# CONFIG_PID_NS is not set
++CONFIG_SYSFS_DEPRECATED=y
++CONFIG_CC_OPTIMIZE_FOR_SIZE=y
++CONFIG_MODULES=y
++CONFIG_MODULE_UNLOAD=y
++# CONFIG_BLK_DEV_BSG is not set
++CONFIG_IOSCHED_BFQ=m
++CONFIG_SSL=y
++CONFIG_NULL_CHAN=y
++CONFIG_PORT_CHAN=y
++CONFIG_PTY_CHAN=y
++CONFIG_TTY_CHAN=y
++CONFIG_XTERM_CHAN=y
++CONFIG_CON_CHAN="pts"
++CONFIG_SSL_CHAN="pts"
++CONFIG_SOUND=m
++CONFIG_UML_SOUND=m
++CONFIG_DEVTMPFS=y
++CONFIG_DEVTMPFS_MOUNT=y
++CONFIG_BLK_DEV_UBD=y
++CONFIG_BLK_DEV_LOOP=m
++CONFIG_BLK_DEV_NBD=m
++CONFIG_DUMMY=m
++CONFIG_TUN=m
++CONFIG_PPP=m
++CONFIG_SLIP=m
++CONFIG_LEGACY_PTY_COUNT=32
++# CONFIG_HW_RANDOM is not set
++CONFIG_UML_RANDOM=y
++CONFIG_NET=y
++CONFIG_PACKET=y
++CONFIG_UNIX=y
++CONFIG_INET=y
++# CONFIG_IPV6 is not set
++CONFIG_EXT4_FS=y
++CONFIG_QUOTA=y
++CONFIG_AUTOFS_FS=m
++CONFIG_ISO9660_FS=m
++CONFIG_JOLIET=y
++CONFIG_PROC_KCORE=y
++CONFIG_TMPFS=y
++CONFIG_NLS=y
++CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
++CONFIG_DEBUG_KERNEL=y

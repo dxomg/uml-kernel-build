@@ -2,10 +2,10 @@
 
 User-Mode Linux, batteries included:
 
-- **Kernels** — x86_64 and arm64 UML kernels built by CI from vanilla
+- **Kernels** — x86_64, arm64 and arm32 UML kernels built by CI from vanilla
   releases, with a set of bundled patches (memfd physmem, host-RSS
-  reclaim, SMP backport for 6.18 LTS, full arm64 port, container and
-  storage config). Artifacts boot any Linux cloud image, no root
+  reclaim, SMP backport for 6.18 LTS, full arm64 and arm32 ports, container
+  and storage config). Artifacts boot any Linux cloud image, no root
   needed.
 - **Network helper** — [`vdeplug-go/`](vdeplug-go/), a Go rewrite of
   `vde_plug` on gVisor's netstack: privileged-free NAT, DHCP, port
