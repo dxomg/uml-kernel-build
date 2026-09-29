@@ -31,6 +31,15 @@ name: "UML Kernel — stable arm32 (linux-um port, cross-built)"
 #   ("target CPU does not support ARM mode").
 # - The UML SMP backport (apply-smp.sh) is NOT applied here: 7.2.x has native
 #   SMP, and the arm32 port was developed and gate-tested against plain 7.2.4.
+#
+# Two jobs run on every dispatch:
+# - build       — the regular kernel, dynamically linked against the arm32
+#                 glibc the target device supplies (the stub's -static is
+#                 dropped for that reason; see the comment at the link step).
+# - build-static — the same kernel + config with CONFIG_STATIC_LINK, so the
+#                 vmlinux and the SKAS stub are fully static (no .so
+#                 dependency, runs on glibc and musl hosts alike) — the
+#                 arm32 twin of lts_latest_static.yml.
 
 on:
   schedule:
@@ -295,4 +304,254 @@ jobs:
           name: linux-uml-stable-arm32
           path: |
             linux-uml-arm32
+            VERSION
+
+  # Same kernel, same cross-build, but the vmlinux (and its SKAS stub) are
+  # linked FULLY STATIC: zero runtime .so dependency, runs on any same-arch
+  # host — glibc distros and musl distros (Alpine) alike — mirroring
+  # lts_latest_static.yml for x86_64. How:
+  # - CONFIG_STATIC_LINK (the MAY_HAVE_RUNTIME_DEPS guard that normally
+  #   forbids VECTOR + STATIC is dropped by vector-static-link.patch, already
+  #   applied above) → CONFIG_LD_SCRIPT_STATIC → the vmlinux link grows
+  #   -static and embeds the armel glibc statically.
+  # - The stub's -static is restored in STUB_EXE_LDFLAGS: the stub_exe is a
+  #   separate host process (a memfd-exec'd ELF), so a dynamic stub would
+  #   still need the target's glibc and defeat the point. -nostdlib strips
+  #   the driver's default libraries either way, and the explicit -lc then
+  #   resolves to the cross sysroot's libc.a (libc6-dev-armel-cross ships
+  #   it); the stub link fails loudly here if a distro ever stops shipping
+  #   it. lld stays required for -no-rosegment as in the dynamic job.
+  build-static:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install deps (host build tools + armel cross toolchain + lld)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential libncurses-dev flex bison \
+            libssl-dev libelf-dev bc dwarves wget curl jq tar xz-utils \
+            pkg-config gnupg git ca-certificates perl file \
+            gcc-arm-linux-gnueabi libc6-dev-armel-cross lld
+
+      - uses: actions/checkout@v7
+
+      - name: Make the host lld findable by the cross gcc driver
+        run: |
+          LLD="$(command -v ld.lld)"
+          ln -sf "$LLD" /usr/local/bin/ld.lld
+          ln -sf "$LLD" /usr/local/bin/arm-linux-gnueabi-ld.lld
+          echo "LLD=$LLD" >> "$GITHUB_ENV"
+          ld.lld --version | head -1
+          echo "cross gcc target: $(arm-linux-gnueabi-gcc -dumpmachine)"
+          arm-linux-gnueabi-gcc -dumpmachine | grep -q '^arm-linux-gnueabi' || {
+            echo "::error::cross gcc is not arm32 (armel) — expected arm-linux-gnueabi"; exit 1; }
+          # The static link needs the cross sysroot's static libc; fail here,
+          # with the package in hand, rather than at the stub link.
+          test -f /usr/arm-linux-gnueabi/lib/libc.a || {
+            echo "::error::/usr/arm-linux-gnueabi/lib/libc.a missing — static libc not shipped by libc6-dev-armel-cross"; exit 1; }
+          ls -la /usr/arm-linux-gnueabi/lib/libc.a
+
+      - name: Pick newest stable (requires >= 7.0 — the arm32 port targets 7.2.x)
+        run: |
+          KVER=$(curl -s https://www.kernel.org/releases.json | \
+            jq -r '.releases[] | select(.moniker=="stable") | .version' | \
+            sort -V | tail -1)
+          MAJOR=$(echo "$KVER" | cut -d. -f1)
+          MINOR=$(echo "$KVER" | cut -d. -f2)
+          if [ "$MAJOR" -lt 7 ]; then
+            echo "::error::Newest stable is $KVER; the arm32 port targets 7.2.x. Pin the version manually."
+            exit 1
+          fi
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+          echo "KMAJOR=$MAJOR" >> "$GITHUB_ENV"
+          echo "KMINOR=$MINOR" >> "$GITHUB_ENV"
+          echo "[+] Selected $KVER"
+
+      - name: Download & extract
+        run: |
+          git clone --depth 1 --branch "v${{ env.KVER }}" \
+            "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git" \
+            "linux-${{ env.KVER }}"
+
+      - name: Apply bundled UML patches
+        run: |
+          cd linux-${{ env.KVER }}
+          shopt -s nullglob
+          for p in ../patches/*.patch; do
+            case "$(basename "$p")" in arm*-port-*) continue;; esac
+            echo "[+] Applying $(basename "$p")"
+            if git apply -v "$p"; then
+              :
+            elif patch -p1 --fuzz=3 < "$p"; then
+              echo "::warning::Applied $(basename "$p") with fuzz via patch(1)"
+            else
+              case "$(basename "$p")" in
+                uml-memdrop-on-free.patch|uml-physmem-memfd.patch)
+                  echo "::error::critical patch $(basename "$p") failed to apply"
+                  exit 1
+                  ;;
+                *)
+                  echo "::warning::$(basename "$p") did not apply cleanly, skipping"
+                  ;;
+              esac
+            fi
+          done
+
+      - name: Apply arm32 port series (consolidated, must apply cleanly)
+        run: |
+          cd linux-${{ env.KVER }}
+          git apply --check ../patches/arm32-port-7.2.4.patch || {
+            echo "::error::arm32 port does not apply on ${{ env.KVER }} + bundled patches"
+            exit 1
+          }
+          git apply ../patches/arm32-port-7.2.4.patch
+          echo "[+] arm32 port applied"
+
+      - name: Patch UML (unwind_user.h)
+        run: |
+          cd linux-${{ env.KVER }}
+          if [ -f arch/x86/include/asm/unwind_user.h ] && \
+             ! grep -q unwind_user arch/um/include/asm/Kbuild 2>/dev/null; then
+            echo 'generic-y += unwind_user.h' >> arch/um/include/asm/Kbuild
+            echo "[+] Patched unwind_user.h"
+          fi
+
+      - name: Configure & build (arm32 STATIC, cross from x86_64)
+        run: |
+          cd linux-${{ env.KVER }}
+          MAKE="make ARCH=um SUBARCH=arm CROSS_COMPILE=arm-linux-gnueabi-"
+
+          $MAKE defconfig
+
+          # --- cpu model override (blank = show host CPU at boot) ---
+          if [ -n "${{ inputs.cpu_model }}" ]; then
+            echo "[+] Setting CONFIG_UML_CPU_MODEL to '${{ inputs.cpu_model }}'"
+            scripts/config --file .config --set-str CONFIG_UML_CPU_MODEL "${{ inputs.cpu_model }}"
+          fi
+
+          # --- common options (same set as the dynamic job) ---
+          scripts/config --file .config \
+            -e BLK_DEV -e BLK_DEV_LOOP -e BLK_DEV_UBD \
+            -e EXT4_FS -e EXT2_FS -e EXT3_FS -e FS_MBCACHE \
+            -e NET -e INET -e PACKET -e NETDEVICES -e NET_CORE -e TUN \
+            -e TTY -e UNIX98_PTYS -e DEVTMPFS -e DEVTMPFS_MOUNT \
+            -e TMPFS -e TMPFS_POSIX_ACL -e TMPFS_XATTR \
+            -e PROC_FS -e SYSFS -e FHANDLE \
+            -e SIGNALFD -e TIMERFD -e EPOLL -e EVENTFD \
+            -e BLK_DEV_INITRD -e OVERLAY_FS \
+            -e CGROUPS -e CGROUP_SCHED \
+            -e NAMESPACES -e UTS_NS -e IPC_NS -e PID_NS -e NET_NS \
+            -e DEVPTS_FS -e PTY \
+            -d AUDIT -d AUTOFS_FS -d AUTOFS4_FS \
+            -e NETFILTER -e NF_CONNTRACK -e NF_NAT \
+            -e IP_FORWARD -e IP_MULTICAST -e IP_ADVANCED_ROUTER \
+            -e IKCONFIG -e IKCONFIG_PROC -e CONFIG_IPV6 \
+            -e SMP --set-val NR_CPUS 64 \
+            -e UML_NET_VECTOR
+
+          # --- STATIC LINK: embed the arm32 glibc into the binary ---
+          # Requires vector-static-link.patch (already applied above) to drop
+          # the false MAY_HAVE_RUNTIME_DEPS guard so VECTOR + STATIC coexist.
+          scripts/config --file .config -e STATIC_LINK
+
+          # Merge container config, then the storage fragment (same as the
+          # dynamic job — the static artifact is a drop-in alternative).
+          ./scripts/kconfig/merge_config.sh -m -O . .config \
+            ../patches/containers.config ../patches/storage.config >/dev/null
+
+          scripts/config --file .config \
+            -e PAGE_REPORTING \
+            -e CPUSETS -e PROC_PID_CPUSET \
+            -e USER_NS -e CHECKPOINT_RESTORE \
+            -e FAIR_GROUP_SCHED -e CFS_BANDWIDTH -e CGROUP_FREEZER \
+            -e CGROUP_DEVICE -e CGROUP_CPUACCT -e MEMCG \
+            -e CGROUP_BPF -e EXT4_FS_POSIX_ACL -e EXT4_FS_SECURITY \
+            -e VETH -e BRIDGE -e BRIDGE_NETFILTER -e MACVLAN -e IPVLAN -e TAP \
+            -e IP_NF_IPTABLES -e IP_NF_FILTER -e IP_NF_NAT -e IP6_NF_IPTABLES \
+            -e SECCOMP -e SECCOMP_FILTER
+          scripts/config --file .config -e MEMCG_SWAP 2>/dev/null || true
+
+          scripts/config --file .config \
+            -e BLK_DEV_LOOP --set-val BLK_DEV_LOOP_MIN_COUNT 16 \
+            -e SQUASHFS -e SQUASHFS_XATTR -e SQUASHFS_ZLIB -e SQUASHFS_LZ4 \
+            -e SQUASHFS_LZO -e SQUASHFS_XZ -e SQUASHFS_ZSTD \
+            -e FAT_FS -e MSDOS_FS -e VFAT_FS -e EXFAT_FS \
+            -e NLS -e NLS_CODEPAGE_437 -e NLS_ISO8859_1 -e NLS_UTF8 -e NLS_ASCII \
+            -e XFS_FS -e XFS_QUOTA -e XFS_POSIX_ACL -e XFS_RT \
+            -e BTRFS_FS -e BTRFS_FS_POSIX_ACL \
+            -e ISO9660_FS -e JOLIET -e ZISOFS -e UDF_FS \
+            -e MD -e BLK_DEV_MD -e BLK_DEV_DM -e DM_SNAPSHOT \
+            -e DM_THIN_PROVISIONING -e DM_MIRROR -e DM_RAID -e DM_ZERO \
+            -e DM_CRYPT -e DM_VERITY -e DM_INTEGRITY \
+            -e MD_RAID0 -e MD_RAID1 -e MD_RAID10 -e MD_RAID456 \
+            -e QUOTA -e QUOTACTL -e QFMT_V2 \
+            -e CRYPTO_XTS -e CRYPTO_AES -e CRYPTO_SHA256 -e CRYPTO_ESSIV \
+            -e CRYPTO_USER_API_HASH -e CRYPTO_USER_API_SKCIPHER \
+            -e MODULES -e MODULE_UNLOAD -e KALLSYMS -e KALLSYMS_ALL \
+            -d MODULE_SIG_FORCE
+          scripts/config --file .config -e SQUASHFS_FILE_DIRECT || true
+          scripts/config --file .config -e MD_LINEAR 2>/dev/null || true
+          scripts/config --file .config -e MD_BITMAP 2>/dev/null || true
+
+          # STATIC_LINK must survive the merge (merge_config.sh can drop
+          # symbols whose dependencies look unsatisfied at merge time).
+          scripts/config --file .config -e STATIC_LINK
+
+          echo "=== verify memdrop/container knobs ==="
+          grep -E '^CONFIG_(PAGE_REPORTING|USER_NS|CPUSETS|CHECKPOINT_RESTORE|VETH|BRIDGE|SECCOMP_FILTER|MEMCG)=' .config || true
+
+          $MAKE olddefconfig
+
+          echo "=== verify storage knobs ==="
+          grep -E '^CONFIG_(BLK_DEV_LOOP|SQUASHFS|VFAT_FS|EXFAT_FS|XFS_FS|BTRFS_FS|BLK_DEV_DM|BLK_DEV_MD|DM_CRYPT|DM_THIN_PROVISIONING|NLS_UTF8|ISO9660_FS|MODULES)=' .config || true
+          for sym in BLK_DEV_LOOP SQUASHFS VFAT_FS XFS_FS BTRFS_FS BLK_DEV_DM \
+                     BLK_DEV_MD DM_CRYPT DM_THIN_PROVISIONING NLS_UTF8 ISO9660_FS; do
+            grep -q "^CONFIG_${sym}=[ym]" .config || {
+              echo "::error::CONFIG_${sym} is not enabled after olddefconfig"; exit 1; }
+          done
+          grep -q '^CONFIG_32BIT=y' .config || {
+            echo "::error::not an arm32 (32BIT) config — SUBARCH=arm did not stick"; exit 1; }
+          grep -q '^CONFIG_64BIT=y' .config && {
+            echo "::error::unexpectedly a 64BIT config — SUBARCH=arm did not stick"; exit 1; }
+
+          echo "=== verify static config survived ==="
+          grep -E '^CONFIG_STATIC_LINK=|^CONFIG_LD_SCRIPT_STATIC=|^CONFIG_UML_NET_VECTOR=' .config
+
+          # Cross link, fully static: the kernel + stub are arm32 userspace
+          # objects linked against the armel static libc. Same flags as the
+          # dynamic job, but -static is RESTORED for the stub (see the
+          # build-static job comment) and -lc resolves to libc.a.
+          $MAKE STUB_EXE_LDFLAGS="-Wl,-n -Wl,--no-rosegment -static -lc -fuse-ld=lld" \
+            -j"$(nproc)"
+
+      - name: Verify static & strip
+        run: |
+          cd linux-${{ env.KVER }}
+          file -b linux | grep -qE 'ELF 32-bit .* ARM' || {
+            echo "::error::'linux' is not a 32-bit ARM ELF — cross toolchain did not stick"
+            echo "actual: $(file -b linux)"
+            exit 1; }
+          # Fully static: no dynamic section, no interpreter, no NEEDED entries.
+          if readelf -d linux 2>/dev/null | grep -qi 'NEEDED'; then
+            echo "::error::'linux' is not fully static — dynamic dependencies found"
+            readelf -d linux
+            exit 1
+          fi
+          file -b linux | grep -q 'statically linked' || {
+            echo "::error::'linux' has no NEEDED entries but file(1) does not say 'statically linked'"
+            echo "actual: $(file -b linux)"
+            exit 1; }
+          cp linux ../linux-uml-arm32-static
+          cd ..
+          arm-linux-gnueabi-strip linux-uml-arm32-static
+          echo "${{ env.KVER }} (arm32, VECTOR, static)" > VERSION
+          file linux-uml-arm32-static
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-uml-stable-arm32-static
+          path: |
+            linux-uml-arm32-static
             VERSION
