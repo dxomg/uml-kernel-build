@@ -2058,15 +2058,22 @@ index 000000000..358e588d7 100644
 +__do_div64 kernel__do_div64
 diff --git a/arch/arm/um/bugs.c b/arch/arm/um/bugs.c
 new file mode 100644
-index 000000000..0be43ce3d
+index 000000000..81fa07503
 --- /dev/null
 +++ b/arch/arm/um/bugs.c
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,50 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Host-side sanity checks for ARCH=um SUBARCH=arm.
 + */
 +#include <arch.h>
++/*
++ * First of the kernel includes: this is a USER_OBJ, so nothing front-runs it
++ * with <linux/types.h> the way <linux/kernel.h> does for kernel objects --
++ * and <linux/bug.h>'s chain uses bool (kasan-checks.h via compiler.h) and
++ * atomic_t (panic.h) before it pulls types in itself.
++ */
++#include <linux/types.h>
 +#include <linux/bug.h>
 +#include <linux/linkage.h>
 +#include <sysdep/ptrace.h>
