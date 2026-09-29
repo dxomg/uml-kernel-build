@@ -123,10 +123,10 @@ index 000000000..3226d6373
 +endif
 diff --git a/arch/arm/um/Kconfig b/arch/arm/um/Kconfig
 new file mode 100644
-index 000000000..759695979
+index 000000000..d3f472aed
 --- /dev/null
 +++ b/arch/arm/um/Kconfig
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,151 @@
 +# SPDX-License-Identifier: GPL-2.0
 +
 +config UML_ARM
@@ -243,6 +243,21 @@ index 000000000..759695979
 +	hex
 +	default 0x0
 +
++# FUNCTION_ALIGNMENT: linkage.h's __ALIGN expands to
++# ".balign CONFIG_FUNCTION_ALIGNMENT", and the arch/arm .S objects
++# pulled into the host binary through arm-klib.S materialize it in gas
++# input. The symbol's definition lives in arch/Kconfig, which is not
++# sourced for ARCH=um, so without a value the literal reaches gas
++# unexpanded and as fails with
++# "bad or irreducible absolute expression". The arch/Kconfig default
++# chain bottoms out at 0 unless a FUNCTION_ALIGNMENT_NB select fires,
++# and the one mainline selector (DEBUG_FORCE_FUNCTION_ALIGN_64B) is
++# gated on EXPERT plus a non-arm arch; a plain arm kernel's defconfig
++# resolves to 0 as well.
++config FUNCTION_ALIGNMENT
++	int
++	default 0
++
 +# Deliberately *not* "config ARM". Generic code tests CONFIG_ARM to mean
 +# "running on real arm hardware in the kernel" -- it gates things like the
 +# arm32 hardware description, cpuidle and cp15 maintenance code, none of
@@ -314,10 +329,10 @@ index 000000000..99ee08af2 100644
 +include $(srctree)/arch/um/scripts/Makefile.rules
 diff --git a/arch/arm/um/arm-klib.S b/arch/arm/um/arm-klib.S
 new file mode 100644
-index 000000000..ceda100aa 100644
+index 000000000..38ac7229f 100644
 --- /dev/null
 +++ b/arch/arm/um/arm-klib.S
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,71 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * arch/arm/lib objects, pulled into the UML host binary.
@@ -360,6 +375,20 @@ index 000000000..ceda100aa 100644
 + * Including the .S files rather than copying them keeps one source of
 + * truth: the routines are the kernel's own, bit for bit.
 + */
++
++/*
++ * Every include below reaches <linux/compiler_attributes.h> (via
++ * <linux/linkage.h> -> <linux/compiler_types.h>; __KERNEL__ is defined
++ * for .S objects, as it is for C): its eighteen #if __has_attribute()
++ * probes are undefined to the assembler-with-cpp preprocessor and each
++ * one would abort the object with "missing binary operator before token
++ * (". Nothing in this target consumes the attribute macros, so report
++ * "no attributes supported" and let every probe take its fallback.
++ */
++#ifndef __has_attribute
++#define __has_attribute(x)	0
++#endif
++
 +#include "../lib/clearbit.S"
 +#include "../lib/setbit.S"
 +#include "../lib/testsetbit.S"
@@ -954,10 +983,10 @@ index 000000000..ec5070b17
 
 diff --git a/arch/arm/um/asm/ptrace.h b/arch/arm/um/asm/ptrace.h
 new file mode 100644
-index 000000000..1e01e752e
+index 000000000..f48a43dc5 100644
 --- /dev/null
 +++ b/arch/arm/um/asm/ptrace.h
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,123 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef __UM_ARM_PTRACE_H
 +#define __UM_ARM_PTRACE_H
@@ -969,10 +998,12 @@ index 000000000..1e01e752e
 + * the host gave the stub. Only the core regset and, on hosts that have it,
 + * the VFP one are exposed.
 + */
++#ifndef __ASSEMBLER__
 +enum {
 +	REGSET_GENERAL,
 +	REGSET_FP,
 +};
++#endif /* __ASSEMBLER__ */
 +
 +#include <linux/compiler.h>
 +#include <uapi/asm/ptrace.h>
@@ -984,9 +1015,11 @@ index 000000000..1e01e752e
 + * the classic ptrace() regset as struct pt_regs -- so UGL carries a local
 + * mirror here: 18 words, r0-r10, fp, ip, sp, lr, pc, cpsr, orig_r0.
 + */
++#ifndef __ASSEMBLER__
 +struct user_regs_struct {
 +	unsigned int ureg[18];
 +};
++#endif /* __ASSEMBLER__ */
 +
 +#define user_mode(r) UPT_IS_USER(&(r)->regs)
 +
@@ -1042,10 +1075,12 @@ index 000000000..1e01e752e
 +
 +#define profile_pc(regs) PT_REGS_IP(regs)
 +
++#ifndef __ASSEMBLER__
 +static inline long regs_return_value(struct pt_regs *regs)
 +{
 +	return PT_REGS_R0(regs);
 +}
++#endif /* __ASSEMBLER__ */
 +
 +#define user_stack_pointer(regs) PT_REGS_SP(regs)
 +
@@ -1054,6 +1089,7 @@ index 000000000..1e01e752e
 + * arch_set_tls(). These exist only because arch/um/kernel/ptrace.c
 + * references them unconditionally.
 + */
++#ifndef __ASSEMBLER__
 +struct user_desc;
 +
 +#include <asm/errno.h>
@@ -1071,6 +1107,7 @@ index 000000000..1e01e752e
 +}
 +
 +extern void arch_switch_to(struct task_struct *to);
++#endif /* __ASSEMBLER__ */
 +
 +#endif /* __UM_ARM_PTRACE_H */
 diff --git a/arch/arm/um/asm/segment.h b/arch/arm/um/asm/segment.h
@@ -4828,6 +4865,63 @@ index 8fdc0bd9a..9dd4145ec 100644
  generic-y += parport.h
  generic-y += percpu.h
  generic-y += percpu_types.h
+diff --git a/arch/um/include/asm/pgtable.h b/arch/um/include/asm/pgtable.h
+index 88ea84343..f459dde56 100644
+--- a/arch/um/include/asm/pgtable.h
++++ b/arch/um/include/asm/pgtable.h
+@@ -9,6 +9,15 @@
+ #define __UM_PGTABLE_H
+ 
+ #include <asm/page.h>
++
++/*
++ * The device-kernel .S context (SUBARCH=arm, arch/arm/um/arm-klib.S)
++ * preprocesses this header for gas. Everything below declares C types
++ * or drags in C headers, so keep it out of that context, matching the
++ * __ASSEMBLER__ convention of the sibling page.h and thread_info.h.
++ */
++#ifndef __ASSEMBLER__
++
+ #include <linux/mm_types.h>
+ 
+ #define _PAGE_PRESENT	0x001
+@@ -325,4 +334,6 @@
+ 	return pte;
+ }
+ 
++#endif	/* __ASSEMBLER__ */
++
+ #endif
+diff --git a/arch/um/include/asm/unwind.h b/arch/um/include/asm/unwind.h
+index 7ffa5437b..05964bcdd 100644
+--- a/arch/um/include/asm/unwind.h
++++ b/arch/um/include/asm/unwind.h
+@@ -1,8 +1,25 @@
+ #ifndef _ASM_UML_UNWIND_H
+ #define _ASM_UML_UNWIND_H
+ 
++#ifndef __ASSEMBLER__
++
+ static inline void
+ unwind_module_init(struct module *mod, void *orc_ip, size_t orc_ip_size,
+ 		   void *orc, size_t orc_size) {}
+ 
++#else
++
++/*
++ * The SUBARCH=arm device-kernel .S objects (arch/arm/um/arm-klib.S and
++ * the mainline arch/arm/lib files it pulls in) reach this header through
++ * <asm/unwind.h> and open every function with UNWIND() probes. UGL never
++ * builds module orc/unwinding tables (the C stub above is a no-op), so
++ * take mainline arm's CONFIG_ARM_UNWIND=n form and let the probes fall
++ * out; the .fnstart/.save/.pad/.fnend gas macros they wrap are then
++ * never used either.
++ */
++#define UNWIND(code...)
++
++#endif
++
+ #endif /* _ASM_UML_UNWIND_H */
 diff --git a/arch/um/kernel/skas/stub_exe.c b/arch/um/kernel/skas/stub_exe.c
 index cbafaa684..1a903f302 100644
 --- a/arch/um/kernel/skas/stub_exe.c
