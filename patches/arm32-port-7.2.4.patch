@@ -266,10 +266,10 @@ index 000000000..759695979
 
 diff --git a/arch/arm/um/Makefile b/arch/arm/um/Makefile
 new file mode 100644
-index 000000000..eef7fb748
+index 000000000..99ee08af2 100644
 --- /dev/null
 +++ b/arch/arm/um/Makefile
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,42 @@
 +# SPDX-License-Identifier: GPL-2.0
 +#
 +# arch/arm/um -- subarch support for ARCH=um SUBARCH=arm
@@ -279,6 +279,13 @@ index 000000000..eef7fb748
 +	setjmp_arm.o signal.o stub_segv.o syscalls.o \
 +	sys_call_table.o sysrq.o tls.o \
 +	subarch.o os-Linux/
++
++# Link the arch/arm/lib objects that generic code binds to through the parent's
++# <asm/bitops.h> and <asm/div64.h> into the host binary, plus the div helpers
++# the armv7-a host compiler emits, and publish them the way
++# arch/arm/kernel/armksyms.c does. Why these are missing otherwise and what
++# each file is for: see arm-klib.S.
++obj-y += arm-klib.o arm_ksyms.o
 +
 +# Module loading is the parent architecture's, reused rather than reimplemented.
 +# arm relocations patch fixed 32-bit immediates -- R_ARM_PC24, R_ARM_ABS32 and
@@ -305,6 +312,135 @@ index 000000000..eef7fb748
 +CFLAGS_stub_segv.o := $(CFLAGS_NO_HARDENING)
 +
 +include $(srctree)/arch/um/scripts/Makefile.rules
+diff --git a/arch/arm/um/arm-klib.S b/arch/arm/um/arm-klib.S
+new file mode 100644
+index 000000000..ceda100aa 100644
+--- /dev/null
++++ b/arch/arm/um/arm-klib.S
+@@ -0,0 +1,57 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * arch/arm/lib objects, pulled into the UML host binary.
++ *
++ * arch/arm/lib is a device-kernel directory: it is only ever built for
++ * ARCH=arm, so none of its definitions exist in an ARCH=um build. Yet the
++ * parent's headers that UGL deliberately reuses (arch/arm/include/asm is on
++ * the include path for the host objects) declare a number of these as
++ * extern, and generic kernel code binds to them:
++ *
++ *   arch/arm/include/asm/bitops.h   -> _clear_bit, _set_bit,
++ *                                      _test_and_set_bit, _test_and_clear_bit,
++ *                                      _change_bit, _test_and_change_bit and
++ *                                      the _find_next_bit_le family
++ *   arch/arm/include/asm/div64.h    -> __do_div64 (every do_div on 32-bit)
++ *
++ * and the armv7-a host compiler, with hardware division off (the +div
++ * target feature is not part of the armv7-a baseline, and UGL pins the
++ * baseline so the binary keeps running on hosts without it), lowers 32-bit
++ * signed division to calls to __aeabi_idiv / __aeabi_uidiv.
++ *
++ * A plain build is fine with all of these: vmlinux is linked against the
++ * host libc, which supplies the div and shift helpers, and the bitops
++ * families are only referenced by module objects. modpost, however, sees
++ * only what vmlinux itself defines, so the moment CONFIG_MODULES turns on
++ * it fails the build with
++ *
++ *   ERROR: modpost: "_clear_bit" [fs/binfmt_misc.ko] undefined!
++ *   ERROR: modpost: "__do_div64" [block/bfq.ko] undefined!
++ *   ERROR: modpost: "__aeabi_idiv" [block/bfq.ko] undefined!
++ *
++ * and at run time UGL's module loader (arch/arm/kernel/module.o, reused
++ * verbatim -- see arch/arm/um/Makefile) patches guest .ko relocations
++ * against the host binary, so a guest module's reference to any of these
++ * would dangle as well. The real kernel's answer is simply that arch/arm/lib
++ * is in vmlinux; here the objects are linked in through this include chain
++ * instead, and arch/arm/um/arm_ksyms.c publishes them the way
++ * arch/arm/kernel/armksyms.c does for a real kernel.
++ *
++ * Including the .S files rather than copying them keeps one source of
++ * truth: the routines are the kernel's own, bit for bit.
++ */
++#include "../lib/clearbit.S"
++#include "../lib/setbit.S"
++#include "../lib/testsetbit.S"
++#include "../lib/testclearbit.S"
++#include "../lib/changebit.S"
++#include "../lib/testchangebit.S"
++#include "../lib/findbit.S"
++#include "../lib/div64.S"
++#include "../lib/lib1funcs.S"
++#include "../lib/ashldi3.S"
++#include "../lib/ashrdi3.S"
++#include "../lib/lshrdi3.S"
++#include "../lib/muldi3.S"
++#include "../lib/ucmpdi2.S"
++#include "../lib/bswapsdi2.S"
+diff --git a/arch/arm/um/arm_ksyms.c b/arch/arm/um/arm_ksyms.c
+new file mode 100644
+index 000000000..c60dc5fe5 100644
+--- /dev/null
++++ b/arch/arm/um/arm_ksyms.c
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Publish the arch/arm/lib symbols that UGL links into the host binary via
++ * arch/arm/um/arm-klib.S, the way arch/arm/kernel/armksyms.c does for a
++ * real kernel.
++ *
++ * The set is exactly what arm-klib.S defines for this build (little-endian,
++ * no CONFIG_AEABI, ARMv7 host): the single-underscore bitops and the
++ * _le find-bit family the parent's asm/bitops.h binds generic code to,
++ * __do_div64 the parent's asm/div64.h binds every do_div to, and the
++ * div/mod/shift/multiply helpers the armv7-a host compiler lowers 32-bit
++ * signed division into. A guest .ko's relocations are patched against the
++ * host binary by arch/arm/kernel/module.o (see arch/arm/um/Makefile), and
++ * modpost resolves a module's undefined references against this table, so
++ * without it every module that touches a bitops helper or a division fails
++ * the build the moment CONFIG_MODULES is on.
++ */
++#include <linux/export.h>
++
++	/* bitops (arch/arm/lib/{set,clear,testset,testclear,change,testchange}bit.S) */
++EXPORT_SYMBOL(_set_bit);
++EXPORT_SYMBOL(_test_and_set_bit);
++EXPORT_SYMBOL(_sync_test_and_set_bit);
++EXPORT_SYMBOL(_clear_bit);
++EXPORT_SYMBOL(_test_and_clear_bit);
++EXPORT_SYMBOL(_sync_test_and_clear_bit);
++EXPORT_SYMBOL(_change_bit);
++EXPORT_SYMBOL(_test_and_change_bit);
++EXPORT_SYMBOL(_sync_test_and_change_bit);
++
++	/* find-bit, LE build (arch/arm/lib/findbit.S) */
++EXPORT_SYMBOL(_find_first_zero_bit_le);
++EXPORT_SYMBOL(_find_next_zero_bit_le);
++EXPORT_SYMBOL(_find_first_bit_le);
++EXPORT_SYMBOL(_find_next_bit_le);
++
++	/* gcc and AEABI 32-bit div/mod helpers (arch/arm/lib/lib1funcs.S) */
++EXPORT_SYMBOL(__divsi3);
++EXPORT_SYMBOL(__modsi3);
++EXPORT_SYMBOL(__udivsi3);
++EXPORT_SYMBOL(__umodsi3);
++EXPORT_SYMBOL(__aeabi_idiv);
++EXPORT_SYMBOL(__aeabi_uidiv);
++EXPORT_SYMBOL(__aeabi_idivmod);
++EXPORT_SYMBOL(__aeabi_uidivmod);
++
++	/* gcc 64-bit helpers (arch/arm/lib/{ashldi3,ashrdi3,lshrdi3,muldi3,ucmpdi2,bswapsdi2}.S) */
++EXPORT_SYMBOL(__do_div64);
++EXPORT_SYMBOL(__ashldi3);
++EXPORT_SYMBOL(__ashrdi3);
++EXPORT_SYMBOL(__lshrdi3);
++EXPORT_SYMBOL(__muldi3);
++EXPORT_SYMBOL(__ucmpdi2);
++EXPORT_SYMBOL(__aeabi_llsl);
++EXPORT_SYMBOL(__aeabi_lasr);
++EXPORT_SYMBOL(__aeabi_llsr);
++EXPORT_SYMBOL(__aeabi_lmul);
++EXPORT_SYMBOL(__aeabi_ulcmp);
++EXPORT_SYMBOL(__bswapsi2);
++EXPORT_SYMBOL(__bswapdi2);
 diff --git a/arch/arm/um/asm/asm.h b/arch/arm/um/asm/asm.h
 new file mode 100644
 index 000000000..d5e897789
@@ -1633,10 +1769,10 @@ index 000000000..c0056a9fe
 +#endif /* __VM_FLAGS_ARM_H */
 diff --git a/arch/arm/um/bionic-syms.redef b/arch/arm/um/bionic-syms.redef
 new file mode 100644
-index 000000000..c4a0aeec9
+index 000000000..358e588d7 100644
 --- /dev/null
 +++ b/arch/arm/um/bionic-syms.redef
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,98 @@
 +# Kernel symbols renamed when linking against bionic.
 +#
 +# These are names the kernel defines and bionic's libc also references. In a
@@ -1705,6 +1841,36 @@ index 000000000..c4a0aeec9
 +sync_file_range kernel_sync_file_range
 +sched_setattr kernel_sched_setattr
 +sched_getattr kernel_sched_getattr
++
++# The div/mod/shift/multiply helpers arch/arm/um/arm-klib.S links into the
++# host binary from arch/arm/lib. bionic's C runtime carries the AEABI and
++# multi-precision helpers too, so wherever one of the coarser bionic objects
++# we are forced to pull in also defines one of these, the static link fails
++# with a duplicate symbol. The single-underscore bitops names have no bionic
++# counterpart and need no entry; __do_div64 is a kernel name, not a generic
++# compiler helper, so its entry is defensive -- a rename of a symbol bionic
++# does not carry is a no-op, per the note above.
++__divsi3 kernel__divsi3
++__udivsi3 kernel__udivsi3
++__modsi3 kernel__modsi3
++__umodsi3 kernel__umodsi3
++__aeabi_idiv kernel__aeabi_idiv
++__aeabi_uidiv kernel__aeabi_uidiv
++__aeabi_idivmod kernel__aeabi_idivmod
++__aeabi_uidivmod kernel__aeabi_uidivmod
++__muldi3 kernel__muldi3
++__aeabi_lmul kernel__aeabi_lmul
++__ashldi3 kernel__ashldi3
++__aeabi_llsl kernel__aeabi_llsl
++__ashrdi3 kernel__ashrdi3
++__aeabi_lasr kernel__aeabi_lasr
++__lshrdi3 kernel__lshrdi3
++__aeabi_llsr kernel__aeabi_llsr
++__ucmpdi2 kernel__ucmpdi2
++__aeabi_ulcmp kernel__aeabi_ulcmp
++__bswapsi2 kernel__bswapsi2
++__bswapdi2 kernel__bswapdi2
++__do_div64 kernel__do_div64
 diff --git a/arch/arm/um/bugs.c b/arch/arm/um/bugs.c
 new file mode 100644
 index 000000000..87112876b
@@ -4760,3 +4926,43 @@ index 710e0a5f6..61492fabf 100644
  #include <asm/unistd.h>
  #include <init.h>
  #include <os.h>
+diff --git a/arch/um/os-Linux/user_syms.c b/arch/um/os-Linux/user_syms.c
+index 67f611231..8268340b8 100644
+--- a/arch/um/os-Linux/user_syms.c
++++ b/arch/um/os-Linux/user_syms.c
+--- a/arch/um/os-Linux/user_syms.c
++++ b/arch/um/os-Linux/user_syms.c
+@@ -20,7 +20,32 @@
+ EXPORT_SYMBOL(strstr);
+ #endif
+ 
+-#ifndef __x86_64__
++/*
++ * Who exports memcpy/memmove/memset differs per subarch, and exactly one of
++ * them must:
++ *
++ *   i386   -- <asm/string_32.h> defines __HAVE_ARCH_MEMCPY, so lib/string.c
++ *             does not build them, and nothing else exports the libc versions
++ *             the compiler emits calls to. This file has to.
++ *   x86_64 -- same __HAVE_ARCH_MEMCPY, but arch/x86/lib/memcpy_64.S and friends
++ *             are linked in via subarch-y and carry their own EXPORT_SYMBOL.
++ *   arm64  -- arch/arm64/um/asm/string.h deliberately defines no __HAVE_ARCH_*,
++ *             because arch/arm64/lib is not built for ARCH=um, so lib/string.c
++ *             supplies and exports the generic C versions.
++ *   arm    -- it depends on the host C library. arch/arm/um/asm/string.h shadows
++ *             the parent's header: against glibc it declares no __HAVE_ARCH_*,
++ *             so lib/string.c builds and exports the generic versions and this
++ *             file must stay quiet; against bionic the __ANDROID__ branch of
++ *             the parent's string.h declares __HAVE_ARCH_MEMCPY and friends,
++ *             lib/string.c falls silent, and this file has to export what the
++ *             compiler emits. __arm__ is predefined by the arm cross compiler
++ *             and __ANDROID__ by the NDK clang, so one guard covers both.
++ *
++ * Exporting here as well makes modpost fail the build with "'memcpy' exported
++ * twice", which is only visible once CONFIG_MODULES is on -- so it appeared the
++ * moment arm32 gained module support, not when the subarch was written.
++ */
++#if !defined(__x86_64__) && !defined(__aarch64__) && !(defined(__arm__) && !defined(__ANDROID__))
+ #undef memcpy
+ extern void *memcpy(void *, const void *, size_t);
+ EXPORT_SYMBOL(memcpy);
