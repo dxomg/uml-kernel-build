@@ -4150,10 +4150,10 @@ index 000000000..2de09b400
 +}
 diff --git a/arch/arm/um/user-offsets.c b/arch/arm/um/user-offsets.c
 new file mode 100644
-index 000000000..88c5d48b6
+index 000000000..1636ab005
 --- /dev/null
 +++ b/arch/arm/um/user-offsets.c
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,109 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Generates include/generated/user_constants.h for ARCH=um SUBARCH=arm.
@@ -4181,49 +4181,52 @@ index 000000000..88c5d48b6
 +void foo(void)
 +{
 +	/*
-+	 * struct user_regs_struct on arm32 is 18 x unsigned int:
++	 * The host register file is struct user_regs in arm glibc's
++	 * <sys/user.h> -- 18 x unsigned long (there is no user_regs_struct
++	 * on arm, that is an x86 type). It mirrors the UGL kernel-side
++	 * struct user_regs_struct (arch/arm/um/asm/ptrace.h):
 +	 *
-+	 *	ureg[0..10]   = r0-r10
-+	 *	ureg[11]       = fp (r11)
-+	 *	ureg[12]       = ip (r12)
-+	 *	ureg[13]       = sp
-+	 *	ureg[14]       = lr
-+	 *	ureg[15]       = pc
-+	 *	ureg[16]       = cpsr
-+	 *	ureg[17]       = orig_r0
++	 *	regs.uregs[0..10] = r0-r10
++	 *	regs.uregs[11]     = fp (r11)
++	 *	regs.uregs[12]     = ip (r12)
++	 *	regs.uregs[13]     = sp
++	 *	regs.uregs[14]     = lr
++	 *	regs.uregs[15]     = pc
++	 *	regs.uregs[16]     = cpsr
++	 *	regs.uregs[17]     = orig_r0
 +	 *
 +	 * Unlike arm64 there is no separate special-register set at all: SP,
 +	 * LR and PC are ordinary members, and the original first argument is
-+	 * already exposed by the host kernel at ureg[17]. Every slot is one
++	 * already exposed by the host kernel at uregs[17]. Every slot is one
 +	 * unsigned long on this target, so the indices are simply word
 +	 * offsets into the 72-byte PTRACE_GETREGS payload.
 +	 */
-+	DEFINE_LONGS(HOST_R0,  offsetof(struct user_regs_struct, ureg[0]));
-+	DEFINE_LONGS(HOST_R1,  offsetof(struct user_regs_struct, ureg[1]));
-+	DEFINE_LONGS(HOST_R2,  offsetof(struct user_regs_struct, ureg[2]));
-+	DEFINE_LONGS(HOST_R3,  offsetof(struct user_regs_struct, ureg[3]));
-+	DEFINE_LONGS(HOST_R4,  offsetof(struct user_regs_struct, ureg[4]));
-+	DEFINE_LONGS(HOST_R5,  offsetof(struct user_regs_struct, ureg[5]));
-+	DEFINE_LONGS(HOST_R6,  offsetof(struct user_regs_struct, ureg[6]));
-+	DEFINE_LONGS(HOST_R7,  offsetof(struct user_regs_struct, ureg[7]));
-+	DEFINE_LONGS(HOST_R8,  offsetof(struct user_regs_struct, ureg[8]));
-+	DEFINE_LONGS(HOST_R9,  offsetof(struct user_regs_struct, ureg[9]));
-+	DEFINE_LONGS(HOST_R10, offsetof(struct user_regs_struct, ureg[10]));
++	DEFINE_LONGS(HOST_R0,  offsetof(struct user, regs.uregs[0]));
++	DEFINE_LONGS(HOST_R1,  offsetof(struct user, regs.uregs[1]));
++	DEFINE_LONGS(HOST_R2,  offsetof(struct user, regs.uregs[2]));
++	DEFINE_LONGS(HOST_R3,  offsetof(struct user, regs.uregs[3]));
++	DEFINE_LONGS(HOST_R4,  offsetof(struct user, regs.uregs[4]));
++	DEFINE_LONGS(HOST_R5,  offsetof(struct user, regs.uregs[5]));
++	DEFINE_LONGS(HOST_R6,  offsetof(struct user, regs.uregs[6]));
++	DEFINE_LONGS(HOST_R7,  offsetof(struct user, regs.uregs[7]));
++	DEFINE_LONGS(HOST_R8,  offsetof(struct user, regs.uregs[8]));
++	DEFINE_LONGS(HOST_R9,  offsetof(struct user, regs.uregs[9]));
++	DEFINE_LONGS(HOST_R10, offsetof(struct user, regs.uregs[10]));
 +
-+	DEFINE_LONGS(HOST_FP,   offsetof(struct user_regs_struct, ureg[11]));
-+	DEFINE_LONGS(HOST_IP,   offsetof(struct user_regs_struct, ureg[12]));
-+	DEFINE_LONGS(HOST_SP,   offsetof(struct user_regs_struct, ureg[13]));
-+	DEFINE_LONGS(HOST_LR,   offsetof(struct user_regs_struct, ureg[14]));
-+	DEFINE_LONGS(HOST_PC,   offsetof(struct user_regs_struct, ureg[15]));
-+	DEFINE_LONGS(HOST_CPSR, offsetof(struct user_regs_struct, ureg[16]));
-+	DEFINE_LONGS(HOST_ORIG_R0, offsetof(struct user_regs_struct, ureg[17]));
++	DEFINE_LONGS(HOST_FP,   offsetof(struct user, regs.uregs[11]));
++	DEFINE_LONGS(HOST_IP,   offsetof(struct user, regs.uregs[12]));
++	DEFINE_LONGS(HOST_SP,   offsetof(struct user, regs.uregs[13]));
++	DEFINE_LONGS(HOST_LR,   offsetof(struct user, regs.uregs[14]));
++	DEFINE_LONGS(HOST_PC,   offsetof(struct user, regs.uregs[15]));
++	DEFINE_LONGS(HOST_CPSR, offsetof(struct user, regs.uregs[16]));
++	DEFINE_LONGS(HOST_ORIG_R0, offsetof(struct user, regs.uregs[17]));
 +
 +	/*
 +	 * UM_FRAME_SIZE is the size of the register block that is actually
 +	 * exchanged with the host via PTRACE_GETREGS/SETREGS. It is the
 +	 * bound for peek_user/poke_user and for every ptrace transfer.
 +	 */
-+	DEFINE(UM_FRAME_SIZE, sizeof(struct user_regs_struct));
++	DEFINE(UM_FRAME_SIZE, sizeof(struct user_regs));
 +
 +	/*
 +	 * One slot past the end of the host regset, synthesised by UML:
@@ -4240,16 +4243,16 @@ index 000000000..88c5d48b6
 +	 * HOST_ORIG_R0 needs no synthesised slot: unlike arm64's x0, the host
 +	 * exposes the original first argument inside the regset at ureg[17].
 +	 */
-+	DEFINE(HOST_SYSCALL_NR, sizeof(struct user_regs_struct) / sizeof(unsigned long));
-+	DEFINE(UM_MAX_REG_NR,   sizeof(struct user_regs_struct) / sizeof(unsigned long) + 1);
++	DEFINE(HOST_SYSCALL_NR, sizeof(struct user_regs) / sizeof(unsigned long));
++	DEFINE(UM_MAX_REG_NR,   sizeof(struct user_regs) / sizeof(unsigned long) + 1);
 +
 +	/*
 +	 * Guest TLS. arm32 userland owns R8 outright (userspace sets it with
 +	 * "mov r8, #off" style TLS access or the set_tls syscall), so the slot
-+	 * is not appended here: it is the ordinary ureg[8] slot, and
++	 * is not appended here: it is the ordinary regs.uregs[8] slot, and
 +	 * arch_set_tls() writes it there.
 +	 */
-+	DEFINE(HOST_TLS, offsetof(struct user_regs_struct, ureg[8]) /
++	DEFINE(HOST_TLS, offsetof(struct user, regs.uregs[8]) /
 +			sizeof(unsigned long));
 +
 +	DEFINE(UM_POLLIN, POLLIN);
