@@ -151,10 +151,10 @@ index f069d1b23..a74cb1199
 +#endif /* ARCH_ARM_LIB_BITOPS_H */
 diff --git a/arch/arm/um/Kconfig b/arch/arm/um/Kconfig
 new file mode 100644
-index 000000000..d3f472aed
+index 000000000..f67e096c0
 --- /dev/null
 +++ b/arch/arm/um/Kconfig
-@@ -0,0 +1,151 @@
+@@ -0,0 +1,169 @@
 +# SPDX-License-Identifier: GPL-2.0
 +
 +config UML_ARM
@@ -214,6 +214,24 @@ index 000000000..d3f472aed
 +	# guest's 32-bit syscalls are the ABI, and O_LARGEFILE is the guest
 +	# application's flag, not the kernel's.
 +	select ARCH_32BIT_OFF_T
++	#
++	# The 32-bit arm syscall ABI. The EABI table this subarch links
++	# against (arch/arm/um/asm/syscall_table_eabi.h) and the generic
++	# ipc/syscall.c and kernel/signal.c dispatches it compiles are the
++	# parent arch/arm's, and the parent wires them up with three
++	# selects its `config ARM` makes unconditionally
++	# (arch/arm/Kconfig L53/L151/L152) -- a Kconfig that an ARCH=um build
++	# never parses. Without them the versioned IPC dispatch still
++	# compiles (arch/arm's unistd.h defines __ARCH_WANT_SYS_IPC and UGL
++	# picks it up as-is), but the ksys_old_* wrappers it calls live
++	# behind CONFIG_ARCH_WANT_IPC_PARSE_VERSION, and the EABI
++	# sigaction(2)/sigsuspend(2) the table maps __NR_sigaction /
++	# __NR_sigsuspend to live behind CONFIG_OLD_SIGACTION and
++	# CONFIG_OLD_SIGSUSPEND3, so every one of them is an undefined
++	# reference at the first UGL link.
++	select ARCH_WANT_IPC_PARSE_VERSION
++	select OLD_SIGACTION
++	select OLD_SIGSUSPEND3
 +	#
 +	# Frame pointers, as arch/arm64/Kconfig selects them for real
 +	# hardware.
@@ -2022,15 +2040,17 @@ index 000000000..358e588d7 100644
 +__do_div64 kernel__do_div64
 diff --git a/arch/arm/um/bugs.c b/arch/arm/um/bugs.c
 new file mode 100644
-index 000000000..87112876b
+index 000000000..0be43ce3d
 --- /dev/null
 +++ b/arch/arm/um/bugs.c
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,43 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Host-side sanity checks for ARCH=um SUBARCH=arm.
 + */
 +#include <arch.h>
++#include <linux/bug.h>
++#include <linux/linkage.h>
 +#include <sysdep/ptrace.h>
 +
 +void arch_check_bugs(void)
@@ -2052,6 +2072,20 @@ index 000000000..87112876b
 +	 * watchpoints for the guest, so every signal reaching here is what it
 +	 * appears to be.
 +	 */
++}
++
++/*
++ * The divide-by-zero handler the arch/arm/lib helpers (the __aeabi_idiv /
++ * __do_div64 families arm-klib.S links in) branch to when the divisor is
++ * zero. The parent defines it in arch/arm/kernel/traps.c, where it turns
++ * the division into a divide-error exception, oops if not recovered; a
++ * UGL arm build does not build arch/arm/kernel (that traps.c is the
++ * host-side mechanism, and UGL has its own), so the guest kernel has to
++ * provide the symbol here.
++ */
++asmlinkage void __div0(void)
++{
++	BUG();
 +}
 diff --git a/arch/arm/um/cpuinfo.c b/arch/arm/um/cpuinfo.c
 new file mode 100644
@@ -2591,10 +2625,10 @@ index 000000000..925634950
 +}
 diff --git a/arch/arm/um/os-Linux/registers.c b/arch/arm/um/os-Linux/registers.c
 new file mode 100644
-index 000000000..407fc49c6
+index 000000000..17b8555b1
 --- /dev/null
 +++ b/arch/arm/um/os-Linux/registers.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,233 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Host register access for ARCH=um SUBARCH=arm.
@@ -2685,6 +2719,18 @@ index 000000000..407fc49c6
 +	if (ptrace(PTRACE_SETREGS, pid, NULL, regs) < 0)
 +		return -errno;
 +	return 0;
++}
++
++/*
++ * The wrapper the generic skas path calls before PTRACE_CONT to put the
++ * stub's registers back the way do_syscall_stub found them
++ * (arch/um/os-Linux/skas/mem.c); the subarch supplies it. For arm it is
++ * just put_host_regs: the regset goes back as one 72-byte block, and the
++ * synthetic SYSCALL_NR slot above it stays on the UGL side.
++ */
++int ptrace_setregs(long pid, unsigned long *regs_in)
++{
++	return put_host_regs((int)pid, regs_in);
 +}
 +
 +/*
@@ -5123,6 +5169,34 @@ index 177615820..f00e3c657 100644
  
  	print_vma_addr(KERN_CONT " in ", UPT_IP(regs));
  	printk(KERN_CONT "\n");
+diff --git a/arch/um/os-Linux/elf_aux.c b/arch/um/os-Linux/elf_aux.c
+index 72f416edf..36dd85f8f
+--- a/arch/um/os-Linux/elf_aux.c
++++ b/arch/um/os-Linux/elf_aux.c
+@@ -25,6 +25,13 @@
+ /* These are initialized very early in boot and never changed */
+ char * elf_aux_platform;
+ long elf_aux_hwcap;
++/*
++ * The host's second hardware-features word, the pair to elf_aux_hwcap
++ * (arch/arm/um/cpuinfo.c prints them as the cpuinfo "Hardware" pair).
++ * An arm host publishes AT_HWCAP2; an x86 host does not, so it stays
++ * zero there.
++ */
++long elf_aux_hwcap2;
+ 
+ __init void scan_elf_aux( char **envp)
+ {
+@@ -37,6 +44,9 @@
+ 			case AT_HWCAP:
+ 				elf_aux_hwcap = auxv->a_un.a_val;
+ 				break;
++			case AT_HWCAP2:
++				elf_aux_hwcap2 = auxv->a_un.a_val;
++				break;
+ 			case AT_PLATFORM:
+                                 /* elf.h removed the pointer elements from
+                                  * a_un, so we have to use a_val, which is
 diff --git a/arch/um/os-Linux/start_up.c b/arch/um/os-Linux/start_up.c
 index 710e0a5f6..61492fabf 100644
 --- a/arch/um/os-Linux/start_up.c
