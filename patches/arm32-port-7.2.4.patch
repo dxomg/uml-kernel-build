@@ -506,10 +506,10 @@ index 000000000..f512a7b99
 +#include "../lib/bswapsdi2.S"
 diff --git a/arch/arm/um/arm_ksyms.c b/arch/arm/um/arm_ksyms.c
 new file mode 100644
-index 000000000..500330137
+index 000000000..248d124a4
 --- /dev/null
 +++ b/arch/arm/um/arm_ksyms.c
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,131 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Publish the arch/arm/lib symbols that UGL links into the host binary via
@@ -527,7 +527,25 @@ index 000000000..500330137
 + * without it every module that touches a bitops helper or a division fails
 + * the build the moment CONFIG_MODULES is on.
 + */
++#include <linux/bug.h>
 +#include <linux/export.h>
++#include <linux/linkage.h>
++
++/*
++ * The divide-by-zero handler the arch/arm/lib helpers (the __aeabi_idiv /
++ * __do_div64 families arm-klib.S links in) branch to on a zero divisor. The
++ * parent defines it in arch/arm/kernel/traps.c, where it turns the division
++ * into a divide-error exception, oops if not recovered; a UGL arm build does
++ * not build arch/arm/kernel (that traps.c is the host-side mechanism, and
++ * UGL has its own), so the guest kernel has to provide the symbol. It is
++ * defined here rather than in the klib-support USER_OBJ bugs.c because it
++ * runs in guest-kernel context and BUG() needs a kernel-side include
++ * environment -- see the note at the end of arch/arm/um/bugs.c.
++ */
++asmlinkage void __div0(void)
++{
++	BUG();
++}
 +
 +/*
 + * EXPORT_SYMBOL takes the address of the symbol, so every export below
@@ -2058,24 +2076,15 @@ index 000000000..358e588d7 100644
 +__do_div64 kernel__do_div64
 diff --git a/arch/arm/um/bugs.c b/arch/arm/um/bugs.c
 new file mode 100644
-index 000000000..81fa07503
+index 000000000..22afa1d81
 --- /dev/null
 +++ b/arch/arm/um/bugs.c
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,38 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Host-side sanity checks for ARCH=um SUBARCH=arm.
 + */
 +#include <arch.h>
-+/*
-+ * First of the kernel includes: this is a USER_OBJ, so nothing front-runs it
-+ * with <linux/types.h> the way <linux/kernel.h> does for kernel objects --
-+ * and <linux/bug.h>'s chain uses bool (kasan-checks.h via compiler.h) and
-+ * atomic_t (panic.h) before it pulls types in itself.
-+ */
-+#include <linux/types.h>
-+#include <linux/bug.h>
-+#include <linux/linkage.h>
 +#include <sysdep/ptrace.h>
 +
 +void arch_check_bugs(void)
@@ -2100,18 +2109,15 @@ index 000000000..81fa07503
 +}
 +
 +/*
-+ * The divide-by-zero handler the arch/arm/lib helpers (the __aeabi_idiv /
-+ * __do_div64 families arm-klib.S links in) branch to when the divisor is
-+ * zero. The parent defines it in arch/arm/kernel/traps.c, where it turns
-+ * the division into a divide-error exception, oops if not recovered; a
-+ * UGL arm build does not build arch/arm/kernel (that traps.c is the
-+ * host-side mechanism, and UGL has its own), so the guest kernel has to
-+ * provide the symbol here.
++ * __div0, the divide-by-zero handler the arch/arm/lib helpers (the
++ * __aeabi_idiv / __do_div64 families arm-klib.S links in) branch to on a
++ * zero divisor, is deliberately NOT here: it runs in guest-kernel context,
++ * and BUG() would drag <linux/bug.h>'s chain into a USER_OBJ, where every
++ * <linux/*.h> the cross sysroot's linux-libc-dev also ships (types.h and
++ * friends) resolves to the libc copy, which lacks the kernel-internal
++ * bool/atomic_t that chain uses. It lives in arm_ksyms.c, which is built
++ * kernel-side, next to the klib exports it backs.
 + */
-+asmlinkage void __div0(void)
-+{
-+	BUG();
-+}
 diff --git a/arch/arm/um/cpuinfo.c b/arch/arm/um/cpuinfo.c
 new file mode 100644
 index 000000000..20dd791c3
