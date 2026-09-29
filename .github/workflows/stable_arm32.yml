@@ -66,6 +66,10 @@ jobs:
           LLD="$(command -v ld.lld)"
           ln -sf "$LLD" /usr/local/bin/ld.lld
           ln -sf "$LLD" /usr/local/bin/arm-linux-gnueabi-ld.lld
+          # Pass the absolute path to the make step: -fuse-ld=<path> makes the
+          # cross gcc invoke this exact lld, which is multi-target and links the
+          # arm32 objects, rather than relying on it resolving the bare name.
+          echo "LLD=$LLD" >> "$GITHUB_ENV"
           ld.lld --version | head -1
           # Sanity: the cross toolchain really is an arm32 (armel) compiler,
           # not a host fallback — otherwise the build would silently produce
@@ -254,8 +258,10 @@ jobs:
           # against the arm32 glibc from the cross sysroot. The stub is forced
           # onto the host's multi-target lld (its -no-rosegment is not
           # understood by the armel binutils ld); -static is dropped so the
-          # stub links glibc dynamically.
-          $MAKE STUB_EXE_LDFLAGS='-Wl,-n -Wl,--no-rosegment -fuse-ld=lld' \
+          # stub links glibc dynamically. -fuse-ld gets the absolute lld path
+          # (set earlier via GITHUB_ENV) so the cross gcc invokes that exact
+          # linker regardless of its own program search order.
+          $MAKE STUB_EXE_LDFLAGS="-Wl,-n -Wl,--no-rosegment -fuse-ld=${LLD}" \
             -j"$(nproc)"
 
       - name: Verify + strip
