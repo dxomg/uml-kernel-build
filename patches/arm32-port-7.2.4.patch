@@ -5216,6 +5216,38 @@ index 177615820..f00e3c657 100644
  
  	print_vma_addr(KERN_CONT " in ", UPT_IP(regs));
  	printk(KERN_CONT "\n");
+diff --git a/arch/um/kernel/uml.lds.S b/arch/um/kernel/uml.lds.S
+index 30aa24348..223d2aaa1
+--- a/arch/um/kernel/uml.lds.S
++++ b/arch/um/kernel/uml.lds.S
+@@ -68,6 +68,27 @@
+ 	PROVIDE_HIDDEN(__rela_iplt_end = .);
+   }
+ 
++  /*
++   * The arm exception-index tables. A dynamically linked UML gets its
++   * boundaries from libc.so, resolved inside that library's own link; the
++   * static link pulls the arm unwind machinery out of libc.a and libgcc.a,
++   * and that code references __exidx_start/__exidx_end as link-time symbols.
++   * The kernel's own objects emit no .ARM.exidx -- the arm unwinder is not
++   * part of an UGL build -- so the tables end up holding whatever the static
++   * libc members carry and may well be empty, but the boundary symbols must
++   * exist. Same story as the __rel{,a}_iplt_{start,end} above.
++   */
++  .ARM.exidx : {
++	__exidx_start = .;
++	*(.ARM.exidx)
++	*(.ARM.exidx.*)
++	__exidx_end = .;
++  }
++  .ARM.extab : {
++	*(.ARM.extab)
++	*(.ARM.extab.*)
++  }
++
+   #include <asm/common.lds.S>
+ 
+   __init_begin = .;
 diff --git a/arch/um/os-Linux/elf_aux.c b/arch/um/os-Linux/elf_aux.c
 index 72f416edf..36dd85f8f
 --- a/arch/um/os-Linux/elf_aux.c
