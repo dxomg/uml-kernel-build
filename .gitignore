@@ -2,6 +2,9 @@
 linux-src/
 linux-*/
 
+# Local authoring worktrees (kernel trees + target/base dirs, ~GB each)
+.arm32-work/
+
 # Local build logs
 build.log
 *.log

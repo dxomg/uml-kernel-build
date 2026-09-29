@@ -230,6 +230,68 @@ carry a `-arm64` suffix; the amd64 names are unchanged. Artifacts hold raw
 (uncompressed) images — `release.yml` gzips them when staging release
 assets, so published assets keep the `base-*.img.gz` format.
 
+### Full arm32 port for 7.2.4 (`patches/arm32-port-7.2.4.patch`, `stable_arm32.yml`)
+
+The 32-bit arm (`SUBARCH=arm`, armv7l, 32-bit EABI) half of the UML port,
+authored against the same v7.2.4 base as the arm64 series but structured to
+its own needs. Unlike the arm64 patch, it is **100 % new files** — 43 of
+them — and touches no generic `arch/um/` code and no parent `arch/arm/` file
+outside the new `arch/arm/um/` subarch:
+
+* `arch/arm/Makefile.um` + `arch/arm/um/` (41 files) + `arch/um/configs/arm_defconfig`
+
+What it brings to `ARCH=um SUBARCH=arm`:
+
+* the `arch/arm/um/` subarch: `arm_defconfig` (4 KB pages, bootable-guest
+  filesystem set, `MODULES`/`MODULE_UNLOAD`), ptrace/signal state
+  save/restore, and `setjmp_arm.S` saving the AAPCS callee-saved set
+  (`r4–r11` + `sp`/`lr`) so a `switch_buf` built on one CPU thread is safe to
+  `longjmp` from another — which is what makes the subarch SMP-capable
+* FP/NEON carried across signals in a `vfp_sigframe` written into
+  `uc_regspace`; `/proc/cpuinfo` forwards the host `AT_HWCAP`/`AT_HWCAP2`
+  words (glibc's ifunc resolvers and OpenSSL read them), masking out the
+  dead `FPA`/`IWMMXT`/`CRUNCH` coprocessors UML does not save
+* the EABI syscall table: 420 native arm32 syscalls plus the five UGL
+  wrapper entries (`sigreturn`/`statfs64`/`fstatfs64`/`arm_fadvise64_64`/
+  `mmap2`) the parent `arch/arm/tools/syscall.tbl` already names
+* **Fault path** — arm's `sigcontext` has **no** fault-address member (aarch64's
+  does), and the host kernel only hands the faulting address to a handler in
+  the accompanying `siginfo`. `GET_FAULTINFO_FROM_MC(fi, mc)` therefore reads
+  `fi.addr` from the caller's in-scope `si->si_addr` (every call site — the
+  two generic SKAS handlers and the subarch's `stub_segv_handler` — holds that
+  siginfo under the name `si`; a caller without one fails to compile rather
+  than fill a wrong address), and `fi.ec` is the host FSR the kernel parks in
+  `thread.error_code` right before raising the signal
+* **Loadable modules** — arm modules are ELF REL, so the relocator reuses the
+  parent `arch/arm/kernel/module.c` verbatim under `subarch-$(CONFIG_MODULES)`,
+  exactly as x86 UML has done for years. There is no arm equivalent of
+  arm64's `module-plts.c`/`insn.o`: arm relocations patch fixed 32-bit
+  immediates that `module.c` computes in C
+
+Memory layout is the classic 1 GiB split (`PAGE_OFFSET=0xC0000000`,
+`PHYS_OFFSET=0`, virtual `==` physical). Deliberately **not** a `config ARM`,
+**not** `CLONE_BACKWARDS` (that is the aarch64 psABI; arm32 EABI keeps the
+generic clone() argument order), and **no** 16 KB-page option (a 16 KB arm32
+host is not a real target — the 16 KB requirement that motivated the arm64
+port is an arm64-only Android configuration).
+
+`.github/workflows/stable_arm32.yml` builds it with `SUBARCH=arm LLVM=1`
+(**native** — the UML binary is a 32-bit ARM userspace executable that links
+the host's own glibc, so it cannot be cross-compiled; GitHub's public pool has
+no arm32 runner, so `runs-on` points at a self-hosted `arm32` runner with a
+Docker daemon, and `debian:bookworm` resolves to its armhf variant there). The
+generic UML SKAS stub link already sets `STUB_EXE_LDFLAGS = -Wl,-n
+-Wl,--no-rosegment -static`, which GNU ld (≤ 2.43) rejects, so the workflow
+installs LLVM 18 and re-passes `STUB_EXE_LDFLAGS` with `-fuse-ld=lld` — the
+same toolchain treatment as arm64. After `olddefconfig` it fails the build
+loudly unless `CONFIG_32BIT=y` is present and `CONFIG_64BIT` is absent (the
+"did `SUBARCH=arm` stick" check, mirroring arm64's `CONFIG_64BIT` check). The
+UML SMP backport is **not** applied — 7.2.4 has native SMP.
+
+The Go helper matrix picks up the matching target: `vdeplug_go.yml` gains a
+`target: arm` build (`GOOS=linux GOARCH=arm`, pure-Go cross-compile from the
+x86_64 runner, no toolchain).
+
 ### CI: bionic artifacts (`bionic_android.yml`)
 
 One workflow, two jobs, producing the Android-app bionic set (cross-built on
@@ -702,3 +764,8 @@ Reverse-chronological, one line per user-visible change.
 **Kernels & CI** — 162 commits of kernel patching, arm64/bionic ports,
 base-image builds and release automation; see `git log` and the sections
 above for the current state of each area.
+
+- this commit — arm32 (armv7l) UML port: `arch/arm/um` subarch +
+  `arm_defconfig` (43 new files, no generic changes), `stable_arm32.yml`
+  (native arm32 runner, `SUBARCH=arm LLVM=1`), and the matching
+  `GOARCH=arm` target in the `vdeplug_go.yml` helper matrix.

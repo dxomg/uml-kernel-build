@@ -60,6 +60,14 @@ jobs:
             goos: linux
             goarch: arm64
             cgo: 0
+          - target: arm
+            # 32-bit armv7: pure-Go (cgo off), so it cross-compiles from the
+            # x86_64 runner with no toolchain. Companion target of the arm32
+            # UML port (stable_arm32.yml / SUBARCH=arm).
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: arm
+            cgo: 0
           - target: android-arm64
             runner: ubuntu-24.04
             goos: android
