@@ -275,18 +275,24 @@ generic clone() argument order), and **no** 16 KB-page option (a 16 KB arm32
 host is not a real target — the 16 KB requirement that motivated the arm64
 port is an arm64-only Android configuration).
 
-`.github/workflows/stable_arm32.yml` builds it with `SUBARCH=arm LLVM=1`
-(**native** — the UML binary is a 32-bit ARM userspace executable that links
-the host's own glibc, so it cannot be cross-compiled; GitHub's public pool has
-no arm32 runner, so `runs-on` points at a self-hosted `arm32` runner with a
-Docker daemon, and `debian:bookworm` resolves to its armhf variant there). The
-generic UML SKAS stub link already sets `STUB_EXE_LDFLAGS = -Wl,-n
--Wl,--no-rosegment -static`, which GNU ld (≤ 2.43) rejects, so the workflow
-installs LLVM 18 and re-passes `STUB_EXE_LDFLAGS` with `-fuse-ld=lld` — the
-same toolchain treatment as arm64. After `olddefconfig` it fails the build
-loudly unless `CONFIG_32BIT=y` is present and `CONFIG_64BIT` is absent (the
-"did `SUBARCH=arm` stick" check, mirroring arm64's `CONFIG_64BIT` check). The
-UML SMP backport is **not** applied — 7.2.4 has native SMP.
+`.github/workflows/stable_arm32.yml` builds it **cross** on an x86_64
+`ubuntu-latest` runner: `make ARCH=um SUBARCH=arm CROSS_COMPILE=arm-linux-gnueabi-`
+makes the armel cross gcc the build CC (the UML kernel and its SKAS stub are
+both 32-bit ARM userspace objects, so the whole thing compiles exactly like
+any other cross-linked userspace program), and the host's multi-target `lld`
+finishes the stub link (the base UML sets `STUB_EXE_LDFLAGS = -Wl,-n
+-Wl,--no-rosegment -static`, which the armel binutils ld does not understand;
+`-fuse-ld=lld` moves that one link onto lld, and `-static` is dropped so the
+stub links the target's arm32 glibc dynamically rather than needing the static
+arm32 libc the cross dev package does not ship). The main kernel image links
+with the armel cross binutils ld, which is plain. The artifact is a 32-bit ARM
+ELF that links the target device's glibc, so it runs on real arm32 hardware —
+no arm32 runner, cross sysroot download, or qemu needed to *build* it.
+After `olddefconfig` it fails the build loudly unless `CONFIG_32BIT=y` is
+present and `CONFIG_64BIT` is absent (the "did `SUBARCH=arm` stick" check,
+mirroring arm64's `CONFIG_64BIT` check), and it verifies the resulting ELF is
+a 32-bit ARM object so a silent fallback to the host toolchain cannot ship the
+wrong binary. The UML SMP backport is **not** applied — 7.2.4 has native SMP.
 
 The Go helper matrix picks up the matching target: `vdeplug_go.yml` gains a
 `target: arm` build (`GOOS=linux GOARCH=arm`, pure-Go cross-compile from the
@@ -767,5 +773,6 @@ above for the current state of each area.
 
 - this commit — arm32 (armv7l) UML port: `arch/arm/um` subarch +
   `arm_defconfig` (43 new files, no generic changes), `stable_arm32.yml`
-  (native arm32 runner, `SUBARCH=arm LLVM=1`), and the matching
-  `GOARCH=arm` target in the `vdeplug_go.yml` helper matrix.
+  (cross-builds on `ubuntu-latest` with the armel cross gcc + host lld,
+  `SUBARCH=arm`), and the matching `GOARCH=arm` target in the
+  `vdeplug_go.yml` helper matrix.
