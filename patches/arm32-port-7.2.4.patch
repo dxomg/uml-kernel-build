@@ -326,10 +326,10 @@ index 000000000..f67e096c0
 +# 16 KB host anyway, so offering the symbol would be untestable decoration.
 diff --git a/arch/arm/um/Makefile b/arch/arm/um/Makefile
 new file mode 100644
-index 000000000..f7219fe12
+index 000000000..cd814cfd6
 --- /dev/null
 +++ b/arch/arm/um/Makefile
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,89 @@
 +# SPDX-License-Identifier: GPL-2.0
 +#
 +# arch/arm/um -- subarch support for ARCH=um SUBARCH=arm
@@ -358,6 +358,24 @@ index 000000000..f7219fe12
 +# Built with USER_CFLAGS against host headers rather than kernel headers:
 +# these speak to the host kernel, not to the guest.
 +USER_OBJS := bugs.o fault.o
++
++# USER_CFLAGS is derived from KBUILD_CFLAGS, so it loses every -I that
++# KBUILD_CPPFLAGS adds -- including the parent architecture's include dirs,
++# which is where <asm/*.h> resolves in this build. These objects still pull
++# kernel headers: bugs.c reaches <linux/bug.h> -> <asm/bug.h> and
++# linux/compiler.h -> <asm/rwonce.h>, and linux/linkage.h -> <asm/linkage.h>;
++# os-Linux/registers.c reaches <linux/elf.h> -> <asm/elf.h>. Without a
++# parent-asm search path gcc dies on the first of those ("asm/rwonce.h: No
++# such file or directory" in bugs.o). Append the parent's real and generated
++# include dirs as -idirafter, so they are searched behind everything
++# USER_CFLAGS already carries and only fill the gaps: <asm/bug.h> keeps
++# resolving to the um generic wrapper (arm's own would wire BUG() to the
++# parent's UDEF trap, which no UML host handles), and headers this build
++# shadows in arch/arm/um/asm/ for kernel objects are unaffected here.
++# Exported (arch/um/Makefile exports USER_CFLAGS), so the append also reaches
++# the nested os-Linux/ sub-make and its registers.o/mcontext.o.
++USER_CFLAGS += -idirafter $(srctree)/arch/arm/include \
++	       -idirafter $(objtree)/arch/arm/include/generated
 +
 +$(obj)/user-offsets.s: c_flags = -Wp,-MD,$(depfile) $(USER_CFLAGS) \
 +	-Iarch/arm/include/generated
