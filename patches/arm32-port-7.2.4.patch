@@ -303,6 +303,25 @@ index 000000000..eef7fb748
 +CFLAGS_stub_segv.o := $(CFLAGS_NO_HARDENING)
 +
 +include $(srctree)/arch/um/scripts/Makefile.rules
+diff --git a/arch/arm/um/asm/asm.h b/arch/arm/um/asm/asm.h
+new file mode 100644
+index 000000000..d5e897789
+--- /dev/null
++++ b/arch/arm/um/asm/asm.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_ASM_H
++#define __UM_ARM_ASM_H
++
++/*
++ * <asm/asm.h> is an x86 kernel-side header (register C variables for
++ * inline assembly). The generic UML cpufeature.h still includes it on
++ * kernel TUs; none of that machinery is used on arm, so the shadow is
++ * empty.
++ */
++
++#endif /* __UM_ARM_ASM_H */
+
 diff --git a/arch/arm/um/asm/checksum.h b/arch/arm/um/asm/checksum.h
 new file mode 100644
 index 000000000..ea45419d5
@@ -329,6 +348,35 @@ index 000000000..ea45419d5
 +#include <asm-generic/checksum.h>
 +
 +#endif /* __UM_ARM_CHECKSUM_H */
+diff --git a/arch/arm/um/asm/cpufeatures.h b/arch/arm/um/asm/cpufeatures.h
+new file mode 100644
+index 000000000..376b1edd0
+--- /dev/null
++++ b/arch/arm/um/asm/cpufeatures.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_CPUFEATURES_H
++#define __UM_ARM_CPUFEATURES_H
++
++/*
++ * Shadow of <asm/cpufeatures.h> for ARCH=um SUBARCH=arm. The header itself
++ * is an x86 thing (CPUID bit numbers), but the generic UML thread_struct
++ * (arch/um/include/asm/processor-generic.h) and the generated capflags.c
++ * are sized and indexed by its NCAPINTS/NBUGINTS and X86_FEATURE_* /
++ * X86_BUG_* names, and nothing else in the tree provides them for any
++ * other subarch.
++ *
++ * arch/um/Makefile puts -Iarch/$(SUBARCH)/um ahead of -Iarch/$(SUBARCH)/include
++ * and the uapi include dirs, so this file shadows <asm/cpufeatures.h> for
++ * every translation unit of the build. The x86 header is pure #define
++ * (no includes) and the tree always ships it, so pull it in by relative
++ * path: quoted includes resolve against this file's own directory, and
++ * everything stays in sync with the kernel version being built.
++ */
++#include "../../../x86/include/asm/cpufeatures.h"
++
++#endif /* __UM_ARM_CPUFEATURES_H */
+
 diff --git a/arch/arm/um/asm/cpuinfo.h b/arch/arm/um/asm/cpuinfo.h
 new file mode 100644
 index 000000000..e63d9059e
@@ -494,6 +542,24 @@ index 000000000..40af7dd58
 +#include <uapi/asm/hwcap.h>
 +
 +#endif /* __UM_ARM_HWCAP_H */
+diff --git a/arch/arm/um/asm/ldt.h b/arch/arm/um/asm/ldt.h
+new file mode 100644
+index 000000000..f9b35ddbc
+--- /dev/null
++++ b/arch/arm/um/asm/ldt.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_LDT_H
++#define __UM_ARM_LDT_H
++
++/*
++ * arm has no local descriptor table and no user_desc: <asm/ldt.h> is an
++ * x86 UAPI header. The generic UGL start_up.c still includes it; nothing
++ * in an arm build uses anything from it, so the shadow is empty.
++ */
++
++#endif /* __UM_ARM_LDT_H */
+
 diff --git a/arch/arm/um/asm/mman.h b/arch/arm/um/asm/mman.h
 new file mode 100644
 index 000000000..48d50a87c
@@ -598,6 +664,49 @@ index 000000000..e1f7461be
 +#include <asm/processor-generic.h>
 +
 +#endif /* __UM_ARM_PROCESSOR_H */
+diff --git a/arch/arm/um/asm/ptrace-abi.h b/arch/arm/um/asm/ptrace-abi.h
+new file mode 100644
+index 000000000..ec5070b17
+--- /dev/null
++++ b/arch/arm/um/asm/ptrace-abi.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_PTRACE_ABI_H
++#define __UM_ARM_PTRACE_ABI_H
++
++/*
++ * Shadow of <asm/ptrace-abi.h> for ARCH=um SUBARCH=arm. x86 provides
++ * that name as a UAPI header carrying the PTRACE_* request numbers;
++ * arm has no file of that name, but the generic arch/um/kernel/ptrace.c
++ * includes it unconditionally, and two of the request numbers it
++ * dispatches on have no arm UAPI encoding at all:
++ *
++ *   PTRACE_SET_THREAD_AREA  arm has PTRACE_GET_THREAD_AREA (22) but no
++ *                           set half -- TLS is arch_set_tls(), and the
++ *                           port's ptrace_get/set_thread_area() return
++ *                           -ENOSYS for both. The value matches x86's.
++ *   PTRACE_SYSEMU[_SINGLESTEP]  arm has no seccomp-syscall-resume
++ *                           requests; the generic handler just answers
++ *                           them -EIO. The values match arm64's UAPI.
++ *
++ * PTRACE_PEEKUSR/POKEUSR come from <uapi/linux/ptrace.h> (via
++ * <linux/ptrace.h>), PTRACE_GETREGS/SETREGS/GET_THREAD_AREA from arm's
++ * own UAPI <uapi/asm/ptrace.h>, and the MAX_REG_OFFSET / getreg() /
++ * putreg() the GETREGS case needs are pulled in below.
++ */
++#include <sysdep/ptrace.h>
++
++#define PTRACE_SET_THREAD_AREA	26
++#define PTRACE_SYSEMU		31
++#define PTRACE_SYSEMU_SINGLESTEP 32
++
++extern unsigned long getreg(struct task_struct *child, int regno);
++extern int putreg(struct task_struct *child, int regno, unsigned long value);
++extern long subarch_ptrace(struct task_struct *child, long request,
++			   unsigned long addr, unsigned long data);
++
++#endif /* __UM_ARM_PTRACE_ABI_H */
+
 diff --git a/arch/arm/um/asm/ptrace.h b/arch/arm/um/asm/ptrace.h
 new file mode 100644
 index 000000000..1e01e752e
@@ -719,6 +828,27 @@ index 000000000..1e01e752e
 +extern void arch_switch_to(struct task_struct *to);
 +
 +#endif /* __UM_ARM_PTRACE_H */
+diff --git a/arch/arm/um/asm/segment.h b/arch/arm/um/asm/segment.h
+new file mode 100644
+index 000000000..08449df7c
+--- /dev/null
++++ b/arch/arm/um/asm/segment.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __UM_ARM_SEGMENT_H
++#define __UM_ARM_SEGMENT_H
++
++/*
++ * arm has no segment registers: <asm/segment.h> is an x86 thing. The
++ * generic UGL thread_info.h still includes it and the generic
++ * arch/um/kernel/asm-offsets.c still records GDT_ENTRY_TLS_ENTRIES, so
++ * the shadow exists. TLS on arm is a register (r8), not a descriptor
++ * table entry, so there is nothing to count.
++ */
++#define GDT_ENTRY_TLS_ENTRIES 0
++
++#endif /* __UM_ARM_SEGMENT_H */
+
 diff --git a/arch/arm/um/asm/string.h b/arch/arm/um/asm/string.h
 new file mode 100644
 index 000000000..628e48718
@@ -1671,7 +1801,7 @@ index 000000000..20dd791c3
 +}
 diff --git a/arch/arm/um/delay.c b/arch/arm/um/delay.c
 new file mode 100644
-index 000000000..b5d562c37
+index 000000000..c999953bc
 --- /dev/null
 +++ b/arch/arm/um/delay.c
 @@ -0,0 +1,58 @@
@@ -1733,6 +1863,7 @@ index 000000000..b5d562c37
 +	__const_udelay(nsecs * 0x00005); /* 2**32 / 1000000000 (rounded up) */
 +}
 +EXPORT_SYMBOL(__ndelay);
+
 diff --git a/arch/arm/um/fault.c b/arch/arm/um/fault.c
 new file mode 100644
 index 000000000..e16bf0605
@@ -3439,7 +3570,7 @@ index 000000000..20d2923f6
 +#endif /* _SYSDEP_TLS_H */
 diff --git a/arch/arm/um/signal.c b/arch/arm/um/signal.c
 new file mode 100644
-index 000000000..08f3731d1
+index 000000000..11a6ec36a
 --- /dev/null
 +++ b/arch/arm/um/signal.c
 @@ -0,0 +1,401 @@
@@ -3844,6 +3975,7 @@ index 000000000..08f3731d1
 +	force_sig(SIGSEGV);
 +	return 0;
 +}
+
 diff --git a/arch/arm/um/stub_segv.c b/arch/arm/um/stub_segv.c
 new file mode 100644
 index 000000000..3f9d93199
