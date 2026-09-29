@@ -4537,10 +4537,10 @@ index 000000000..1636ab005
 +}
 diff --git a/arch/um/configs/arm_defconfig b/arch/um/configs/arm_defconfig
 new file mode 100644
-index 000000000..93c391648
+index 000000000..55412c31d
 --- /dev/null
 +++ b/arch/um/configs/arm_defconfig
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,95 @@
 +#
 +# 4 KB pages, explicitly: guest pages are host mmap()s, so the guest's page
 +# size cannot be smaller than the host's. Every arm32 host kernel runs 4 KB
@@ -4593,6 +4593,10 @@ index 000000000..93c391648
 +# so the PLT-veneer lookup get_module_plt() that module.c calls when this
 +# option is on has no definition; keep it off.
 +CONFIG_ARM_MODULE_PLTS=n
++# Likewise without arch/arm/kernel/phys2virt.S: with this option on,
++# module_finalize() calls fixup_pv_table(), which lives in that
++# assembly file and has no UGL equivalent.
++CONFIG_ARM_PATCH_PHYS_VIRT=n
 +# CONFIG_BLK_DEV_BSG is not set
 +CONFIG_IOSCHED_BFQ=m
 +CONFIG_SSL=y

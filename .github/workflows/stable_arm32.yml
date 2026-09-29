@@ -262,12 +262,16 @@ jobs:
           # Cross link: the kernel + stub are arm32 userspace objects, linked
           # against the arm32 glibc from the cross sysroot. The stub is forced
           # onto the host's multi-target lld (its -no-rosegment is not
-          # understood by the armel binutils ld); -static is dropped so the
-          # stub links glibc dynamically. -fuse-ld takes only the linker's
-          # base name -- gcc rejects a path there -- and the symlinks made in
-          # the lld step are how the name resolves to that exact multi-target
-          # lld instead of the armel binutils ld.
-          $MAKE STUB_EXE_LDFLAGS="-Wl,-n -Wl,--no-rosegment -fuse-ld=lld" \
+          # understood by the armel binutils ld). -static is dropped, so the
+          # stub links glibc dynamically and the target device supplies it at
+          # runtime; -lc is passed explicitly because the stub link is
+          # -nostdlib, which strips the implicit -lc, and without it the
+          # memset that gcc emits to zero the partial struct initializers in
+          # real_init() is an undefined symbol in the link. -fuse-ld takes
+          # only the linker's base name -- gcc rejects a path there -- and
+          # the symlinks made in the lld step are how the name resolves to
+          # that exact multi-target lld instead of the armel binutils ld.
+          $MAKE STUB_EXE_LDFLAGS="-Wl,-n -Wl,--no-rosegment -lc -fuse-ld=lld" \
             -j"$(nproc)"
 
       - name: Verify + strip
