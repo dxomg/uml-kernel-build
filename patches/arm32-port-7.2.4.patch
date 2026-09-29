@@ -123,10 +123,10 @@ index 000000000..3226d6373
 +endif
 diff --git a/arch/arm/um/Kconfig b/arch/arm/um/Kconfig
 new file mode 100644
-index 000000000..1152a6d3c
+index 000000000..759695979
 --- /dev/null
 +++ b/arch/arm/um/Kconfig
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,136 @@
 +# SPDX-License-Identifier: GPL-2.0
 +
 +config UML_ARM
@@ -150,15 +150,16 @@ index 000000000..1152a6d3c
 +	# on one CPU rather than refusing to boot.
 +	select UML_SUBARCH_SUPPORTS_SMP
 +	#
-+	# The parent arch/arm does not select these, but its decision was made
-+	# for a machine with MMU, IOMMU and hardware spin-table errata to
-+	# worry about. UML guest spinlocks serialize threads of one process,
-+	# so the generic queued implementations -- plain C on top of the
-+	# architecture's atomics, which ARCH_SUPPORTS_ATOMIC_RMW above
-+	# covers -- are the right ones, exactly as the x86 and arm64 UML
-+	# subarchs select them.
-+	select ARCH_USE_QUEUED_RWLOCKS
-+	select ARCH_USE_QUEUED_SPINLOCKS
++	# Spinlocks and rwlocks stay the parent's ticket locks; the ARCH_USE_
++	# QUEUED_* selects the x86 and arm64 subarchs take are not available
++	# here. The generic queued implementation redefines arch_spinlock_t
++	# as struct qspinlock, while arch/arm's ticket locks type it as a
++	# different struct, so a translation unit that includes both
++	# <asm/spinlock.h> and <asm/qspinlock.h> is a typedef conflict rather
++	# than a choice, and arch/arm ships no <asm/qspinlock.h> to bridge
++	# them. A UML guest's locks serialize threads of one host process on
++	# the host's atomics, where the ticket locks the parent ships for
++	# SMP are exactly good enough.
 +	#
 +	# The guest is ARMv7, which has the efficient unaligned access
 +	# hardware. The parent gates this on CPU_V6 and later plus MMU;
@@ -262,6 +263,7 @@ index 000000000..1152a6d3c
 +# KB-page requirement the arm64 port exists for (Android 15+) is an
 +# arm64-only Android configuration, and a 4 KB UML guest cannot boot on a
 +# 16 KB host anyway, so offering the symbol would be untestable decoration.
+
 diff --git a/arch/arm/um/Makefile b/arch/arm/um/Makefile
 new file mode 100644
 index 000000000..eef7fb748
@@ -903,30 +905,6 @@ index 000000000..1e01e752e
 +extern void arch_switch_to(struct task_struct *to);
 +
 +#endif /* __UM_ARM_PTRACE_H */
-diff --git a/arch/arm/um/asm/qspinlock.h b/arch/arm/um/asm/qspinlock.h
-new file mode 100644
-index 000000000..dee51c5ca
---- /dev/null
-+++ b/arch/arm/um/asm/qspinlock.h
-@@ -0,0 +1,18 @@
-+/* SPDX-License-Identifier: GPL-2.0 */
-+#ifndef __UM_ARM_QSPINLOCK_H
-+#define __UM_ARM_QSPINLOCK_H
-+
-+/*
-+ * UML arm32 shadow of <asm/qspinlock.h>. The arm kernel uses ticket
-+ * spinlocks and ships no header of that name, and Kbuild's
-+ * mandatory-header fallback does not wrap one either. But this subarch
-+ * selects ARCH_USE_QUEUED_SPINLOCKS exactly as x86 and arm64 UML do,
-+ * so with CONFIG_QUEUED_SPINLOCKS set, <asm-generic/rqspinlock.h> and
-+ * kernel/bpf/rqspinlock.c both include <asm/qspinlock.h>. Point it at
-+ * the generic queued implementation: guest queued locks are plain C on
-+ * top of the architecture's atomics, which ARCH_SUPPORTS_ATOMIC_RMW
-+ * covers.
-+ */
-+#include <asm-generic/qspinlock.h>
-+
-+#endif /* __UM_ARM_QSPINLOCK_H */
 diff --git a/arch/arm/um/asm/segment.h b/arch/arm/um/asm/segment.h
 new file mode 100644
 index 000000000..08449df7c
@@ -4587,3 +4565,25 @@ index 000000000..763f54f01
 +CONFIG_NLS=y
 +CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 +CONFIG_DEBUG_KERNEL=y
+
+diff --git a/arch/um/include/asm/Kbuild b/arch/um/include/asm/Kbuild
+index 8fdc0bd9a..9dd4145ec 100644
+--- a/arch/um/include/asm/Kbuild
++++ b/arch/um/include/asm/Kbuild
+@@ -12,8 +12,16 @@
+ generic-y += kdebug.h
+ generic-y += mcs_spinlock.h
+ generic-y += mmiowb.h
++# The arm32 subarch reuses arch/arm/kernel/module.c, which needs arch/arm's
++# own struct mod_arch_specific and the get_module_plt() declaration. Those live
++# in arch/arm/um/asm/module.h, and a generic-y wrapper here would shadow it --
++# generated headers win the include path -- leaving "field has incomplete type
++# 'struct mod_arch_specific'" in every translation unit that pulls in
++# <linux/module.h>.
++ifneq ($(HEADER_ARCH),arm)
+ generic-y += module.h
+ generic-y += module.lds.h
++endif
+ generic-y += parport.h
+ generic-y += percpu.h
+ generic-y += percpu_types.h
