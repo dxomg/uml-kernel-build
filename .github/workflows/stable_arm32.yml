@@ -294,6 +294,10 @@ jobs:
             echo "actual: $(file -b linux)"
             exit 1; }
           cp linux ../linux-uml-arm32
+          # Ship the built stub next to the kernel: the stub_exe=<path> boot
+          # argument (the Android memfd-exec workaround) wants a copy of
+          # exactly this file.
+          cp linux-${{ env.KVER }}/arch/um/kernel/skas/stub_exe ../stub_exe
           cd ..
           arm-linux-gnueabi-strip linux-uml-arm32
           echo "${{ env.KVER }} (arm32, VECTOR, cross)" > VERSION
@@ -304,6 +308,7 @@ jobs:
           name: linux-uml-stable-arm32
           path: |
             linux-uml-arm32
+            stub_exe
             VERSION
 
   # Same kernel, same cross-build, but the vmlinux (and its SKAS stub) are
@@ -544,6 +549,8 @@ jobs:
             echo "actual: $(file -b linux)"
             exit 1; }
           cp linux ../linux-uml-arm32-static
+          # The static stub, for the same stub_exe=<path> workaround.
+          cp linux-${{ env.KVER }}/arch/um/kernel/skas/stub_exe ../stub_exe-static
           cd ..
           arm-linux-gnueabi-strip linux-uml-arm32-static
           echo "${{ env.KVER }} (arm32, VECTOR, static)" > VERSION
@@ -554,4 +561,5 @@ jobs:
           name: linux-uml-stable-arm32-static
           path: |
             linux-uml-arm32-static
+            stub_exe-static
             VERSION

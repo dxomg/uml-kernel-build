@@ -5130,6 +5130,82 @@ index 7ffa5437b..05964bcdd 100644
 +#endif
 +
  #endif /* _ASM_UML_UNWIND_H */
+diff --git a/arch/um/include/shared/os.h b/arch/um/include/shared/os.h
+index 50346fea2..f0a47ddaf
+--- a/arch/um/include/shared/os.h
++++ b/arch/um/include/shared/os.h
+@@ -198,7 +198,7 @@
+ extern void report_enomem(void);
+ 
+ /* process.c */
+-pid_t os_reap_child(void);
++pid_t os_reap_child(int *status);
+ extern void os_alarm_process(int pid);
+ extern void os_kill_process(int pid, int reap_child);
+ extern void os_kill_ptraced_process(int pid, int reap_child);
+diff --git a/arch/um/kernel/skas/mmu.c b/arch/um/kernel/skas/mmu.c
+index b50170960..282279422
+--- a/arch/um/kernel/skas/mmu.c
++++ b/arch/um/kernel/skas/mmu.c
+@@ -109,14 +109,35 @@
+ 	free_pages(mmu->id.stack, ilog2(STUB_DATA_PAGES));
+ }
+ 
++/*
++ * real_init() in the stub exits with a distinct code per setup step; map the
++ * interesting ones to causes. Most of them mean a host kernel capability is
++ * missing; a signal death points at the stub code itself or at the filter's
++ * architecture check.
++ */
++static const char *stub_exit_text(int code)
++{
++	switch (code) {
++	case 10: return "could not read init data from UML";
++	case 11: return "could not map the stub code page";
++	case 12: return "could not map the stub data page";
++	case 13: return "close_range() failed (host kernel too old?)";
++	case 14 ... 20: return "signal handler setup failed";
++	case 21: return "seccomp filter rejected (host kernel lacks seccomp filters?)";
++	case 30: return "clean exit past the handshake (stub bug?)";
++	default: return "unknown stub exit code";
++	}
++}
++
+ static irqreturn_t mm_sigchld_irq(int irq, void* dev)
+ {
+ 	struct mm_context *mm_context;
+ 	pid_t pid;
++	int status;
+ 
+ 	guard(spinlock)(&mm_list_lock);
+ 
+-	while ((pid = os_reap_child()) > 0) {
++	while ((pid = os_reap_child(&status)) > 0) {
+ 		/*
+ 		* A child died, check if we have an MM with the PID. This is
+ 		* only relevant in SECCOMP mode (as ptrace will fail anyway).
+@@ -125,8 +146,21 @@
+ 		*/
+ 		list_for_each_entry(mm_context, &mm_list, list) {
+ 			if (mm_context->id.pid == pid) {
++				int sig = status & 0x7f;
+ 				struct stub_data *stub_data;
+ 				printk("Unexpectedly lost MM child! Affected tasks will segfault.");
++				/*
++				 * The stub exits with a distinct code per init step (real_init in
++				 * stub_exe.c), and a signal death points at the stub code or the
++				 * filter's architecture check rather than at the host. Print which,
++				 * or every failure here looks alike.
++				 */
++				if (sig == 0)
++					printk("Stub pid %d exited with %d: %s\n",
++					       pid, (status >> 8) & 0xff,
++					       stub_exit_text((status >> 8) & 0xff));
++				else if (sig != 0x7f)
++					printk("Stub pid %d was killed by signal %d\n", pid, sig);
+ 
+ 				/* Marks the MM as dead */
+ 				mm_context->id.pid = -1;
 diff --git a/arch/um/kernel/skas/stub_exe.c b/arch/um/kernel/skas/stub_exe.c
 index cbafaa684..1a903f302 100644
 --- a/arch/um/kernel/skas/stub_exe.c
@@ -5276,6 +5352,31 @@ index 72f416edf..36dd85f8f
  			case AT_PLATFORM:
                                  /* elf.h removed the pointer elements from
                                   * a_un, so we have to use a_val, which is
+diff --git a/arch/um/os-Linux/process.c b/arch/um/os-Linux/process.c
+index 3a2a84ab9..1462b0d9b
+--- a/arch/um/os-Linux/process.c
++++ b/arch/um/os-Linux/process.c
+@@ -67,12 +67,14 @@
+ 	unblock_signals();
+ }
+ 
+-pid_t os_reap_child(void)
+-{
+-	int status;
+-
+-	/* Try to reap a child */
+-	return waitpid(-1, &status, WNOHANG);
++pid_t os_reap_child(int *status)
++{
++	int st;
++	pid_t pid = waitpid(-1, &st, WNOHANG);
++
++	if (pid > 0 && status)
++		*status = st;
++	return pid;
+ }
+ 
+ /* Don't use the glibc version, which caches the result in TLS. It misses some
 diff --git a/arch/um/os-Linux/start_up.c b/arch/um/os-Linux/start_up.c
 index 710e0a5f6..61492fabf 100644
 --- a/arch/um/os-Linux/start_up.c
