@@ -5328,3 +5328,713 @@ index 67f611231..8268340b8 100644
  #undef memcpy
  extern void *memcpy(void *, const void *, size_t);
  EXPORT_SYMBOL(memcpy);
+
+#
+# Generic ptrace-cancellation path (skas0 on hosts without PTRACE_SYSEMU).
+# The checks and the userspace() loop below are the arm32 counterparts of the
+# same machinery the arm64 port carries; arm32 hosts have no PTRACE_SYSEMU,
+# so every guest syscall is intercepted by cancelling it at a PTRACE_SYSCALL
+# stop instead. Also fixes check_ptrace(), which probed the syscall number
+# with PTRACE_PEEKUSER at the synthesised PT_SYSCALL_NR_OFFSET -- a slot only
+# UML's own regset copy serves -- so the probe child ran its getpid
+# unmodified and exited 1, which check_ptrace() reported as
+# "expected (SIGTRAP|0x80), got status = 256" and the boot died there.
+#
+diff --git a/arch/um/include/shared/registers.h b/arch/um/include/shared/registers.h
+index 7d81b23..5be8806 100644
+--- a/arch/um/include/shared/registers.h
++++ b/arch/um/include/shared/registers.h
+@@ -8,6 +8,34 @@
+ 
+ #include <sysdep/ptrace.h>
+ 
++/*
++ * Transfer the general-purpose register file to/from a stub process.
++ *
++ * These used to be open-coded PTRACE_GETREGS/PTRACE_SETREGS calls. The subarch
++ * also uses them to fill in any register state that does not live in the
++ * host's primary regset -- on arm32 the in-flight syscall number, which is
++ * synthesised one slot above the 72-byte block from r7.
++ */
++extern int get_host_regs(int pid, unsigned long *regs);
++extern int put_host_regs(int pid, unsigned long *regs);
++
++/*
++ * Inspect and rewrite the syscall a stopped tracee is about to make.
++ *
++ * These were open-coded as PTRACE_PEEKUSER/PTRACE_POKEUSER at
++ * PT_SYSCALL_NR_OFFSET. That works on x86, where the syscall number lives in
++ * orig_ax inside the ptrace user area. arm32 has no syscall-number word in
++ * its user area: the number is r7, which is also the only way to cancel a
++ * syscall (by writing -1 into it -- the host's dispatcher answers anything
++ * outside the table with -ENOSYS).
++ *
++ * ptrace_get_syscall_nr() returns the number, or -1 with errno set.
++ * The setters return 0 or a negative errno.
++ */
++extern long ptrace_get_syscall_nr(int pid);
++extern int ptrace_set_syscall_nr(int pid, long nr);
++extern int ptrace_set_syscall_ret(int pid, long val);
++
+ extern int init_pid_registers(int pid);
+ extern void get_safe_registers(unsigned long *regs, unsigned long *fp_regs);
+ extern int get_fp_registers(int pid, unsigned long *regs);
+diff --git a/arch/um/include/shared/skas/skas.h b/arch/um/include/shared/skas/skas.h
+index 2237ffe..066c417 100644
+--- a/arch/um/include/shared/skas/skas.h
++++ b/arch/um/include/shared/skas/skas.h
+@@ -10,6 +10,14 @@
+ 
+ extern int using_seccomp;
+ 
++/*
++ * Whether the host implements PTRACE_SYSEMU. Where it does not, UML builds
++ * the same semantics out of PTRACE_SYSCALL and a syscall cancellation; see
++ * check_sysemu(). Set once at boot, before any stub exists.
++ */
++extern int have_ptrace_sysemu;
++extern int syscall_cancel_nr;
++
+ extern void new_thread_handler(void);
+ extern void handle_syscall(struct uml_pt_regs *regs);
+ extern unsigned long current_stub_stack(void);
+diff --git a/arch/um/kernel/skas/syscall.c b/arch/um/kernel/skas/syscall.c
+index bc11773..85ec811 100644
+--- a/arch/um/kernel/skas/syscall.c
++++ b/arch/um/kernel/skas/syscall.c
+@@ -14,6 +14,20 @@
+ #include <asm/unistd.h>
+ #include <asm/delay.h>
+ 
++/*
++ * Seed the return register with -ENOSYS before the syscall-entry stop.
++ *
++ * Unconditional unless a subarch says otherwise, which preserves the x86
++ * behaviour: there the return register is not an argument register and native
++ * x86 genuinely leaves -ENOSYS in it at an entry stop. See the arm override
++ * in <sysdep/ptrace.h> for why that is wrong when the two alias -- on arm32
++ * the return register is r0, which is also the first argument, and seeding
++ * it here would destroy the argument before the call ever runs.
++ */
++#ifndef UM_SEED_ENOSYS_BEFORE_TRACE
++#define UM_SEED_ENOSYS_BEFORE_TRACE(r)	1
++#endif
++
+ void handle_syscall(struct uml_pt_regs *r)
+ {
+ 	struct pt_regs *regs = container_of(r, struct pt_regs, regs);
+@@ -21,7 +35,8 @@ void handle_syscall(struct uml_pt_regs *r)
+ 
+ 	/* Initialize the syscall number and default return value. */
+ 	UPT_SYSCALL_NR(r) = PT_SYSCALL_NR(r->gp);
+-	PT_REGS_SET_SYSCALL_RETURN(regs, -ENOSYS);
++	if (UM_SEED_ENOSYS_BEFORE_TRACE(r))
++		PT_REGS_SET_SYSCALL_RETURN(regs, -ENOSYS);
+ 
+ 	if (syscall_trace_enter(regs))
+ 		goto out;
+diff --git a/arch/um/os-Linux/skas/process.c b/arch/um/os-Linux/skas/process.c
+index d6c22f8..3ba1060 100644
+--- a/arch/um/os-Linux/skas/process.c
++++ b/arch/um/os-Linux/skas/process.c
+@@ -92,7 +92,7 @@ static int ptrace_dump_regs(int pid)
+ 	unsigned long regs[MAX_REG_NR];
+ 	int i;
+ 
+-	if (ptrace(PTRACE_GETREGS, pid, 0, regs) < 0)
++	if (get_host_regs(pid, regs) < 0)
+ 		return -errno;
+ 
+ 	printk(UM_KERN_ERR "Stub registers -\n");
+@@ -428,6 +428,18 @@ __initcall(init_stub_exe_fd);
+ 
+ int using_seccomp;
+ 
++/*
++ * Whether the host implements PTRACE_SYSEMU. Where it does not -- on arm32
++ * that is every host -- UML builds the same semantics out of PTRACE_SYSCALL
++ * and a syscall cancellation; see check_sysemu(). syscall_cancel_nr is the
++ * number written over each guest syscall before it resumes: -1, which the
++ * host's dispatcher answers with -ENOSYS, or, on hosts whose seccomp filter
++ * screens that number, a harmless substitute. Set once at boot, before any
++ * stub exists.
++ */
++int have_ptrace_sysemu = 1;
++int syscall_cancel_nr = -1;
++
+ /**
+  * start_userspace() - prepare a new userspace process
+  * @mm_id: The corresponding struct mm_id
+@@ -543,6 +555,30 @@ out_close:
+ static int unscheduled_userspace_iterations;
+ extern unsigned long tt_extra_sched_jiffies;
+ 
++#ifdef UM_SYSCALL_TRAP_INSN
++/*
++ * Is the guest about to execute the instruction that enters the kernel?
++ *
++ * Only consulted while single-stepping a guest on a host without
++ * PTRACE_SYSEMU, which is a debugger path, so the extra ptrace call per step
++ * costs nothing that matters. A failed read is reported as "not a syscall":
++ * the instruction is about to be executed by the guest either way, and if it
++ * is unreadable the single-step will fault on it and be reported normally,
++ * which is a better outcome than refusing to step.
++ */
++static int at_syscall_insn(int pid, unsigned long pc)
++{
++	long word;
++
++	errno = 0;
++	word = ptrace(PTRACE_PEEKTEXT, pid, (void *)pc, 0);
++	if (word == -1 && errno)
++		return 0;
++
++	return (unsigned int)word == UM_SYSCALL_TRAP_INSN;
++}
++#endif
++
+ void userspace(struct uml_pt_regs *regs)
+ {
+ 	int err, status, op;
+@@ -666,7 +702,7 @@ void userspace(struct uml_pt_regs *regs)
+ 			 * fail.  In this case, there is nothing to do but
+ 			 * just kill the process.
+ 			 */
+-			if (ptrace(PTRACE_SETREGS, pid, 0, regs->gp)) {
++			if (put_host_regs(pid, regs->gp)) {
+ 				printk(UM_KERN_ERR "%s - ptrace set regs failed, errno = %d\n",
+ 				       __func__, errno);
+ 				fatal_sigsegv();
+@@ -678,10 +714,34 @@ void userspace(struct uml_pt_regs *regs)
+ 				fatal_sigsegv();
+ 			}
+ 
+-			if (singlestepping())
++			/*
++			 * Without PTRACE_SYSEMU the guest is run under plain
++			 * PTRACE_SYSCALL and the syscall is cancelled at the
++			 * entry stop below, which reaches the same place: the
++			 * call does not execute and the guest resumes past it
++			 * with whatever UML puts in the return register.
++			 */
++			if (!have_ptrace_sysemu) {
++				op = PTRACE_SYSCALL;
++#ifdef UM_SYSCALL_TRAP_INSN
++				/*
++				 * Single-stepping still has to step. The one
++				 * instruction that must not be stepped is the
++				 * one that enters the kernel: stepping it
++				 * would run the guest's syscall on the host.
++				 * Take the syscall stop for that instruction
++				 * instead, so it can be cancelled like any
++				 * other.
++				 */
++				if (singlestepping() &&
++				    !at_syscall_insn(pid, UPT_IP(regs)))
++					op = PTRACE_SINGLESTEP;
++#endif
++			} else if (singlestepping()) {
+ 				op = PTRACE_SYSEMU_SINGLESTEP;
+-			else
++			} else {
+ 				op = PTRACE_SYSEMU;
++			}
+ 
+ 			if (ptrace(op, pid, 0, 0)) {
+ 				printk(UM_KERN_ERR "%s - ptrace continue failed, op = %d, errno = %d\n",
+@@ -697,8 +757,8 @@ void userspace(struct uml_pt_regs *regs)
+ 			}
+ 
+ 			regs->is_user = 1;
+-			if (ptrace(PTRACE_GETREGS, pid, 0, regs->gp)) {
+-				printk(UM_KERN_ERR "%s - PTRACE_GETREGS failed, errno = %d\n",
++			if (get_host_regs(pid, regs->gp)) {
++				printk(UM_KERN_ERR "%s - get_host_regs failed, errno = %d\n",
+ 				       __func__, errno);
+ 				fatal_sigsegv();
+ 			}
+@@ -709,6 +769,84 @@ void userspace(struct uml_pt_regs *regs)
+ 				fatal_sigsegv();
+ 			}
+ 
++			/*
++			 * Without PTRACE_SYSEMU this stop is an ordinary
++			 * syscall-entry stop and the guest's call is about to
++			 * run for real on the host. Cancel it before anything
++			 * else: write the cancellation number over r7, then
++			 * step off the stop. The step consumes the svc -- it
++			 * runs as the cancelled call, a no-op the host answers
++			 * with -ENOSYS -- and leaves the program counter after
++			 * it, so the guest never re-runs the call and no
++			 * syscall-exit stop follows. The registers were read
++			 * above, so the syscall number and arguments UML needs
++			 * have already been taken and overwriting r7 here
++			 * loses nothing; the emulated result is written back
++			 * by the put_host_regs at the top of the next pass.
++			 *
++			 * syscall_cancel_nr is -1, the "run nothing" value,
++			 * unless the boot probe found the host refuses it --
++			 * in which case it names a harmless syscall to run in
++			 * the guest call's place. See check_sysemu().
++			 */
++			if (!have_ptrace_sysemu && WIFSTOPPED(status) &&
++			    WSTOPSIG(status) == (SIGTRAP | 0x80)) {
++				int sstatus, tries = 0;
++
++				if (ptrace_set_syscall_nr(pid,
++							  syscall_cancel_nr)) {
++					printk(UM_KERN_ERR "%s - failed to cancel a guest syscall, errno = %d\n",
++					       __func__, errno);
++					fatal_sigsegv();
++				}
++
++				while (1) {
++					if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0)) {
++						printk(UM_KERN_ERR "%s - failed to step off a syscall stop, errno = %d\n",
++						       __func__, errno);
++						fatal_sigsegv();
++					}
++
++					CATCH_EINTR(err = waitpid(pid, &sstatus,
++								  WUNTRACED | __WALL));
++					if (err < 0) {
++						printk(UM_KERN_ERR "%s - wait after step failed, errno = %d\n",
++						       __func__, errno);
++						fatal_sigsegv();
++					}
++
++					if (WIFSTOPPED(sstatus) &&
++					    WSTOPSIG(sstatus) == SIGTRAP)
++						break;
++
++					/*
++					 * The stub can be interrupted here, and
++					 * wait_stub_done() tolerates the same
++					 * two signals for the same reason.
++					 * Neither is for the guest -- the stub
++					 * installs no handler for either in
++					 * ptrace mode, so delivering one would
++					 * kill it -- and the step has not
++					 * happened yet, so drop the signal and
++					 * step again.
++					 */
++					if (WIFSTOPPED(sstatus) &&
++					    ((1 << WSTOPSIG(sstatus)) & STUB_SIG_MASK) &&
++					    ++tries < 16)
++						continue;
++
++					/*
++					 * Anything else means the assumption
++					 * above no longer holds. Fail loudly
++					 * rather than run a guest on registers
++					 * that are quietly wrong.
++					 */
++					printk(UM_KERN_ERR "%s - unexpected status 0x%x stepping off a syscall stop\n",
++					       __func__, sstatus);
++					fatal_sigsegv();
++				}
++			}
++
+ 			if (WIFSTOPPED(status)) {
+ 				sig = WSTOPSIG(status);
+ 
+diff --git a/arch/um/os-Linux/start_up.c b/arch/um/os-Linux/start_up.c
+index 61492fa..f3ce9f1 100644
+--- a/arch/um/os-Linux/start_up.c
++++ b/arch/um/os-Linux/start_up.c
+@@ -139,15 +139,47 @@ static void stop_ptraced_child(int pid, int exitcode)
+ 	}
+ }
+ 
+-static void __init check_sysemu(void)
++/*
++ * Reap a probe child without the fatal() that stop_ptraced_child() applies, so
++ * a capability that is merely absent can be reported as absent rather than
++ * ending the boot.
++ */
++static int __init finish_probe_child(int pid, int exitcode)
+ {
+-	int pid, n, status, count=0;
++	int status, n;
++
++	if (ptrace(PTRACE_CONT, pid, 0, 0) < 0) {
++		kill(pid, SIGKILL);
++		waitpid(pid, &status, 0);
++		return 0;
++	}
++
++	CATCH_EINTR(n = waitpid(pid, &status, 0));
++	if (n < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != exitcode) {
++		kill(pid, SIGKILL);
++		waitpid(pid, &status, WNOHANG);
++		return 0;
++	}
++	return 1;
++}
++
++/*
++ * The classic probe: PTRACE_SYSEMU stops before the syscall and never runs it.
++ *
++ * arm32 hosts have no PTRACE_SYSEMU anywhere in their uapi -- the numbers
++ * PTRACE_SYSEMU/PTRACE_SYSEMU_SINGLESTEP carry here are unused request slots
++ * the host rejects with EIO -- so this probe is expected to fail on every arm
++ * host and check_sysemu() falls through to the cancellation probes below. It
++ * is kept first anyway: it costs one forked child and it is the only probe
++ * that would make an x86-style host work without any substitution.
++ */
++static int __init try_sysemu(void)
++{
++	int pid, n, status, count = 0;
+ 
+-	os_info("Checking syscall emulation for ptrace...");
+ 	pid = start_ptraced_child();
+ 
+-	if ((ptrace(PTRACE_SETOPTIONS, pid, 0,
+-		   (void *) PTRACE_O_TRACESYSGOOD) < 0))
++	if (ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)PTRACE_O_TRACESYSGOOD) < 0)
+ 		fatal_perror("check_sysemu: PTRACE_SETOPTIONS failed");
+ 
+ 	while (1) {
+@@ -158,43 +190,246 @@ static void __init check_sysemu(void)
+ 		if (n < 0)
+ 			fatal_perror("check_sysemu: wait failed");
+ 
+-		if (WIFSTOPPED(status) &&
+-		    (WSTOPSIG(status) == (SIGTRAP|0x80))) {
+-			if (!count) {
+-				non_fatal("check_sysemu: SYSEMU_SINGLESTEP "
+-					  "doesn't singlestep");
++		if (WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80)) {
++			if (!count)
++				goto fail;
++			if (ptrace_set_syscall_ret(pid, os_getpid()) < 0)
+ 				goto fail;
+-			}
+-			n = ptrace(PTRACE_POKEUSER, pid, PT_SYSCALL_RET_OFFSET,
+-				   os_getpid());
+-			if (n < 0)
+-				fatal_perror("check_sysemu : failed to modify "
+-					     "system call return");
+ 			break;
+-		}
+-		else if (WIFSTOPPED(status) && (WSTOPSIG(status) == SIGTRAP))
++		} else if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+ 			count++;
+-		else {
+-			non_fatal("check_sysemu: expected SIGTRAP or "
+-				  "(SIGTRAP | 0x80), got status = %d\n",
+-				  status);
++		} else {
+ 			goto fail;
+ 		}
+ 	}
+-	stop_ptraced_child(pid, 0);
+ 
+-	os_info("OK\n");
++	return finish_probe_child(pid, 0);
++
++fail:
++	kill(pid, SIGKILL);
++	CATCH_EINTR(waitpid(pid, &status, 0));
++	return 0;
++}
++
++/*
++ * The substitute, for hosts without PTRACE_SYSEMU -- which on arm32 is every
++ * host.
++ *
++ * PTRACE_SYSEMU is not doing anything a tracer cannot do for itself: it stops
++ * at syscall entry and declines to execute the call. Writing -1 into the
++ * in-flight syscall number is the documented way to cancel a syscall from a
++ * tracer; on arm32 the number lives in r7, and the host's svc dispatcher
++ * returns -ENOSYS for any number outside the table, so r7 = -1 cancels the
++ * call without a dedicated regset.
++ *
++ * -1 is not always accepted, though. A host that screens syscall numbers with
++ * a seccomp filter -- an Android app sandbox does this, and the filter runs
++ * *after* the tracer's stop sees the number the tracer just wrote -- traps a
++ * cancelled syscall with SIGSYS: syscall cancellation is unavailable in
++ * precisely the environment that also lacks PTRACE_SYSEMU.
++ *
++ * Substituting a harmless syscall for the guest's works there: the guest's
++ * call still does not run, which is the whole requirement, and the substitute
++ * is a number the filter already permits. getppid(2) is the natural choice --
++ * no arguments, no side effects, and among the cheapest calls the host has.
++ *
++ * Probing rather than deriving this from a version number is deliberate. It
++ * has to be true of the host actually underneath us -- which may be a
++ * container, an emulator, a vendor kernel with its own patches, or a sandbox
++ * someone else installed a filter into -- and running the whole sequence end
++ * to end is the only thing that establishes that.
++ */
++enum cancel_ret { RET_LEAVE, RET_PARENT_PID, RET_CHILD_PID };
++
++/*
++ * Run, once, exactly what userspace() will do per guest syscall: stop at
++ * entry, cancel, step off the stop, then set the return value the guest sees.
++ *
++ * ptrace_child() exits 1 if it saw its own pid from os_getpid() and 0 if it
++ * saw its parent's, so what the child does with the value is what tells the
++ * caller whether each half of that took effect. Which of the two is the pass
++ * depends on the probe; see try_syscall_cancel().
++ */
++static int __init run_cancel_probe(int cancel_nr, enum cancel_ret ret_mode,
++				   int expect_exit)
++{
++	int pid, n, status, sig;
++
++	pid = start_ptraced_child();
++
++	if (ptrace(PTRACE_SETOPTIONS, pid, 0, (void *)PTRACE_O_TRACESYSGOOD) < 0)
++		fatal_perror("try_syscall_cancel: PTRACE_SETOPTIONS failed");
++
++	if (ptrace(PTRACE_SYSCALL, pid, 0, 0) < 0)
++		goto fail;
++	CATCH_EINTR(n = waitpid(pid, &status, WUNTRACED));
++	if (n < 0)
++		fatal_perror("try_syscall_cancel: wait failed");
++	if (!WIFSTOPPED(status) || WSTOPSIG(status) != (SIGTRAP | 0x80))
++		goto fail;
+ 
+-	return;
++	if (ptrace_set_syscall_nr(pid, cancel_nr) < 0)
++		goto fail;
++
++	if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) < 0)
++		goto fail;
++	CATCH_EINTR(n = waitpid(pid, &status, WUNTRACED));
++	if (n < 0 || !WIFSTOPPED(status))
++		goto fail;
++
++	/*
++	 * A seccomp filter that rejected the number written above reports
++	 * here, as a SIGSYS the tracer is asked to deliver. Treat any stop
++	 * that is not the step as a failure rather than passing the signal
++	 * on: continuing would suppress the SIGSYS and let a host that cannot
++	 * do this look like one that can.
++	 */
++	sig = WSTOPSIG(status);
++	if (sig != SIGTRAP && sig != (SIGTRAP | 0x80))
++		goto fail;
++
++	if (ret_mode != RET_LEAVE &&
++	    ptrace_set_syscall_ret(pid, ret_mode == RET_PARENT_PID ?
++					os_getpid() : pid) < 0)
++		goto fail;
++
++	return finish_probe_child(pid, expect_exit);
+ 
+ fail:
+-	stop_ptraced_child(pid, 1);
+-	fatal("missing\n");
++	kill(pid, SIGKILL);
++	CATCH_EINTR(waitpid(pid, &status, 0));
++	return 0;
++}
++
++static int __init try_syscall_cancel(int cancel_nr)
++{
++	if (cancel_nr < 0)
++		/*
++		 * A cancelled syscall leaves -ENOSYS in the return register,
++		 * which is neither pid nor ppid, so one child covers both
++		 * halves: the child can only exit 0 if the call did not run
++		 * *and* the write below replaced what it left behind.
++		 */
++		return run_cancel_probe(cancel_nr, RET_PARENT_PID, 0);
++
++	/*
++	 * A substituted getppid() leaves the parent's pid there by itself,
++	 * which is the same value a working return-value write would store --
++	 * so one child cannot tell the two apart, and each half gets its own.
++	 *
++	 * First: substitute and write nothing. The child sees its parent's
++	 * pid only if getppid() ran in place of its os_getpid(), so exit 0
++	 * means the guest's syscall was really replaced.
++	 *
++	 * Second: substitute and write the child's own pid, the one value the
++	 * substitute cannot produce. Exit 1 means the write took.
++	 */
++	return run_cancel_probe(cancel_nr, RET_LEAVE, 0) &&
++	       run_cancel_probe(cancel_nr, RET_CHILD_PID, 1);
++}
++
++static int force_no_sysemu __initdata;
++static int force_no_cancel __initdata;
++
++static int __init uml_nosysemu(char *line, int *add)
++{
++	*add = 0;
++	force_no_sysemu = 1;
++	return 0;
++}
++
++__uml_setup("nosysemu", uml_nosysemu,
++"nosysemu\n"
++"    Pretend the host has no PTRACE_SYSEMU and use the syscall-cancellation\n"
++"    path instead. On arm32 that is every host, so this option only matters\n"
++"    for testing the cancellation path on machines that do have SYSEMU.\n\n"
++);
++
++/*
++ * Settle on a way to keep a guest syscall from running, and report which.
++ * Returns 0 if the host offers none.
++ */
++static int __init pick_cancel_method(void)
++{
++	os_info("Checking syscall cancellation instead...");
++	if (force_no_cancel) {
++		os_info("skipped (nocancel)\n");
++	} else if (try_syscall_cancel(-1)) {
++		syscall_cancel_nr = -1;
++		os_info("OK\n");
++		return 1;
++	} else {
++		os_info("refused\n");
++	}
++
++	os_info("Checking syscall substitution instead...");
++	if (try_syscall_cancel(__NR_getppid)) {
++		syscall_cancel_nr = __NR_getppid;
++		os_info("OK\n");
++		os_info("Host rejects a cancelled (-1) syscall, so a seccomp "
++			"filter is screening syscall numbers -- an Android app "
++			"sandbox does this. Running getppid(2) in place of "
++			"each guest syscall instead.\n");
++		return 1;
++	}
++	os_info("missing\n");
++	return 0;
++}
++
++static int __init uml_nocancel(char *line, int *add)
++{
++	*add = 0;
++	force_no_cancel = 1;
++	return 0;
++}
++
++__uml_setup("nocancel", uml_nocancel,
++"nocancel\n"
++"    Pretend the host rejects a cancelled (-1) syscall and substitute a\n"
++"    harmless call for each guest syscall instead. Implies nosysemu.\n"
++"\n"
++"    That is what an app sandbox forces, because the host's seccomp filter\n"
++"    runs after the ptrace stop and screens the number the tracer wrote.\n"
++"    Without this option the substitution path can only be reached on a host\n"
++"    that has such a filter installed, which is the environment that is\n"
++"    hardest to debug on.\n\n"
++);
++
++static void __init check_sysemu(void)
++{
++	if (force_no_sysemu || force_no_cancel) {
++		os_info("Checking syscall emulation for ptrace...");
++		os_info("skipped (nosysemu)\n");
++		if (pick_cancel_method()) {
++			have_ptrace_sysemu = 0;
++			return;
++		}
++		fatal("\nnosysemu was requested but this host can neither "
++		      "cancel nor substitute a syscall from a tracer.\n");
++	}
++
++	os_info("Checking syscall emulation for ptrace...");
++	if (try_sysemu()) {
++		have_ptrace_sysemu = 1;
++		os_info("OK\n");
++		return;
++	}
++	os_info("missing\n");
++
++	if (pick_cancel_method()) {
++		have_ptrace_sysemu = 0;
++		return;
++	}
++
++	fatal("\nThis host provides neither PTRACE_SYSEMU nor any way for a "
++	      "tracer to stop a guest syscall from running, and UML cannot "
++	      "intercept guest syscalls without one of them.\n");
+ }
+ 
+ static void __init check_ptrace(void)
+ {
+-	int pid, syscall, n, status;
++	int pid, n, status;
++	long syscall;
+ 
+ 	os_info("Checking that ptrace can change system call numbers...");
+ 	pid = start_ptraced_child();
+@@ -216,11 +451,22 @@ static void __init check_ptrace(void)
+ 			fatal("check_ptrace : expected (SIGTRAP|0x80), "
+ 			       "got status = %d", status);
+ 
+-		syscall = ptrace(PTRACE_PEEKUSER, pid, PT_SYSCALL_NR_OFFSET,
+-				 0);
++		/*
++		 * PTRACE_PEEKUSER at PT_SYSCALL_NR_OFFSET cannot be used
++		 * here: on arm32 that offset is one word past the 72-byte
++		 * regset block, and the host's user area has no syscall
++		 * number there -- it lives in r7. The regset-backed helpers
++		 * read and write r7 as the host actually stores it, which is
++		 * also how userspace() rewrites in-flight syscalls; probing
++		 * with anything else would fail the boot on a mechanism the
++		 * kernel never uses.
++		 */
++		syscall = ptrace_get_syscall_nr(pid);
++		if (syscall < 0)
++			fatal_perror("check_ptrace : failed to read the "
++				     "system call number");
+ 		if (syscall == __NR_getpid) {
+-			n = ptrace(PTRACE_POKEUSER, pid, PT_SYSCALL_NR_OFFSET,
+-				   __NR_getppid);
++			n = ptrace_set_syscall_nr(pid, __NR_getppid);
+ 			if (n < 0)
+ 				fatal_perror("check_ptrace : failed to modify "
+ 					     "system call");
+@@ -480,6 +726,15 @@ void __init os_early_checks(void)
+ 	if (seccomp_config) {
+ 		if (init_seccomp()) {
+ 			using_seccomp = 1;
++			/*
++			 * Which mode is in use decides how much every guest
++			 * syscall costs -- SECCOMP handles them in-process via
++			 * SIGSYS, ptrace pays a stop and a waitpid per call --
++			 * so it is the first thing anyone asks when the guest
++			 * feels slow. Saying it once at boot is cheaper than
++			 * inferring it from which probe lines are absent.
++			 */
++			os_info("Userspace mode: SECCOMP\n");
+ 			return;
+ 		}
+ 
+@@ -487,10 +742,27 @@ void __init os_early_checks(void)
+ 			fatal("SECCOMP userspace requested but not functional!\n");
+ 	}
+ 
+-	if (uml_ncpus > 1)
+-		fatal("SMP is not supported with PTRACE userspace.\n");
++	/*
++	 * ptrace cannot drive more than one CPU thread, but that is a reason
++	 * to bring up one CPU rather than to refuse to boot: a host without
++	 * a working seccomp would otherwise turn the CPU count into a
++	 * property of the host. Treat ncpus= as a request for an upper bound,
++	 * which is what it already is against NR_CPUS. Guarded because
++	 * uml_ncpus is the constant 1 on a uniprocessor build, so the
++	 * assignment below does not compile at all there -- and there is
++	 * nothing to clamp in that configuration anyway.
++	 */
++#ifdef CONFIG_SMP
++	if (uml_ncpus > 1) {
++		os_info("SMP is not supported with ptrace userspace; "
++			"running on 1 CPU instead of the %d requested\n",
++			uml_ncpus);
++		uml_ncpus = 1;
++	}
++#endif
+ 
+ 	using_seccomp = 0;
++	os_info("Userspace mode: ptrace\n");
+ 	check_ptrace();
+ 
+ 	pid = start_ptraced_child();

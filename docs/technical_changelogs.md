@@ -234,11 +234,12 @@ assets, so published assets keep the `base-*.img.gz` format.
 
 The 32-bit arm (`SUBARCH=arm`, armv7l, 32-bit EABI) half of the UML port,
 authored against the same v7.2.4 base as the arm64 series but structured to
-its own needs. Unlike the arm64 patch, it is **100 % new files** — 43 of
-them — and touches no generic `arch/um/` code and no parent `arch/arm/` file
-outside the new `arch/arm/um/` subarch:
+its own needs. It is 43 new files under `arch/arm/um/`, plus the generic
+`arch/um/` pieces the ptrace userspace needs (see below):
 
 * `arch/arm/Makefile.um` + `arch/arm/um/` (41 files) + `arch/um/configs/arm_defconfig`
+* generic `arch/um/` changes — the SKAS0 ptrace-cancellation path
+  (`start_up.c`, `skas/process.c`, `skas/syscall.c`, `registers.h`, `skas.h`)
 
 What it brings to `ARCH=um SUBARCH=arm`:
 
@@ -262,6 +263,53 @@ What it brings to `ARCH=um SUBARCH=arm`:
   siginfo under the name `si`; a caller without one fails to compile rather
   than fill a wrong address), and `fi.ec` is the host FSR the kernel parks in
   `thread.error_code` right before raising the signal
+* **SKAS0 ptrace userspace on hosts without PTRACE_SYSEMU** — arm hosts never
+  had `PTRACE_SYSEMU`, and the generic startup checks and `userspace()` loop
+  are built around it, so the first arm32 boot on a phone died in
+  `check_ptrace` with `expected (SIGTRAP|0x80), got status = 256`. That
+  status is the probe child exiting 1 — "my getpid was never rewritten" —
+  because `check_ptrace` probed the syscall number with
+  `PTRACE_PEEKUSER` at the synthesised `PT_SYSCALL_NR_OFFSET` (72): a slot
+  only UML's own regset copy serves, never the host's user area. The port
+  already shipped the regset-backed accessors (`get_host_regs`,
+  `ptrace_get_syscall_nr`, `ptrace_set_syscall_nr`, `ptrace_set_syscall_ret`)
+  and the `UM_SEED_ENOSYS_BEFORE_TRACE` guard in its `sysdep/`; the fix wires
+  the generic code to them:
+
+  * `check_ptrace()` reads and rewrites the in-flight syscall number through
+    `ptrace_get_syscall_nr()`/`ptrace_set_syscall_nr()` (r7 on arm32) instead
+    of `PEEKUSER`/`POKEUSER` at the offset no arm host serves
+  * `check_sysemu()` no longer `fatal("missing")` on the PTRACE_SYSEMU probe
+    every arm host fails: it falls back to the same cancellation machinery the
+    arm64 port carries — cancel the guest's syscall at the `PTRACE_SYSCALL`
+    entry stop (r7 = -1; on hosts whose seccomp filter screens that number,
+    e.g. an Android app sandbox, substitute `getppid(2)`), single-step off the
+    stop so the call never runs, and deliver UML's emulated result via the
+    `put_host_regs()` at the top of the next loop pass. `nosysemu`/`nocancel`
+    boot args force either path for testing on capable hosts
+  * `userspace()` uses `get_host_regs`/`put_host_regs` (the arm32 regset is
+    72 bytes and slot 18 is synthesised from r7 — `PTRACE_GETREGS` cannot see
+    or write the syscall slot) and cancels + steps off every syscall-entry
+    stop when `have_ptrace_sysemu` is 0; single-stepping a guest takes the
+    syscall stop for the `svc #0` itself (`UM_SYSCALL_TRAP_INSN`, whose
+    encoding is corrected here from `0xea000000` — a branch — to
+    `0xef000000`) so stepping never executes a guest syscall on the host
+  * `handle_syscall()` honours `UM_SEED_ENOSYS_BEFORE_TRACE`: on arm32 the
+    return register r0 *is* the first argument register, so the x86-style
+    unconditional `-ENOSYS` seed would destroy arg0 before the call runs
+  * `os_early_checks()` prints the chosen userspace mode, and on a seccomp→
+    ptrace fallback clamps `ncpus` to 1 with a message instead of refusing to
+    boot
+
+  On a host that offers seccomp filters, `seccomp=auto` still picks the
+  faster SECCOMP userspace; the cancellation path is what makes the ptrace
+  fallback actually boot where neither SYSEMU nor seccomp exist. The
+  launcher passes `seccomp=auto` (was `on`, which *required* seccomp and
+  died on old host kernels) and passes `stub_exe=<path>` when the kernel
+  artifact's `stub_exe` file sits next to it — Android refuses to exec the
+  stub from an anonymous memfd, which would otherwise kill the guest before
+  it prints its version (`stable_arm32.yml` ships the stub in both kernel
+  artifacts for exactly this).
 * **Loadable modules** — arm modules are ELF REL, so the relocator reuses the
   parent `arch/arm/kernel/module.c` verbatim under `subarch-$(CONFIG_MODULES)`,
   exactly as x86 UML has done for years. There is no arm equivalent of
