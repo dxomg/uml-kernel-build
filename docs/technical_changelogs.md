@@ -230,6 +230,122 @@ carry a `-arm64` suffix; the amd64 names are unchanged. Artifacts hold raw
 (uncompressed) images — `release.yml` gzips them when staging release
 assets, so published assets keep the `base-*.img.gz` format.
 
+### Full arm32 port for 7.2.4 (`patches/arm32-port-7.2.4.patch`, `stable_arm32.yml`)
+
+The 32-bit arm (`SUBARCH=arm`, armv7l, 32-bit EABI) half of the UML port,
+authored against the same v7.2.4 base as the arm64 series but structured to
+its own needs. It is 43 new files under `arch/arm/um/`, plus the generic
+`arch/um/` pieces the ptrace userspace needs (see below):
+
+* `arch/arm/Makefile.um` + `arch/arm/um/` (41 files) + `arch/um/configs/arm_defconfig`
+* generic `arch/um/` changes — the SKAS0 ptrace-cancellation path
+  (`start_up.c`, `skas/process.c`, `skas/syscall.c`, `registers.h`, `skas.h`)
+
+What it brings to `ARCH=um SUBARCH=arm`:
+
+* the `arch/arm/um/` subarch: `arm_defconfig` (4 KB pages, bootable-guest
+  filesystem set, `MODULES`/`MODULE_UNLOAD`), ptrace/signal state
+  save/restore, and `setjmp_arm.S` saving the AAPCS callee-saved set
+  (`r4–r11` + `sp`/`lr`) so a `switch_buf` built on one CPU thread is safe to
+  `longjmp` from another — which is what makes the subarch SMP-capable
+* FP/NEON carried across signals in a `vfp_sigframe` written into
+  `uc_regspace`; `/proc/cpuinfo` forwards the host `AT_HWCAP`/`AT_HWCAP2`
+  words (glibc's ifunc resolvers and OpenSSL read them), masking out the
+  dead `FPA`/`IWMMXT`/`CRUNCH` coprocessors UML does not save
+* the EABI syscall table: 420 native arm32 syscalls plus the five UGL
+  wrapper entries (`sigreturn`/`statfs64`/`fstatfs64`/`arm_fadvise64_64`/
+  `mmap2`) the parent `arch/arm/tools/syscall.tbl` already names
+* **Fault path** — arm's `sigcontext` has **no** fault-address member (aarch64's
+  does), and the host kernel only hands the faulting address to a handler in
+  the accompanying `siginfo`. `GET_FAULTINFO_FROM_MC(fi, mc)` therefore reads
+  `fi.addr` from the caller's in-scope `si->si_addr` (every call site — the
+  two generic SKAS handlers and the subarch's `stub_segv_handler` — holds that
+  siginfo under the name `si`; a caller without one fails to compile rather
+  than fill a wrong address), and `fi.ec` is the host FSR the kernel parks in
+  `thread.error_code` right before raising the signal
+* **SKAS0 ptrace userspace on hosts without PTRACE_SYSEMU** — arm hosts never
+  had `PTRACE_SYSEMU`, and the generic startup checks and `userspace()` loop
+  are built around it, so the first arm32 boot on a phone died in
+  `check_ptrace` with `expected (SIGTRAP|0x80), got status = 256`. That
+  status is the probe child exiting 1 — "my getpid was never rewritten" —
+  because `check_ptrace` probed the syscall number with
+  `PTRACE_PEEKUSER` at the synthesised `PT_SYSCALL_NR_OFFSET` (72): a slot
+  only UML's own regset copy serves, never the host's user area. The port
+  already shipped the regset-backed accessors (`get_host_regs`,
+  `ptrace_get_syscall_nr`, `ptrace_set_syscall_nr`, `ptrace_set_syscall_ret`)
+  and the `UM_SEED_ENOSYS_BEFORE_TRACE` guard in its `sysdep/`; the fix wires
+  the generic code to them:
+
+  * `check_ptrace()` reads and rewrites the in-flight syscall number through
+    `ptrace_get_syscall_nr()`/`ptrace_set_syscall_nr()` (r7 on arm32) instead
+    of `PEEKUSER`/`POKEUSER` at the offset no arm host serves
+  * `check_sysemu()` no longer `fatal("missing")` on the PTRACE_SYSEMU probe
+    every arm host fails: it falls back to the same cancellation machinery the
+    arm64 port carries — cancel the guest's syscall at the `PTRACE_SYSCALL`
+    entry stop (r7 = -1; on hosts whose seccomp filter screens that number,
+    e.g. an Android app sandbox, substitute `getppid(2)`), single-step off the
+    stop so the call never runs, and deliver UML's emulated result via the
+    `put_host_regs()` at the top of the next loop pass. `nosysemu`/`nocancel`
+    boot args force either path for testing on capable hosts
+  * `userspace()` uses `get_host_regs`/`put_host_regs` (the arm32 regset is
+    72 bytes and slot 18 is synthesised from r7 — `PTRACE_GETREGS` cannot see
+    or write the syscall slot) and cancels + steps off every syscall-entry
+    stop when `have_ptrace_sysemu` is 0; single-stepping a guest takes the
+    syscall stop for the `svc #0` itself (`UM_SYSCALL_TRAP_INSN`, whose
+    encoding is corrected here from `0xea000000` — a branch — to
+    `0xef000000`) so stepping never executes a guest syscall on the host
+  * `handle_syscall()` honours `UM_SEED_ENOSYS_BEFORE_TRACE`: on arm32 the
+    return register r0 *is* the first argument register, so the x86-style
+    unconditional `-ENOSYS` seed would destroy arg0 before the call runs
+  * `os_early_checks()` prints the chosen userspace mode, and on a seccomp→
+    ptrace fallback clamps `ncpus` to 1 with a message instead of refusing to
+    boot
+
+  On a host that offers seccomp filters, `seccomp=auto` still picks the
+  faster SECCOMP userspace; the cancellation path is what makes the ptrace
+  fallback actually boot where neither SYSEMU nor seccomp exist. The
+  launcher passes `seccomp=auto` (was `on`, which *required* seccomp and
+  died on old host kernels) and passes `stub_exe=<path>` when the kernel
+  artifact's `stub_exe` file sits next to it — Android refuses to exec the
+  stub from an anonymous memfd, which would otherwise kill the guest before
+  it prints its version (`stable_arm32.yml` ships the stub in both kernel
+  artifacts for exactly this).
+* **Loadable modules** — arm modules are ELF REL, so the relocator reuses the
+  parent `arch/arm/kernel/module.c` verbatim under `subarch-$(CONFIG_MODULES)`,
+  exactly as x86 UML has done for years. There is no arm equivalent of
+  arm64's `module-plts.c`/`insn.o`: arm relocations patch fixed 32-bit
+  immediates that `module.c` computes in C
+
+Memory layout is the classic 1 GiB split (`PAGE_OFFSET=0xC0000000`,
+`PHYS_OFFSET=0`, virtual `==` physical). Deliberately **not** a `config ARM`,
+**not** `CLONE_BACKWARDS` (that is the aarch64 psABI; arm32 EABI keeps the
+generic clone() argument order), and **no** 16 KB-page option (a 16 KB arm32
+host is not a real target — the 16 KB requirement that motivated the arm64
+port is an arm64-only Android configuration).
+
+`.github/workflows/stable_arm32.yml` builds it **cross** on an x86_64
+`ubuntu-latest` runner: `make ARCH=um SUBARCH=arm CROSS_COMPILE=arm-linux-gnueabi-`
+makes the armel cross gcc the build CC (the UML kernel and its SKAS stub are
+both 32-bit ARM userspace objects, so the whole thing compiles exactly like
+any other cross-linked userspace program), and the host's multi-target `lld`
+finishes the stub link (the base UML sets `STUB_EXE_LDFLAGS = -Wl,-n
+-Wl,--no-rosegment -static`, which the armel binutils ld does not understand;
+`-fuse-ld=lld` moves that one link onto lld, and `-static` is dropped so the
+stub links the target's arm32 glibc dynamically rather than needing the static
+arm32 libc the cross dev package does not ship). The main kernel image links
+with the armel cross binutils ld, which is plain. The artifact is a 32-bit ARM
+ELF that links the target device's glibc, so it runs on real arm32 hardware —
+no arm32 runner, cross sysroot download, or qemu needed to *build* it.
+After `olddefconfig` it fails the build loudly unless `CONFIG_32BIT=y` is
+present and `CONFIG_64BIT` is absent (the "did `SUBARCH=arm` stick" check,
+mirroring arm64's `CONFIG_64BIT` check), and it verifies the resulting ELF is
+a 32-bit ARM object so a silent fallback to the host toolchain cannot ship the
+wrong binary. The UML SMP backport is **not** applied — 7.2.4 has native SMP.
+
+The Go helper matrix picks up the matching target: `vdeplug_go.yml` gains a
+`target: arm` build (`GOOS=linux GOARCH=arm`, pure-Go cross-compile from the
+x86_64 runner, no toolchain).
+
 ### CI: bionic artifacts (`bionic_android.yml`)
 
 One workflow, two jobs, producing the Android-app bionic set (cross-built on
@@ -702,3 +818,9 @@ Reverse-chronological, one line per user-visible change.
 **Kernels & CI** — 162 commits of kernel patching, arm64/bionic ports,
 base-image builds and release automation; see `git log` and the sections
 above for the current state of each area.
+
+- this commit — arm32 (armv7l) UML port: `arch/arm/um` subarch +
+  `arm_defconfig` (43 new files, no generic changes), `stable_arm32.yml`
+  (cross-builds on `ubuntu-latest` with the armel cross gcc + host lld,
+  `SUBARCH=arm`), and the matching `GOARCH=arm` target in the
+  `vdeplug_go.yml` helper matrix.

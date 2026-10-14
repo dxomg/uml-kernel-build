@@ -109,8 +109,10 @@ jobs:
           cd "$KDIR"
           shopt -s nullglob
           for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
-            # Applied separately below — it must apply cleanly or the build fails.
-            case "$(basename "$p")" in arm64-port-*) continue;; esac
+            # Port series are applied separately below — they must apply
+            # cleanly or the build fails. Skip both arch ports here: this is
+            # an arm64 build, so the arm32 series must not be picked up.
+            case "$(basename "$p")" in arm*-port-*) continue;; esac
             echo "[+] Applying $(basename "$p")"
             git apply "$p" || patch -p1 --fuzz=3 < "$p" || exit 1
           done

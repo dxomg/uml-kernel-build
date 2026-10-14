@@ -61,26 +61,45 @@ fi
 
 # --- build the kernel cmdline ---
 #
-# SMP rules (upstream UML since v6.19):
+# Userspace-mode rules:
+#   * seccomp=auto — use the SECCOMP userspace when the host kernel offers it
+#                    (it is the faster mode), fall back to ptrace otherwise.
+#                    An "on" here would mean *required*: on hosts whose kernel
+#                    is too old for seccomp filters (old Android phones) the
+#                    boot would die in the capability checks instead of
+#                    degrading. The ptrace fallback on arm32 intercepts guest
+#                    syscalls by cancelling them at a PTRACE_SYSCALL stop, so
+#                    it works where PTRACE_SYSEMU is absent too.
 #   * ncpus=N      — how many vCPUs to bring online (<= NR_CPUS, default 1).
-#   * seccomp=on   — REQUIRED for ncpus>1. SMP is incompatible with the
-#                    default PTRACE userspace mode; it must use seccomp.
-#                    Harmless for ncpus=1 / UP kernels.
-#   * mode=skas0   — forces PTRACE userspace (TT-less). INCOMPATIBLE with
-#                    SMP, so only used when ncpus==1 AND /dev/shm is slow.
-#                    (seccomp mode already avoids the /dev/shm dependency
-#                    via the memfd physmem backport.)
+#                    SMP is incompatible with the ptrace userspace; when
+#                    seccomp is unavailable the kernel clamps the count to 1
+#                    with a message rather than refusing to boot.
+#   * mode=skas0   — forces PTRACE userspace on kernels where seccomp is the
+#                    default (6.x series). Only used when ncpus==1 AND
+#                    /dev/shm is slow.
 SMP_ARGS=""
 SKAS_MODE=""
 
 if [ "$KERNEL_HAS_SMP" -eq 1 ] && [ "$NCPUS" -gt 1 ]; then
-    SMP_ARGS="ncpus=$NCPUS seccomp=on"
+    SMP_ARGS="ncpus=$NCPUS seccomp=auto"
 elif [ "$KERNEL_HAS_SMP" -eq 1 ]; then
-    SMP_ARGS="ncpus=1 seccomp=on"
+    SMP_ARGS="ncpus=1 seccomp=auto"
 else
     if [ "$SHM_OK" -eq 0 ]; then
         SKAS_MODE="mode=skas0"
     fi
+fi
+
+# --- the SKAS stub, when shipped as a file next to the kernel ---
+#
+# Android refuses to exec a binary from an anonymous memfd (not only inside
+# an app sandbox), so the stub can never be exec'd there and the guest dies
+# before it prints its version. The stub_exe=<path> boot argument points the
+# kernel at a file copy instead; the kernel artifacts ship it as `stub_exe`.
+# Passing it is harmless on hosts where the memfd works.
+STUB_EXE_ARG=""
+if [ -f "$BASE/stub_exe" ]; then
+    STUB_EXE_ARG="stub_exe=$BASE/stub_exe"
 fi
 
 if [ "$SHM_OK" -eq 0 ]; then
@@ -103,6 +122,7 @@ fi
 echo "  Memory   : $MEMORY"
 echo "  Network  : VDE VECTOR + netstack NAT"
 if [ -n "$SKAS_MODE" ]; then echo "  Userspace: skas0 (slow /dev/shm fallback)"; fi
+if [ -n "$STUB_EXE_ARG" ]; then echo "  Stub     : file (stub_exe=)"; fi
 echo "  Config   : $CONFIG"
 echo "----------------------------------------"
 echo "  Login: root / root"
@@ -116,6 +136,7 @@ exec "$KERNEL" \
     mem="$MEMORY" \
     $SKAS_MODE \
     $SMP_ARGS \
+    $STUB_EXE_ARG \
     ubd0="$ROOTFS" \
     root=/dev/ubda rw \
     init=/lib/systemd/systemd \

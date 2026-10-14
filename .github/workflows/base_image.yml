@@ -15,6 +15,14 @@ name: "UML Base Image (distro-agnostic, VECTOR/VDE)"
 # pair builds for both architectures; arm64 runs natively on an arm runner
 # (same pattern as stable_arm64.yml), so no qemu/chroot emulation is
 # involved.
+#
+# One 32-bit ARM image exists alongside them: base-alpine-3.24-arm32.img
+# (the pairing for the arm32 UML kernels). It builds on the arm64 runner
+# too — an aarch64 kernel runs armv7 (armhf) binaries through its compat
+# layer, so the apk chroot below executes natively with no qemu — and is
+# the only Alpine entry: OpenRC instead of systemd (getty comes from
+# /etc/inittab, sshd's init script regenerates the host keys itself, and
+# cloud-init ships OpenRC service scripts), apk instead of apt/dnf.
 # Runs weekly Monday + manual trigger.
 
 on:
@@ -111,6 +119,14 @@ jobs:
             arch: arm64
             runner: ubuntu-24.04-arm
             suffix: "-arm64"
+          # --- arm32 (armv7): one Alpine pairing for the arm32 kernels.
+          # "armhf" is linuxcontainers.org's name for 32-bit ARM; the armhf
+          # chroot runs natively on the arm64 runner via the compat layer.
+          - distro: alpine
+            release: "3.24"
+            arch: armhf
+            runner: ubuntu-24.04-arm
+            suffix: "-arm32"
 
     steps:
       - uses: actions/checkout@v7
@@ -152,19 +168,28 @@ jobs:
       - name: Detect distro family
         id: family
         run: |
-          # Debian/Ubuntu: apt + /lib/systemd;  EL: dnf + /usr/lib/systemd
-          if [ -f /mnt/rootfs/usr/bin/dnf ] || [ -f /mnt/rootfs/usr/bin/yum ]; then
+          # Debian/Ubuntu: apt + /lib/systemd;  EL: dnf + /usr/lib/systemd;
+          # Alpine: apk + OpenRC (busybox getty via /etc/inittab; sshd's
+          # init script regenerates host keys on first start by itself).
+          if [ -f /mnt/rootfs/sbin/apk ] || [ -f /mnt/rootfs/etc/alpine-release ]; then
+            echo "pm=apk"      >> "$GITHUB_OUTPUT"
+            echo "sshd=sshd"   >> "$GITHUB_OUTPUT"
+            echo "init=openrc" >> "$GITHUB_OUTPUT"
+            echo "pkgs=openssh iproute2 iputils" >> "$GITHUB_OUTPUT"
+          elif [ -f /mnt/rootfs/usr/bin/dnf ] || [ -f /mnt/rootfs/usr/bin/yum ]; then
             echo "pm=dnf"      >> "$GITHUB_OUTPUT"
             echo "sshd=sshd"   >> "$GITHUB_OUTPUT"
+            echo "init=systemd" >> "$GITHUB_OUTPUT"
             echo "unitpath=usr/lib/systemd/system" >> "$GITHUB_OUTPUT"
             echo "pkgs=iproute iputils openssh-server openssh-clients" >> "$GITHUB_OUTPUT"
           else
             echo "pm=apt"      >> "$GITHUB_OUTPUT"
             echo "sshd=ssh"    >> "$GITHUB_OUTPUT"
+            echo "init=systemd" >> "$GITHUB_OUTPUT"
             echo "unitpath=lib/systemd/system" >> "$GITHUB_OUTPUT"
             echo "pkgs=openssh-server iproute2 iputils-ping" >> "$GITHUB_OUTPUT"
           fi
-          echo "[+] Distro: ${{ matrix.distro }} → ${{ steps.family.outputs.pm }}"
+          echo "[+] Distro: ${{ matrix.distro }} → ${{ steps.family.outputs.pm }} (init: ${{ steps.family.outputs.init }})"
 
       - name: Install packages
         run: |
@@ -172,17 +197,30 @@ jobs:
           sudo mount --bind /dev /mnt/rootfs/dev
           sudo rm -f /mnt/rootfs/etc/resolv.conf
           echo 'nameserver 1.1.1.1' | sudo tee /mnt/rootfs/etc/resolv.conf
-          sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }}-get update -qq || \
-            sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} update -qq || true
-          sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} install -y -q \
-            ${{ steps.family.outputs.pkgs }}
+          if [ "${{ steps.family.outputs.pm }}" = "apk" ]; then
+            # apk has neither an "install" verb nor a "-get" update alias —
+            # call it directly rather than through the generic lines below.
+            sudo chroot /mnt/rootfs apk update -q
+            sudo chroot /mnt/rootfs apk add --no-progress ${{ steps.family.outputs.pkgs }}
+          else
+            sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }}-get update -qq || \
+              sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} update -qq || true
+            sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} install -y -q \
+              ${{ steps.family.outputs.pkgs }}
+          fi
           sudo umount /mnt/rootfs/dev
           sudo umount /mnt/rootfs/proc
 
       - name: Configure system
         run: |
-          # root password
-          sudo chroot /mnt/rootfs bash -c 'echo "root:root" | chpasswd'
+          INIT=${{ steps.family.outputs.init }}
+
+          # root password (busybox chpasswd on Alpine; /bin/sh — no bash there)
+          if [ "$INIT" = "openrc" ]; then
+            sudo chroot /mnt/rootfs /bin/sh -c 'echo "root:root" | chpasswd'
+          else
+            sudo chroot /mnt/rootfs bash -c 'echo "root:root" | chpasswd'
+          fi
 
           # hostname
           echo 'uml' | sudo tee /mnt/rootfs/etc/hostname
@@ -190,10 +228,6 @@ jobs:
           127.0.0.1   localhost localhost.localdomain
           127.0.1.1   uml
           HOSTS
-
-          # getty on tty0 (console login)
-          sudo ln -sf /${{ steps.family.outputs.unitpath }}/getty@.service \
-            /mnt/rootfs/etc/systemd/system/getty.target.wants/getty@tty0.service
 
           # fstab (UML block device)
           sudo tee /mnt/rootfs/etc/fstab >/dev/null <<'FSTAB'
@@ -207,20 +241,38 @@ jobs:
           sudo cp rootfs/sysprep /mnt/rootfs/usr/bin/sysprep
           sudo chmod +x /mnt/rootfs/usr/bin/sysprep
 
-          # SSH host-key regeneration on first boot
-          sudo cp rootfs/ssh-keygen.service /mnt/rootfs/etc/systemd/system/
-          sudo chroot /mnt/rootfs systemctl enable ssh-keygen
+          if [ "$INIT" = "openrc" ]; then
+            # getty on tty0 (console login) — OpenRC spawns from /etc/inittab
+            echo 'tty0::respawn:/sbin/getty 38400 tty0' | \
+              sudo tee -a /mnt/rootfs/etc/inittab
 
-          # sshd service name differs (ssh vs sshd)
-          sudo chroot /mnt/rootfs systemctl enable ${{ steps.family.outputs.sshd }}
+            # sshd on boot. No key-regeneration service: Alpine's sshd init
+            # script runs `ssh-keygen -A` on first start by itself.
+            sudo chroot /mnt/rootfs rc-update add sshd default
+          else
+            # getty on tty0 (console login)
+            sudo ln -sf /${{ steps.family.outputs.unitpath }}/getty@.service \
+              /mnt/rootfs/etc/systemd/system/getty.target.wants/getty@tty0.service
+
+            # SSH host-key regeneration on first boot
+            sudo cp rootfs/ssh-keygen.service /mnt/rootfs/etc/systemd/system/
+            sudo chroot /mnt/rootfs systemctl enable ssh-keygen
+
+            # sshd service name differs (ssh vs sshd)
+            sudo chroot /mnt/rootfs systemctl enable ${{ steps.family.outputs.sshd }}
+          fi
 
       - name: Configure networking (cloud-init NoCloud)
         run: |
-          # Remove any pre-existing network configs that fight cloud-init
-          sudo rm -f /mnt/rootfs/etc/netplan/*.yaml
-          sudo rm -f /mnt/rootfs/etc/systemd/network/*.network
-          sudo rm -f /mnt/rootfs/etc/sysconfig/network-scripts/ifcfg-*
-          sudo rm -f /mnt/rootfs/etc/NetworkManager/system-connections/cloud-init-eth0.nmconnection
+          INIT=${{ steps.family.outputs.init }}
+
+          if [ "$INIT" = "systemd" ]; then
+            # Remove any pre-existing network configs that fight cloud-init
+            sudo rm -f /mnt/rootfs/etc/netplan/*.yaml
+            sudo rm -f /mnt/rootfs/etc/systemd/network/*.network
+            sudo rm -f /mnt/rootfs/etc/sysconfig/network-scripts/ifcfg-*
+            sudo rm -f /mnt/rootfs/etc/NetworkManager/system-connections/cloud-init-eth0.nmconnection
+          fi
 
           # Remove cloud-init.disabled (LXC sets it on EL)
           sudo rm -f /mnt/rootfs/etc/cloud/cloud-init.disabled
@@ -232,30 +284,45 @@ jobs:
                   rootfs/nocloud/user-data \
                   /mnt/rootfs/var/lib/cloud/seed/nocloud/
 
-          # Enable cloud-init services manually (generator needs a volume)
-          UNITPATH=${{ steps.family.outputs.unitpath }}
-          sudo mkdir -p /mnt/rootfs/etc/systemd/system/sysinit.target.wants
-          sudo mkdir -p /mnt/rootfs/etc/systemd/system/multi-user.target.wants
-          sudo ln -sf "/${UNITPATH}/cloud-init-local.service" \
-            /mnt/rootfs/etc/systemd/system/sysinit.target.wants/cloud-init-local.service
-          for svc in cloud-init cloud-config cloud-final; do
-            sudo ln -sf "/${UNITPATH}/${svc}.service" \
-              /mnt/rootfs/etc/systemd/system/multi-user.target.wants/${svc}.service
-          done
+          if [ "$INIT" = "openrc" ]; then
+            # Alpine cloud images ship cloud-init with OpenRC service scripts;
+            # schedule all four stages the way the systemd images do (local
+            # + init in boot, config + final in default — the upstream
+            # packaging's own runlevel assignment). cloud-init renders the
+            # seed's network-config to /etc/network/interfaces, which the
+            # networking service brings up on boot.
+            for svc in cloud-init-local cloud-init; do
+              sudo chroot /mnt/rootfs rc-update add $svc boot 2>/dev/null || true
+            done
+            for svc in cloud-config cloud-final; do
+              sudo chroot /mnt/rootfs rc-update add $svc default 2>/dev/null || true
+            done
+          else
+            # Enable cloud-init services manually (generator needs a volume)
+            UNITPATH=${{ steps.family.outputs.unitpath }}
+            sudo mkdir -p /mnt/rootfs/etc/systemd/system/sysinit.target.wants
+            sudo mkdir -p /mnt/rootfs/etc/systemd/system/multi-user.target.wants
+            sudo ln -sf "/${UNITPATH}/cloud-init-local.service" \
+              /mnt/rootfs/etc/systemd/system/sysinit.target.wants/cloud-init-local.service
+            for svc in cloud-init cloud-config cloud-final; do
+              sudo ln -sf "/${UNITPATH}/${svc}.service" \
+                /mnt/rootfs/etc/systemd/system/multi-user.target.wants/${svc}.service
+            done
 
-          # Mask wait-online (hangs on Debian, unneeded — cloud-init handles timing)
-          sudo ln -sf /dev/null \
-            /mnt/rootfs/etc/systemd/system/systemd-networkd-wait-online.service
+            # Mask wait-online (hangs on Debian, unneeded — cloud-init handles timing)
+            sudo ln -sf /dev/null \
+              /mnt/rootfs/etc/systemd/system/systemd-networkd-wait-online.service
 
-          # Enable network services
-          sudo chroot /mnt/rootfs systemctl enable systemd-networkd 2>/dev/null || true
-          sudo chroot /mnt/rootfs systemctl enable systemd-resolved 2>/dev/null || true
+            # Enable network services
+            sudo chroot /mnt/rootfs systemctl enable systemd-networkd 2>/dev/null || true
+            sudo chroot /mnt/rootfs systemctl enable systemd-resolved 2>/dev/null || true
 
-          # resolv.conf → resolved stub (if resolved is enabled)
-          if [ -f /mnt/rootfs/etc/systemd/system/multi-user.target.wants/systemd-resolved.service ]; then
-            sudo rm -f /mnt/rootfs/etc/resolv.conf
-            sudo ln -sf /run/systemd/resolve/stub-resolv.conf \
-              /mnt/rootfs/etc/resolv.conf
+            # resolv.conf → resolved stub (if resolved is enabled)
+            if [ -f /mnt/rootfs/etc/systemd/system/multi-user.target.wants/systemd-resolved.service ]; then
+              sudo rm -f /mnt/rootfs/etc/resolv.conf
+              sudo ln -sf /run/systemd/resolve/stub-resolv.conf \
+                /mnt/rootfs/etc/resolv.conf
+            fi
           fi
 
       - name: Sysprep & finalise
@@ -264,10 +331,14 @@ jobs:
           sudo rm -f /mnt/rootfs/etc/machine-id
           sudo touch /mnt/rootfs/etc/machine-id
 
-          # APT/dnf cleanup
-          sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} clean all 2>/dev/null || \
-            sudo chroot /mnt/rootfs apt-get clean 2>/dev/null || true
-          sudo rm -rf /mnt/rootfs/var/lib/apt/lists/*
+          # APT/dnf/apk cleanup
+          if [ "${{ steps.family.outputs.pm }}" = "apk" ]; then
+            sudo rm -rf /mnt/rootfs/var/cache/apk/*
+          else
+            sudo chroot /mnt/rootfs ${{ steps.family.outputs.pm }} clean all 2>/dev/null || \
+              sudo chroot /mnt/rootfs apt-get clean 2>/dev/null || true
+            sudo rm -rf /mnt/rootfs/var/lib/apt/lists/*
+          fi
 
           # Remove SSH host keys (regenerated by ssh-keygen.service)
           sudo rm -f /mnt/rootfs/etc/ssh/ssh_host_*
