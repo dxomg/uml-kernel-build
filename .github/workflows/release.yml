@@ -448,7 +448,7 @@ jobs:
             NOTES="$NOTES
 
           ### Included Images
-          * \`base-*.img.gz\`: Fresh UML rootfs cloud images (amd64 + arm64; Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10) with cloud-init NoCloud networking baked in"
+          * \`base-*.img.gz\`: Fresh UML rootfs cloud images (amd64 + arm64; Ubuntu Noble/Resolute, Debian Bookworm/Trixie, Rocky 9/10, Alma 9/10, Alpine 3.24) with cloud-init NoCloud networking baked in"
           fi
 
           gh release create "$TAG" ./release-assets/* \

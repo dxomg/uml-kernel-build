@@ -19,10 +19,13 @@ name: "UML Base Image (distro-agnostic, VECTOR/VDE)"
 # One 32-bit ARM image exists alongside them: base-alpine-3.24-arm32.img
 # (the pairing for the arm32 UML kernels). It builds on the arm64 runner
 # too — an aarch64 kernel runs armv7 (armhf) binaries through its compat
-# layer, so the apk chroot below executes natively with no qemu — and is
-# the only Alpine entry: OpenRC instead of systemd (getty comes from
-# /etc/inittab, sshd's init script regenerates the host keys itself, and
-# cloud-init ships OpenRC service scripts), apk instead of apt/dnf.
+# layer, so the apk chroot below executes natively with no qemu.
+#
+# Alpine 3.24 also builds for amd64 and arm64 (base-alpine-3.24.img and
+# base-alpine-3.24-arm64.img), sharing the same apk/OpenRC branches as the
+# arm32 entry: OpenRC instead of systemd (getty comes from /etc/inittab,
+# sshd's init script regenerates the host keys itself, and cloud-init ships
+# OpenRC service scripts), apk instead of apt/dnf.
 # Runs weekly Monday + manual trigger.
 
 on:
@@ -78,6 +81,11 @@ jobs:
             arch: amd64
             runner: ubuntu-latest
             suffix: ""
+          - distro: alpine
+            release: "3.24"
+            arch: amd64
+            runner: ubuntu-latest
+            suffix: ""
           # --- arm64: same pairs, built natively on arm runners ---
           - distro: ubuntu
             release: noble
@@ -116,6 +124,11 @@ jobs:
             suffix: "-arm64"
           - distro: almalinux
             release: "10"
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            suffix: "-arm64"
+          - distro: alpine
+            release: "3.24"
             arch: arm64
             runner: ubuntu-24.04-arm
             suffix: "-arm64"
